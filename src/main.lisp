@@ -1,11 +1,3 @@
-(defpackage #:kira
-  (:use :cl :alexandria)
-  (:import-from #:raw-bindings-sdl2 #:x #:y #:h #:w)
-  (:local-nicknames (#:cltl2 #:cl-environments)
-                    (#:fonts #:org.shirakumo.font-discovery)
-                    (#:sdl #:raw-bindings-sdl2)
-                    (#:sdl-ttf #:raw-bindings-sdl2-ttf))
-  (:export #:main))
 (in-package #:kira)
 
 ;; thanks zulu
@@ -29,34 +21,26 @@
 (defmacro c-> (variable slot &environment env)
   `(cffi:foreign-slot-value ,variable ',(cffi-type-or-error variable env) ,slot))
 
+;; editor state
 (defvar *running* nil)
-(defvar *window* nil)
-(defvar *renderer* nil)
-(defvar *ttf-font* nil)
-
-(defparameter *font* '(:family "InputSans" :weight 90))
-(defparameter *empty-line-spacing* 8)
-
 (defparameter *text*
-  "(defun %handle-event (event)
-  \"TODO handle pending events\"
-  (restart-case
-      (case (cffi:foreign-slot-value event 'sdl:sdl-event 'sdl:type)
-        (#.sdl:+sdl-quit+
-         (setf *running* nil)))
-    (never-gonna-give-you-up ()
-      (return-from %handle-event))))
-
-;; very very very loing bit of text very very loing bit of text1234
+  "#include \"test.h\"
 //  second very very very loing bit of text
 
 int main()
 {
     return 0;
 }")
+
+;; config
+(defparameter *font* '(:family "InputSans" :weight 90))
+(defparameter *empty-line-spacing* 8)
 (defparameter *offset* 0)
 
-;; hmm... I might have to coordinate cursor/window states... multiple mutable object states
+;; SDL state
+(defvar *window* nil)
+(defvar *renderer* nil)
+(defvar *ttf-font* nil)
 
 (defun %handle-event (event)
   "TODO handle pending events"
@@ -82,6 +66,7 @@ int main()
       (return-from %handle-event))))
 
 (defun %render ()
+  (sdl:sdl-set-render-draw-color *renderer* 0 43 54 0)
   (sdl:sdl-render-clear *renderer*)
   (with-input-from-string (s *text*)
     (loop :with last-y = 0
@@ -147,7 +132,6 @@ int main()
            (when (cffi:null-pointer-p *renderer*)
              (format t "SDL *renderer* failed to initialize: ~a~%" (sdl:sdl-get-error))
              (return-from main))
-           (sdl:sdl-set-render-draw-color *renderer* 0 43 54 0)
            (format t "initialized renderer~%")
            ;; main loop
            (cffi:with-foreign-object (event 'sdl:sdl-event)

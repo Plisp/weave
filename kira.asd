@@ -6,12 +6,18 @@
   :license "BSD 3-clause license"
   :depends-on (#:alexandria
                #:trivial-features
+               #:yacc
+               ;;
+               #:cffi-libffi ;; for sdl bindings
                #:cl-environments
-               #:cffi-libffi
                #:font-discovery
-               #:trivial-clipboard
-               ;; *not on quicklisp*
-               #:raw-bindings-sdl2 #:raw-bindings-sdl2-ttf)
+               #:raw-bindings-sdl2 #:raw-bindings-sdl2-ttf ; *not on quicklisp*
+               ;;#:trivial-clipboard
+               )
   :pathname "src"
   :serial t
-  :components ((:file "impl")))
+  :components ((:file "nodes")
+               (:file "c")
+               (:file "c-parse")
+               (:file "main")
+               ))

@@ -1,1 +1,1 @@
-# todo
+# A structure editor
