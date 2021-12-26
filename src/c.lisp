@@ -1,6 +1,6 @@
 ;;; C language support
 
-;; TODO multiline comments
+;; TODO single-line, multiline comments
 ;; TODO preprocessor - include files
 
 (defpackage #:kira-c
