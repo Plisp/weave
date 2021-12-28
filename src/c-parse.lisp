@@ -28,7 +28,10 @@
 ;; array-decl := (ARRAY num|star (pointer-qualifiers *) name), implicitly a pointer
 
 ;; n.b. any change to the terminal list must occur here and in the lexer (+typespec rule)
-;; XXX don't break on fn(int(T)), declaring int function taking T
+
+;; XXX don't break on fn(int(T)), declaring parameter: int function taking T
+;; could mean either fn(int (*)(T)) or fn(int T) if T is not a type
+;; though nobody should be doing this anyways
 
 (yacc:define-parser *c-parser*
   (:start-symbol translation-unit)
@@ -342,7 +345,10 @@
 
   (direct-declarator
    identifier
-   (|(| declarator |)| (lambda (a b c) (declare (ignore a c)) b))
+   (|(| declarator |)| (lambda (a b c) (declare (ignore a c))
+                         (if (null (car b))
+                             (cadr b)
+                             b)))
    (direct-declarator |[| fn-qualifier-list-opt assignment-expression-opt |]| ; a[3] primary exp
                       (extract 'array 3 2 0))
    (direct-declarator |[| fn-qualifier-list-opt |*| |]|  (extract 'array '* 2 0))
@@ -416,7 +422,10 @@
    abstract-declarator)
 
   (direct-abstract-declarator
-   (|(| abstract-declarator |)| (lambda (a b c) (declare (ignore a c)) b))
+   (|(| abstract-declarator |)| (lambda (a b c) (declare (ignore a c))
+                                  (if (null (car b))
+                                      (cadr b)
+                                      b)))
    (direct-abstract-declarator-opt |[| fn-qualifier-list-opt assignment-expression-opt |]|
                                    (extract 'array 3 2 0))
    (direct-abstract-declarator-opt |[| fn-qualifier-list-opt |*| |]|

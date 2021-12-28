@@ -134,7 +134,6 @@
           (t (return-from get-numeric-token (parse-integer-suffix value c))))
         (setf c (lexer-read-char in))))))
 
-;; TODO u8 string literals, etc.
 (defun get-string-token (in c)
   (let ((string (make-array 20 :element-type 'character
                                :fill-pointer 0 :adjustable t)))
@@ -286,20 +285,6 @@
       (loop for token = (multiple-value-list (get-next-token in))
             while (car token)
             collect token))))
-
-;;; TODO extracting typedef-ed name - use a proper database
-
-(defun direct-declarator-name (x)
-  "Return the name declared by a direct-declarator."
-  (cond
-    ((null x) (error "Abstract declarator where declarator expected"))
-    ((atom x) (assert (stringp x)) x)
-    ((eql 'declarator (car x)) (direct-declarator-name (cadr x)))
-    (t (direct-declarator-name (cadr x)))))
-
-(defun init-declarator-name (x)
-  "Return the name declared by a declarator."
-  (direct-declarator-name x))
 
 ;;; parser
 
