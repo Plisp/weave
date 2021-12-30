@@ -44,7 +44,7 @@
                           typedef-name sizeof
                           typedef extern static auto register
                           void char short int long float double signed unsigned
-                          |_Bool| |_Complex| |_Imaginary|
+                          |_Bool| |_Complex| |_Imaginary| __builtin_va_list
                           struct union enum
                           const __const restrict __restrict volatile
                           inline __inline __inline__
@@ -67,12 +67,12 @@
 
   (postfix-expression
    primary-expression
-   (postfix-expression |[| expression |]|  (extract 'aref 0 2))
-   (postfix-expression |(| argument-expression-list-opt |)|  (extract 'apply 0 2))
+   (postfix-expression |[| expression |]| (extract 'aref 0 2))
+   (postfix-expression |(| argument-expression-list-opt |)| (extract 'apply 0 2))
    (postfix-expression |.| identifier #'to-prefix)
    (postfix-expression |->| identifier #'to-prefix)
-   (postfix-expression |++|  (extract 'post-++ 0))
-   (postfix-expression |--|  (extract 'post--- 0))
+   (postfix-expression |++| (extract 'post-++ 0))
+   (postfix-expression |--| (extract 'post--- 0))
    (|(| type-name |)| |{| initializer-list |}| (extract 'compound-literal 1 4))
    )
 
@@ -90,15 +90,15 @@
    (|++| unary-expression)
    (|--| unary-expression)
    (unary-operator cast-expression)
-   (sizeof unary-expression  (extract 'sizeof-expression 1))
-   (sizeof |(| type-name |)|  (extract 'sizeof-type 2))
+   (sizeof unary-expression (extract 'sizeof-expression 1))
+   (sizeof |(| type-name |)| (extract 'sizeof-type 2))
    )
 
   (unary-operator |&| |*| |+| |-| |~| |!|)
 
   (cast-expression
    unary-expression
-   (|(| type-name |)| cast-expression  (extract 'cast 3 1))
+   (|(| type-name |)| cast-expression (extract 'cast 3 1))
    )
 
   (multiplicative-expression
@@ -186,7 +186,9 @@
                            #'(lambda (ds idl)
                                (when (member 'typedef ds)
                                  (mapc
-                                  #'(lambda (name) (notice-typedef (init-declarator-name name)))
+                                  #'(lambda (name)
+                                      (notice-typedef
+                                       (find-if #'stringp (alexandria:flatten name))))
                                   idl))
                                (append (list ds) idl))))
 
@@ -238,6 +240,7 @@
    |_Bool|
    |_Complex|
    |_Imaginary|
+   __builtin_va_list
    struct-or-union-specifier
    enum-specifier
    typedef-name)
@@ -264,7 +267,7 @@
    (struct-declaration-list struct-declaration #'rcons))
 
   (struct-declaration
-   (specifier-qualifier-list struct-declarator-list-opt |;|  (extract 0 1))
+   (specifier-qualifier-list struct-declarator-list-opt |;| (extract 0 1))
    )
 
   (specifier-qualifier-list
@@ -287,7 +290,7 @@
 
   (struct-declarator
    declarator
-   (declarator-opt |:| constant-expression  (extract 'bitfield 0 2)))
+   (declarator-opt |:| constant-expression (extract 'bitfield 0 2)))
 
   (enum-specifier
    (enum identifier-opt |{| enumerator-list |}|
@@ -351,7 +354,7 @@
                              b)))
    (direct-declarator |[| fn-qualifier-list-opt assignment-expression-opt |]| ; a[3] primary exp
                       (extract 'array 3 2 0))
-   (direct-declarator |[| fn-qualifier-list-opt |*| |]|  (extract 'array '* 2 0))
+   (direct-declarator |[| fn-qualifier-list-opt |*| |]| (extract 'array '* 2 0))
    (direct-declarator |(| parameter-type-list |)|
                       (lambda (a b c d)
                         (declare (ignore b d))
@@ -442,7 +445,7 @@
 
   (initializer
    (assignment-expression #'(lambda (x) (list 'expression x)))
-   (|{| initializer-list |}|  (extract 'initializer-list 1))
+   (|{| initializer-list |}| (extract 'initializer-list 1))
    (|{| initializer-list |,| |}| (extract 'initializer-list 1))
    )
 
@@ -464,8 +467,8 @@
    (designator-list designator))
 
   (designator
-   (|[| constant-expression |]|  (extract 'aref 1))
-   (|.| identifier  (extract '|.| 1))
+   (|[| constant-expression |]| (extract 'aref 1))
+   (|.| identifier (extract '|.| 1))
    )
 
   (statement-no-head
@@ -477,13 +480,13 @@
    jump-statement)
 
   (statement
-   (statement-no-head  (extract 'statement 0))
+   (statement-no-head (extract 'statement 0))
    )
 
   (labeled-statement
-   (identifier |:| statement  (extract 'label 0 2))
-   (case constant-expression |:| statement  (extract 'case 1 3))
-   (default |:| statement  (extract 'default 2))
+   (identifier |:| statement (extract 'label 0 2))
+   (case constant-expression |:| statement (extract 'case 1 3))
+   (default |:| statement (extract 'default 2))
    )
 
   (compound-statement
@@ -504,17 +507,17 @@
    )
 
   (expression-statement
-   (expression-opt |;|  (extract 'expression 0))
+   (expression-opt |;| (extract 'expression 0))
    )
 
   (selection-statement
-   (if |(| expression |)| statement  (extract 0 2 4))
-   (if |(| expression |)| statement else statement  (extract 0 2 4 6))
-   (switch |(| expression |)| statement  (extract 0 2 4)))
+   (if |(| expression |)| statement (extract 0 2 4))
+   (if |(| expression |)| statement else statement (extract 0 2 4 6))
+   (switch |(| expression |)| statement (extract 0 2 4)))
 
   (iteration-statement
-   (while |(| expression |)| statement  (extract 0 2 4))
-   (do statement while |(| expression |)| |;|  (extract 'do-while 1 4))
+   (while |(| expression |)| statement (extract 0 2 4))
+   (do statement while |(| expression |)| |;| (extract 'do-while 1 4))
    (for |(| expression-opt |;| expression-opt |;| expression-opt |)| statement
         (extract 0 2 4 6 8))
    (for |(| declaration expression-opt |;| expression-opt |)| statement
@@ -526,7 +529,7 @@
    (goto identifier |;| (extract 0 1))
    (continue |;| (constantly (list 'continue)))
    (break |;| (constantly (list 'break)))
-   (return expression-opt |;|  (extract 0 1))
+   (return expression-opt |;| (extract 0 1))
    )
 
   (translation-unit

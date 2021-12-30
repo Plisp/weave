@@ -29,13 +29,13 @@
 
 (defparameter *c-keywords*
   '("sizeof"
-    "typedef" "extern" "static" "auto" "register" ; SC
-    "void" "char" "short" "int" "long" "float" "double" "signed" "unsigned" ; int
-    "_Bool" "_Complex" "_Imaginary"
+    "typedef" "extern" "static" "auto" "register"
+    "void" "char" "short" "int" "long" "float" "double" "signed" "unsigned"
+    "_Bool" "_Complex" "_Imaginary" "__builtin_va_list"
     "struct" "union" "enum"
-    "const" "__const" "restrict" "__restrict" "volatile" ; cvr
+    "const" "__const" "restrict" "__restrict" "volatile"
     "inline" "__inline" "__inline__"
-    "case" "default" "if" "else" "switch" "while" "do" "for" ; flow
+    "case" "default" "if" "else" "switch" "while" "do" "for"
     "goto" "continue" "break" "return"
     "asm" "__asm__"))
 
@@ -287,6 +287,11 @@
             collect token))))
 
 ;;; parser
+
+(defun preprocess-c (file)
+  (uiop:run-program (list "/bin/gcc" "-E" "-P" "-D__extension__=" "-D__attribute__(x)="
+                          file)
+                    :output :string))
 
 (defun parse-c-file (in &key typedefs)
   (let ((*line-number* 1)
