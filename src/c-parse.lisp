@@ -19,6 +19,9 @@
 
   (defun to-prefix (a b c)
     (list b a c))
+
+  (defun rest-id (&rest args)
+    args)
   )
 
 ;; Returned decls := (storage|qualifiers* type) ((* pointer-qualifiers*) name)*
@@ -41,6 +44,9 @@
                           |&| |*| |/| |%| |+| |-| |~| |!| |<<| |>>| |<| |>| |<=| |>=|
                           |==| |!=| |^| \| |&&| \|\| |?| |:|
                           |=| |*=| |/=| |%=| |+=| |-=| |<<=| |>>=| |&=| |^=| |...| |\|=|
+                          |#|
+                          define undef include line error pragma
+                          ppif ifdef ifndef ppelse elif endif
                           typedef-name sizeof
                           typedef extern static auto register
                           void char short int long float double signed unsigned
@@ -53,15 +59,42 @@
                           asm __asm__
                           ))
 
+  (preprocessor-directive
+   (include string-literal #'rest-id)
+   (line number string-literal #'rest-id)
+   (pragma string #'rest-id)
+   (error string #'rest-id)
+   (undef identifier #'rest-id)
+   (ifdef identifier #'rest-id)
+   (ifndef identifier #'rest-id)
+   ppelse
+   (ppif primary-expression translation-unit endif (lambda (p exp forms e)
+                                                     (declare (ignore e))
+                                                     `(,p ,exp ,@forms)))
+   (elif primary-expression translation-unit endif (lambda (p exp forms e)
+                                                     (declare (ignore e))
+                                                     `(,p ,exp ,@forms))))
+
+  ;; TODO distinguish these from ident objects (keep type of strings - char32_t)
   (string-literal (string #'(lambda (s) (list 'string s)))
                   (wide-string #'(lambda (s) (list 'wide-string s)))
                   (character #'(lambda (s) (list 'character s)))
                   (wide-character #'(lambda (s) (list 'wide-character s))))
 
-  (primary-expression
-   identifier
-   number
+  ;; adjacent string literals are concatenated in translation phase 6, meaning
+  ;; I need to run the preprocessor prior to execution (needs user compilation flags)
+  ;;
+  ;; The hack here covers parsing of adjacent str literals and #defined identifiers,
+  ;; assuming keywords are not #defined to be idents/string literal constants (dumb)
+  (string-literals
    string-literal
+   (identifier (lambda (a) (list a)))
+   (string-literal string-literals (lambda (a b) (append (list a) b)))
+   (identifier string-literals (lambda (a b) (append (list a) b))))
+
+  (primary-expression
+   number
+   string-literals ; covers solitary identifiers
    (|(| expression |)| #'(lambda (a b c) (declare (ignore a c)) b))
    )
 
@@ -406,6 +439,10 @@
    (declaration-specifiers abstract-declarator-opt))
 
   (identifier-list
+   identifier-list-no-elipsis
+   (identifier-list-no-elipsis |,| |...| #'rcons3))
+
+  (identifier-list-no-elipsis
    (identifier)
    (identifier-list |,| identifier #'rcons3))
 
@@ -532,9 +569,13 @@
    (return expression-opt |;| (extract 0 1))
    )
 
+  (toplevel-item
+   preprocessor-directive
+   external-declaration)
+
   (translation-unit
-   (external-declaration)
-   (translation-unit external-declaration #'rcons)
+   (toplevel-item)
+   (translation-unit toplevel-item #'rcons)
    )
 
   (external-declaration ; TODO checkpoint file-position here
@@ -554,3 +595,17 @@
   (declaration-list-opt
    ()
    declaration-list))
+
+;;; parser
+
+(defun parse-c-file (in &key typedefs)
+  (let ((*line-number* 1)
+        (*typedef-names* (make-hash-table :test 'equal))
+        (*comments* (list)))
+    (declare (special *typedef-names* *line-number* *c-parser* *comments*))
+    (dolist (tok typedefs) (notice-typedef tok))
+    (handler-case
+        (values (yacc:parse-with-lexer (make-c-lexer in) *c-parser*)
+                (list :comments *comments*))
+      (yacc:yacc-parse-error (e)
+        (error "Parse error at line ~A:~%~A" *line-number* e)))))

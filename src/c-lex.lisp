@@ -1,8 +1,5 @@
 ;;; C language support
 
-;; TODO single-line, multiline comments
-;; TODO preprocessor - include files
-
 (defpackage #:kira-c
   (:use :cl))
 (in-package #:kira-c)
@@ -27,6 +24,14 @@
     (decf *line-number*))
   (unread-char c in))
 
+(defun lexer-read-line (in)
+  (coerce (loop for c = (lexer-read-char in)
+                while (and c (char/= c #\Newline))
+                collect c)
+          'simple-string))
+
+(defvar *comments* (list))
+
 (defparameter *c-keywords*
   '("sizeof"
     "typedef" "extern" "static" "auto" "register"
@@ -39,6 +44,9 @@
     "goto" "continue" "break" "return"
     "asm" "__asm__"))
 
+(defparameter *cpp-directives* '("define" "undef" "include" "line" "error" "pragma"
+                                 "if" "ifdef" "ifndef" "else" "elif" "endif"))
+
 (defun string-to-symbol (s)
   (declare (simple-string s))
   (if (some #'upper-case-p s)
@@ -50,7 +58,7 @@
            (type (or character null) c))
   (let ((c (or c (lexer-read-char in))))
     (declare (type (or null character) c))
-    (loop while (member c '(#\Space #\Tab #\Newline))
+    (loop while (member c '(#\Space #\Tab))
           do (setf c (lexer-read-char in))
           finally (return c))))
 
@@ -147,14 +155,8 @@
         (setf c (lexer-read-char in))
         (cond
           ((null c) (error "Unexpected end of file in string"))
-          ((and (eql c terminator) (eql terminator #\"))
-           (let ((next (skip-whitespace in)))
-             (unless (eql next #\")
-               (when next
-                 (lexer-unread-char next in))
-               (return-from get-string-token (copy-seq string)))))
           ((eql c terminator)
-           (return-from get-string-token (copy-seq string)))
+           (return-from get-string-token (coerce string 'simple-string)))
           ((eql c #\\)
            (let ((d (lexer-read-char in)))
              (unless (eql d #\newline)
@@ -179,7 +181,7 @@
          (vector-push-extend c string))
         (t
          (lexer-unread-char c in)
-         (return-from get-identifier-token (copy-seq string)))))))
+         (return-from get-identifier-token (coerce string 'simple-string)))))))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defparameter *punctuator-tokens-1*
@@ -240,17 +242,98 @@
   (declare (string token))
   (setf (gethash token *typedef-names*) t))
 
-(defun get-next-token (in)
+;; TODO match comments up later by saving byte spans of everything
+;; this will also enable source lookup on disk
+(defun get-comment (in c)
+  (lexer-read-char in)
+  (case c
+    (#\/
+     (lexer-read-line in)
+     (lexer-unread-char #\Newline in))
+    (#\*
+     (with-output-to-string (string)
+       (loop
+         (setf c (lexer-read-char in))
+         (if (and (char= c #\*)
+                  (eql #\/ (peek-char nil in nil)))
+             (progn
+               (lexer-read-char in)
+               (return))
+             (write-char c string)))))))
+
+(defun get-token-string (in c)
+  (values 'string
+           (with-output-to-string (s)
+             (write-char c s)
+             (loop for line = (lexer-read-line in)
+                   for length = (length line)
+                   do (if (eql #\\ (schar line (1- length)))
+                          (write-string line s :start 0 :end (1- length))
+                          (progn
+                            (write-string line s)
+                            (lexer-unread-char #\Newline in)
+                            (loop-finish)))))))
+
+(defun get-preprocessor-token (in c preprocessor-state)
+  (case preprocessor-state
+    ((nil)
+     (alexandria:if-let (c (skip-whitespace in)) ; we don't do null directives here
+       (let ((id (get-identifier-token in c)))
+         (if (member id *cpp-directives* :test #'equal)
+             (let* ((s (string-to-symbol id))
+                    (type (case s
+                            (if 'ppif)
+                            (else 'ppelse)
+                            (t s))))
+               (values type type s)) ; s is the state
+             (error "~s is not a valid preprocessor directive" id)))
+       (values nil nil)))
+    ((include line-filename) ; <> "", no degenerate filenames
+     (let ((filename (make-array 20 :element-type 'character
+                                    :fill-pointer 0 :adjustable t))
+           (terminator (case c
+                         (#\< #\>)
+                         (#\" #\")
+                         (t (return-from get-preprocessor-token)))))
+       (loop
+         (setf c (lexer-read-char in))
+         (cond ((char= c terminator)
+                (return (values 'string filename nil)))
+               (t
+                (vector-push-extend c filename))))))
+    (line (values 'number (get-numeric-token in c) 'line-filename))
+    ((pragma error) (get-token-string in c)) ; TODO
+    ((ifdef ifndef undef if elif else endif)
+     (lexer-unread-char c in)
+     (get-next-token in nil))
+    ;; (defin-params (list 'identifier get-identifier-token))
+    ;; (defin-token-string (get-token-string in c))
+    ))
+
+(defun get-next-token (in preprocessor-state)
   (declare (stream in))
-  (let ((c (skip-whitespace in)))
+  (let* ((file-start? (zerop (file-position in)))
+         (c (skip-whitespace in))) ; has side effect
     (cond
       ((null c) (values nil nil))
+      (preprocessor-state (get-preprocessor-token in c preprocessor-state))
+      ((or file-start?
+           (char= c #\Newline))
+       (let ((c (if file-start?
+                    c
+                    (skip-whitespace in))))
+         (cond ((null c) (values nil nil))
+               ((char= c #\#) (get-preprocessor-token in c preprocessor-state))
+               (t ; TODO SHOULD BE TAIL CALL, make sure
+                (lexer-unread-char c in)
+                (get-next-token in nil)))))
       ((or (char<= #\A c #\Z)
            (char<= #\a c #\z)
            (eql c #\_))
        (let ((d (peek-char nil in nil)))
          (if (and (member c '(#\l #\L))
                   (member d '(#\' #\")))
+             ;; these may contain escaped literals, evaluate before execution
              (values (if (eql d #\') 'wide-character 'wide-string)
                      (get-string-token in c))
              (let ((id (get-identifier-token in c)))
@@ -265,40 +348,38 @@
       ((char<= #\0 c #\9)
        (values 'number (get-numeric-token in c)))
       ((or (char= c #\') (char= c #\"))
-       (values (if (eql c #\') 'character 'string)
-               (get-string-token in c)))
+       (values (if (eql c #\') 'character 'string) (get-string-token in c)))
       ((find c "[](){}.-+&*~!/%<>=|&^?:;,#")
-       (let ((s (intern (get-punctuator-token in c) 'kira-c)))
-         (values s s)))
+       (let ((next (peek-char nil in nil)))
+         (if (and (char= c #\/)
+                  (member next '(#\* #\/)))
+             (let ((fpos (file-position in)))
+               (push (list fpos (get-comment in next) (file-position in))
+                     *comments*)
+               ;; TODO SHOULD BE TAIL CALL, make sure
+               (get-next-token in nil))
+             (let ((s (intern (get-punctuator-token in c) 'kira-c)))
+               (values s s)))))
       (t
        (error "Unexpected character \"~A\"" c)))))
 
 (defun make-c-lexer (in)
   (declare (stream in))
-  #'(lambda () (get-next-token in)))
+  (let ((preprocessor-state nil))
+    #'(lambda ()
+        (multiple-value-bind (type value next-preprocessor-state)
+            (get-next-token in preprocessor-state)
+          (setf preprocessor-state next-preprocessor-state)
+          (values type value)))))
 
 (defun lex-c-file (file)
   (let ((*line-number* 1)
-        (*typedef-names* (make-hash-table :test 'equal)))
-    (declare (special *typedef-names* *line-number* *c-parser*))
-    (with-open-file (in file)
-      (loop for token = (multiple-value-list (get-next-token in))
-            while (car token)
-            collect token))))
-
-;;; parser
-
-(defun preprocess-c (file)
-  (uiop:run-program (list "/bin/gcc" "-E" "-P" "-D__extension__=" "-D__attribute__(x)="
-                          file)
-                    :output :string))
-
-(defun parse-c-file (in &key typedefs)
-  (let ((*line-number* 1)
-        (*typedef-names* (make-hash-table :test 'equal)))
-    (declare (special *typedef-names* *line-number* *c-parser*))
-    (dolist (tok typedefs) (notice-typedef tok))
-    (handler-case
-        (yacc:parse-with-lexer (make-c-lexer in) *c-parser*)
-      (yacc:yacc-parse-error (e)
-        (error "Parse error at line ~A:~%~A" *line-number* e)))))
+        (*typedef-names* (make-hash-table :test 'equal))
+        (*comments* (list)))
+    (declare (special *typedef-names* *line-number* *c-parser*  *comments*))
+    (values (with-open-file (in file)
+              (loop with lexer = (make-c-lexer in)
+                    for token = (multiple-value-list (funcall lexer))
+                    while (car token)
+                    collect token))
+            (list :comments *comments*))))

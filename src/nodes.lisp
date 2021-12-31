@@ -1,8 +1,7 @@
 (defpackage #:kira
   (:use :cl :alexandria)
   (:import-from #:raw-bindings-sdl2 #:x #:y #:h #:w)
-  (:local-nicknames (#:cltl2 #:cl-environments)
-                    (#:fonts #:org.shirakumo.font-discovery)
+  (:local-nicknames (#:fonts #:org.shirakumo.font-discovery)
                     (#:sdl #:raw-bindings-sdl2)
                     (#:sdl-ttf #:raw-bindings-sdl2-ttf))
   (:export #:main))

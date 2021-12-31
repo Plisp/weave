@@ -9,7 +9,6 @@
                #:yacc
                ;;
                #:cffi-libffi ;; for sdl bindings
-               #:cl-environments
                #:font-discovery
                #:raw-bindings-sdl2 #:raw-bindings-sdl2-ttf ; *not on quicklisp*
                ;;#:trivial-clipboard
@@ -17,7 +16,7 @@
   :pathname "src"
   :serial t
   :components ((:file "nodes")
-               (:file "c")
+               (:file "c-lex")
                (:file "c-parse")
                (:file "main")
                ))
