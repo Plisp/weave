@@ -18,11 +18,7 @@
          items)))
 
   (defun to-prefix (a b c)
-    (list b a c))
-
-  (defun rest-id (&rest args)
-    args)
-  )
+    (list b a c)))
 
 ;; Returned decls := (storage|qualifiers* type) ((* pointer-qualifiers*) name)*
 ;; type := standard-type | (struct string)
@@ -38,7 +34,7 @@
 
 (yacc:define-parser *c-parser*
   (:start-symbol translation-unit)
-  (:muffle-conflicts (3 0))
+  (:muffle-conflicts (3 2))
   (:terminals (identifier number string wide-string character wide-character
                           |(| |)| |[| |]| |.| |->| |++| |--| |{| |}| |,| |;|
                           |&| |*| |/| |%| |+| |-| |~| |!| |<<| |>>| |<| |>| |<=| |>=|
@@ -56,30 +52,35 @@
                           inline __inline __inline__
                           case default if else switch while do for
                           goto continue break return
-                          asm __asm__
-                          ))
+                          asm __asm__))
 
   (preprocessor-directive
-   (include string-literal #'rest-id)
-   (line number string-literal #'rest-id)
-   (pragma string #'rest-id)
-   (error string #'rest-id)
-   (undef identifier #'rest-id)
-   (ifdef identifier #'rest-id)
-   (ifndef identifier #'rest-id)
+   (include string-literal)
+   (line number string-literal)
+   (pragma string)
+   (error string)
+   (undef identifier)
+   (ifdef identifier)
+   (ifndef identifier)
+   ;; disallow preprocessor 'typedef's for now
+   ;; XXX issue with reduce conflict between (expr)(call) and (macro params)(expr)
+   (define identifier |(| identifier-list-opt |)| expression-opt)
+   (define identifier expression-opt)
    ppelse
    (ppif primary-expression translation-unit endif (lambda (p exp forms e)
                                                      (declare (ignore e))
                                                      `(,p ,exp ,@forms)))
    (elif primary-expression translation-unit endif (lambda (p exp forms e)
                                                      (declare (ignore e))
-                                                     `(,p ,exp ,@forms))))
+                                                     `(,p ,exp ,@forms)))
+   )
 
   ;; TODO distinguish these from ident objects (keep type of strings - char32_t)
-  (string-literal (string #'(lambda (s) (list 'string s)))
-                  (wide-string #'(lambda (s) (list 'wide-string s)))
-                  (character #'(lambda (s) (list 'character s)))
-                  (wide-character #'(lambda (s) (list 'wide-character s))))
+  (string-literal
+   (string #'(lambda (s) (list 'string s)))
+   (wide-string #'(lambda (s) (list 'wide-string s)))
+   (character #'(lambda (s) (list 'character s)))
+   (wide-character #'(lambda (s) (list 'wide-character s))))
 
   ;; adjacent string literals are concatenated in translation phase 6, meaning
   ;; I need to run the preprocessor prior to execution (needs user compilation flags)
@@ -88,15 +89,14 @@
   ;; assuming keywords are not #defined to be idents/string literal constants (dumb)
   (string-literals
    string-literal
-   (identifier (lambda (a) (list a)))
+   (identifier (lambda (a) (list a))) ; these have no enclosing list
    (string-literal string-literals (lambda (a b) (append (list a) b)))
    (identifier string-literals (lambda (a b) (append (list a) b))))
 
   (primary-expression
    number
    string-literals ; covers solitary identifiers
-   (|(| expression |)| #'(lambda (a b c) (declare (ignore a c)) b))
-   )
+   (|(| expression |)| #'(lambda (a b c) (declare (ignore a c)) b)))
 
   (postfix-expression
    primary-expression
@@ -106,17 +106,15 @@
    (postfix-expression |->| identifier #'to-prefix)
    (postfix-expression |++| (extract 'post-++ 0))
    (postfix-expression |--| (extract 'post--- 0))
-   (|(| type-name |)| |{| initializer-list |}| (extract 'compound-literal 1 4))
-   )
+   (|(| type-name |)| |{| initializer-list |}| (extract 'compound-literal 1 4)))
 
   (argument-expression-list
    (assignment-expression)
-   (argument-expression-list |,| assignment-expression #'rcons3)
-   )
+   (argument-expression-list |,| assignment-expression #'rcons3))
 
   (argument-expression-list-opt
-   argument-expression-list
-   ())
+   ()
+   argument-expression-list)
 
   (unary-expression
    postfix-expression
@@ -124,53 +122,45 @@
    (|--| unary-expression)
    (unary-operator cast-expression)
    (sizeof unary-expression (extract 'sizeof-expression 1))
-   (sizeof |(| type-name |)| (extract 'sizeof-type 2))
-   )
+   (sizeof |(| type-name |)| (extract 'sizeof-type 2)))
 
   (unary-operator |&| |*| |+| |-| |~| |!|)
 
   (cast-expression
    unary-expression
-   (|(| type-name |)| cast-expression (extract 'cast 3 1))
-   )
+   (|(| type-name |)| cast-expression (extract 'cast 3 1)))
 
   (multiplicative-expression
    cast-expression
    (multiplicative-expression |*| cast-expression #'to-prefix)
    (multiplicative-expression |/| cast-expression #'to-prefix)
-   (multiplicative-expression |%| cast-expression #'to-prefix)
-   )
+   (multiplicative-expression |%| cast-expression #'to-prefix))
 
   (additive-expression
    multiplicative-expression
    (additive-expression |+| multiplicative-expression #'to-prefix)
-   (additive-expression |-| multiplicative-expression #'to-prefix)
-   )
+   (additive-expression |-| multiplicative-expression #'to-prefix))
 
   (shift-expression
    additive-expression
    (shift-expression |<<| additive-expression #'to-prefix)
-   (shift-expression |>>| additive-expression #'to-prefix)
-   )
+   (shift-expression |>>| additive-expression #'to-prefix))
 
   (relational-expression
    shift-expression
    (relational-expression |<| shift-expression #'to-prefix)
    (relational-expression |>| shift-expression #'to-prefix)
    (relational-expression |<=| shift-expression #'to-prefix)
-   (relational-expression |>=| shift-expression #'to-prefix)
-   )
+   (relational-expression |>=| shift-expression #'to-prefix))
 
   (equality-expression
    relational-expression
    (equality-expression |==| relational-expression #'to-prefix)
-   (equality-expression |!=| relational-expression #'to-prefix)
-   )
+   (equality-expression |!=| relational-expression #'to-prefix))
 
   (and-expression
    equality-expression
-   (and-expression |&| equality-expression #'to-prefix)
-   )
+   (and-expression |&| equality-expression #'to-prefix))
 
   (exclusive-or-expression
    and-expression
@@ -191,8 +181,7 @@
   (conditional-expression
    logical-or-expression
    (logical-or-expression |?| expression |:| conditional-expression
-                          (extract '? 0 2 4))
-   )
+                          (extract '? 0 2 4)))
 
   (assignment-expression
    conditional-expression
@@ -227,8 +216,7 @@
 
   (declaration
    (declaration-no-semicolon |;|
-                             #'(lambda (a b) (declare (ignore b)) (cons 'declaration a)))
-   )
+                             #'(lambda (a b) (declare (ignore b)) (cons 'declaration a))))
 
   (init-declarator-list-opt
    ()
@@ -246,8 +234,7 @@
 
   (init-declarator-list
    (init-declarator)
-   (init-declarator-list |,| init-declarator #'rcons3)
-   )
+   (init-declarator-list |,| init-declarator #'rcons3))
 
   (init-declarator
    declarator
@@ -284,8 +271,7 @@
    (struct-or-union typedef-name |{| struct-declaration-list |}|
                     (extract 0 1 3))
    (struct-or-union identifier)
-   (struct-or-union typedef-name)
-   )
+   (struct-or-union typedef-name))
 
   (identifier-opt
    ()
@@ -300,8 +286,7 @@
    (struct-declaration-list struct-declaration #'rcons))
 
   (struct-declaration
-   (specifier-qualifier-list struct-declarator-list-opt |;| (extract 0 1))
-   )
+   (specifier-qualifier-list struct-declarator-list-opt |;| (extract 0 1)))
 
   (specifier-qualifier-list
    (type-specifier specifier-qualifier-list-opt #'cons)
@@ -317,8 +302,7 @@
 
   (struct-declarator-list
    (struct-declarator)
-   (struct-declarator-list |,| struct-declarator #'rcons3)
-   )
+   (struct-declarator-list |,| struct-declarator #'rcons3))
 
 
   (struct-declarator
@@ -353,10 +337,9 @@
 
 
   (function-specifier
-   inline
    __inline                               ; GNU extension
    __inline__                             ; GNU extension
-   )
+   inline)
 
   (declarator
    (pointer-opt direct-declarator asm-label-opt ; GNU extension fn() asm ("label")
@@ -391,8 +374,7 @@
    (direct-declarator |(| parameter-type-list |)|
                       (lambda (a b c d)
                         (declare (ignore b d))
-                        (list* 'function a c)))
-   )
+                        (list* 'function a c))))
 
   (pointer
    (|*| type-qualifier-list-opt #'cons)
@@ -417,13 +399,11 @@
 
   (type-qualifier-list
    (type-qualifier)
-   (type-qualifier-list type-qualifier #'rcons)
-   )
+   (type-qualifier-list type-qualifier #'rcons))
 
   (parameter-type-list
    parameter-list
-   (parameter-list |,| |...| #'rcons3)
-   )
+   (parameter-list |,| |...| #'rcons3))
 
 
   (parameter-type-list-opt
@@ -439,16 +419,16 @@
    (declaration-specifiers abstract-declarator-opt))
 
   (identifier-list
-   identifier-list-no-elipsis
-   (identifier-list-no-elipsis |,| |...| #'rcons3))
-
-  (identifier-list-no-elipsis
-   (identifier)
-   (identifier-list |,| identifier #'rcons3))
+   identifier-list-no-ellipsis
+   (identifier-list-no-ellipsis |,| |...| #'rcons3))
 
   (identifier-list-opt
    ()
    identifier-list)
+
+  (identifier-list-no-ellipsis
+   (identifier)
+   (identifier-list-no-ellipsis |,| identifier #'rcons3))
 
   (type-name
    (specifier-qualifier-list abstract-declarator-opt))
@@ -473,8 +453,7 @@
    (direct-abstract-declarator-opt |(| parameter-type-list-opt |)| ; abstract fn decl
                                    (lambda (a b c d)
                                      (declare (ignore b d))
-                                     (list* 'function a c)))
-   )
+                                     (list* 'function a c))))
 
   (direct-abstract-declarator-opt
    ()
@@ -483,14 +462,12 @@
   (initializer
    (assignment-expression #'(lambda (x) (list 'expression x)))
    (|{| initializer-list |}| (extract 'initializer-list 1))
-   (|{| initializer-list |,| |}| (extract 'initializer-list 1))
-   )
+   (|{| initializer-list |,| |}| (extract 'initializer-list 1)))
 
   (initializer-list
    (designation-opt initializer #'(lambda (a b) (list a b)))
    (initializer-list |,| designation-opt initializer
-                     #'(lambda (a b c d) (declare (ignore b)) (append a (list (list c d)))))
-   )
+                     #'(lambda (a b c d) (declare (ignore b)) (append a (list (list c d))))))
 
   (designation
    (designator-list |=| #'(lambda (a b) (list b a))))
@@ -505,8 +482,7 @@
 
   (designator
    (|[| constant-expression |]| (extract 'aref 1))
-   (|.| identifier (extract '|.| 1))
-   )
+   (|.| identifier (extract '|.| 1)))
 
   (statement-no-head
    labeled-statement
@@ -517,14 +493,12 @@
    jump-statement)
 
   (statement
-   (statement-no-head (extract 'statement 0))
-   )
+   (statement-no-head (extract 'statement 0)))
 
   (labeled-statement
    (identifier |:| statement (extract 'label 0 2))
    (case constant-expression |:| statement (extract 'case 1 3))
-   (default |:| statement (extract 'default 2))
-   )
+   (default |:| statement (extract 'default 2)))
 
   (compound-statement
    (|{| block-item-list-opt |}|
@@ -540,12 +514,10 @@
 
   (block-item
    declaration
-   statement
-   )
+   statement)
 
   (expression-statement
-   (expression-opt |;| (extract 'expression 0))
-   )
+   (expression-opt |;| (extract 'expression 0)))
 
   (selection-statement
    (if |(| expression |)| statement (extract 0 2 4))
@@ -559,15 +531,13 @@
         (extract 0 2 4 6 8))
    (for |(| declaration expression-opt |;| expression-opt |)| statement
         #'(lambda (a b c d e f g h) (declare (ignore b e g h))
-            (list a (list 'declaration c) d f)))
-   )
+            (list a (list 'declaration c) d f))))
 
   (jump-statement
    (goto identifier |;| (extract 0 1))
    (continue |;| (constantly (list 'continue)))
    (break |;| (constantly (list 'break)))
-   (return expression-opt |;| (extract 0 1))
-   )
+   (return expression-opt |;| (extract 0 1)))
 
   (toplevel-item
    preprocessor-directive
@@ -575,8 +545,7 @@
 
   (translation-unit
    (toplevel-item)
-   (translation-unit toplevel-item #'rcons)
-   )
+   (translation-unit toplevel-item #'rcons))
 
   (external-declaration ; TODO checkpoint file-position here
    function-definition
@@ -585,8 +554,7 @@
   (function-definition
    (declaration-specifiers declarator ;declaration-list-opt k&r?
                            compound-statement
-                           (extract 'definition 0 1 2))
-   )
+                           (extract 'definition 0 1 2)))
 
   (declaration-list
    (declaration)
@@ -601,8 +569,9 @@
 (defun parse-c-file (in &key typedefs)
   (let ((*line-number* 1)
         (*typedef-names* (make-hash-table :test 'equal))
-        (*comments* (list)))
-    (declare (special *typedef-names* *line-number* *c-parser* *comments*))
+        (*comments* (list))
+        (*in-define* nil))
+    (declare (special *typedef-names* *line-number* *c-parser* *comments* *in-define*))
     (dolist (tok typedefs) (notice-typedef tok))
     (handler-case
         (values (yacc:parse-with-lexer (make-c-lexer in) *c-parser*)

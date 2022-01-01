@@ -177,6 +177,9 @@
         ((or (char<= #\A c #\Z)
              (char<= #\a c #\z)
              (char<= #\0 c #\9)
+             ;; XXX treat stringifiction and concat #c a##b as single id. This can be
+             ;; detected since it's not otherwise allowed, but not impld anyways for now
+             (eql c #\#)
              (eql c #\_))
          (vector-push-extend c string))
         (t
@@ -197,7 +200,6 @@
       "++" "--"
       "<<" ">>" "<=" ">=" "==" "!=" "&&" "||"
       "*=" "/=" "%=" "+=" "-=" "<<=" ">>=" "&=" "~=" "|="
-      "##"
       "<:" ":>" "<%" "%>" "%:"))
 
   (defparameter *punctuator-tokens-3*
@@ -248,8 +250,9 @@
   (lexer-read-char in)
   (case c
     (#\/
-     (lexer-read-line in)
-     (lexer-unread-char #\Newline in))
+     (let ((comment (lexer-read-line in)))
+       (lexer-unread-char #\Newline in)
+       comment))
     (#\*
      (with-output-to-string (string)
        (loop
@@ -264,15 +267,18 @@
 (defun get-token-string (in c)
   (values 'string
            (with-output-to-string (s)
-             (write-char c s)
+             (lexer-unread-char c in)
              (loop for line = (lexer-read-line in)
                    for length = (length line)
-                   do (if (eql #\\ (schar line (1- length)))
-                          (write-string line s :start 0 :end (1- length))
-                          (progn
-                            (write-string line s)
-                            (lexer-unread-char #\Newline in)
-                            (loop-finish)))))))
+                   do (cond ((zerop length) (loop-finish)) ; zero length token-string
+                            ((eql #\\ (schar line (1- length)))
+                             (write-string line s :start 0 :end (1- length)))
+                            (t
+                             (write-string line s)
+                             (lexer-unread-char #\Newline in)
+                             (loop-finish)))))))
+
+(defvar *in-define*)
 
 (defun get-preprocessor-token (in c preprocessor-state)
   (case preprocessor-state
@@ -302,20 +308,35 @@
                (t
                 (vector-push-extend c filename))))))
     (line (values 'number (get-numeric-token in c) 'line-filename))
-    ((pragma error) (get-token-string in c)) ; TODO
+    ;; pragma is unused
+    ;; parser has nothing to do with with error garbage strings, so just lex like so
+    ((pragma error) (get-token-string in c))
     ((ifdef ifndef undef if elif else endif)
      (lexer-unread-char c in)
      (get-next-token in nil))
-    ;; (defin-params (list 'identifier get-identifier-token))
-    ;; (defin-token-string (get-token-string in c))
+    ;; allow expanding to expressions (including function calls)
+    ;; disallow type alias and definition generation for now
+    (define
+     (setf *in-define* t)
+     (lexer-unread-char c in)
+     (get-next-token in nil))
     ))
 
 (defun get-next-token (in preprocessor-state)
   (declare (stream in))
   (let* ((file-start? (zerop (file-position in)))
-         (c (skip-whitespace in))) ; has side effect
+         (c (or (skip-whitespace in) ; has side effect
+                (return-from get-next-token))))
+    (when *in-define*
+      (case c
+        (#\\
+         (when (eql (peek-char nil in nil) #\Newline)
+           (lexer-read-char in)) ; throw away newline
+         (setf c (or (skip-whitespace in)
+                     (return-from get-next-token))))
+        (#\Newline
+         (setf *in-define* nil))))
     (cond
-      ((null c) (values nil nil))
       (preprocessor-state (get-preprocessor-token in c preprocessor-state))
       ((or file-start?
            (char= c #\Newline))
@@ -375,8 +396,9 @@
 (defun lex-c-file (file)
   (let ((*line-number* 1)
         (*typedef-names* (make-hash-table :test 'equal))
-        (*comments* (list)))
-    (declare (special *typedef-names* *line-number* *c-parser*  *comments*))
+        (*comments* (list))
+        (*in-define* nil))
+    (declare (special *typedef-names* *line-number* *comments* *in-define*))
     (values (with-open-file (in file)
               (loop with lexer = (make-c-lexer in)
                     for token = (multiple-value-list (funcall lexer))
