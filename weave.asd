@@ -1,8 +1,8 @@
-(asdf:defsystem :kira
-  :build-pathname "kira"
-  :entry-point "kira:main"
+(asdf:defsystem :weave
+  ;;:build-pathname "kira"
+  ;;:entry-point "kira:main"
   ;;:author "tianlin qu <tianlinqu@gmail.com>"
-  :description "A SDL2 frontend for Kira"
+  :description "A semantic C editor"
   :license "BSD 3-clause license"
   :depends-on (#:alexandria
                #:trivial-features

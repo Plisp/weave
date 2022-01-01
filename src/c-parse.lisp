@@ -1,4 +1,4 @@
-(in-package #:kira-c)
+(in-package #:weave-c)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defun rcons (l x)

@@ -1,8 +1,8 @@
 ;;; C language support
 
-(defpackage #:kira-c
+(defpackage #:weave-c
   (:use :cl))
-(in-package #:kira-c)
+(in-package #:weave-c)
 
 ;;; lexer
 
@@ -50,8 +50,8 @@
 (defun string-to-symbol (s)
   (declare (simple-string s))
   (if (some #'upper-case-p s)
-      (intern s 'kira-c)
-      (intern (string-upcase s) 'kira-c)))
+      (intern s 'weave-c)
+      (intern (string-upcase s) 'weave-c)))
 
 (defun skip-whitespace (in &optional c)
   (declare (optimize (speed 3) (safety 1))
@@ -379,7 +379,7 @@
                      *comments*)
                ;; TODO SHOULD BE TAIL CALL, make sure
                (get-next-token in nil))
-             (let ((s (intern (get-punctuator-token in c) 'kira-c)))
+             (let ((s (intern (get-punctuator-token in c) 'weave-c)))
                (values s s)))))
       (t
        (error "Unexpected character \"~A\"" c)))))

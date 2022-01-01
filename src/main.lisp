@@ -1,4 +1,4 @@
-(in-package #:kira)
+(in-package #:weave)
 
 ;; editor state
 (defvar *running* nil)

@@ -1,11 +1,11 @@
-(defpackage #:kira
+(defpackage #:weave
   (:use :cl :alexandria)
   (:import-from #:raw-bindings-sdl2 #:x #:y #:h #:w)
   (:local-nicknames (#:fonts #:org.shirakumo.font-discovery)
                     (#:sdl #:raw-bindings-sdl2)
                     (#:sdl-ttf #:raw-bindings-sdl2-ttf))
   (:export #:main))
-(in-package #:kira)
+(in-package #:weave)
 
 (defparameter *cursor* nil)
 
