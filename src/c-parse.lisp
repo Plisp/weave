@@ -34,15 +34,12 @@
 
 (yacc:define-parser *c-parser*
   (:start-symbol translation-unit)
-  (:muffle-conflicts (3 2))
+  (:muffle-conflicts (3 0))
   (:terminals (identifier number string wide-string character wide-character
                           |(| |)| |[| |]| |.| |->| |++| |--| |{| |}| |,| |;|
                           |&| |*| |/| |%| |+| |-| |~| |!| |<<| |>>| |<| |>| |<=| |>=|
                           |==| |!=| |^| \| |&&| \|\| |?| |:|
                           |=| |*=| |/=| |%=| |+=| |-=| |<<=| |>>=| |&=| |^=| |...| |\|=|
-                          |#|
-                          define undef include line error pragma
-                          ppif ifdef ifndef ppelse elif endif
                           typedef-name sizeof
                           typedef extern static auto register
                           void char short int long float double signed unsigned
@@ -54,48 +51,16 @@
                           goto continue break return
                           asm __asm__))
 
-  (preprocessor-directive
-   (include string-literal)
-   (line number string-literal)
-   (pragma string)
-   (error string)
-   (undef identifier)
-   (ifdef identifier)
-   (ifndef identifier)
-   ;; disallow preprocessor 'typedef's for now
-   ;; XXX issue with reduce conflict between (expr)(call) and (macro params)(expr)
-   (define identifier |(| identifier-list-opt |)| expression-opt)
-   (define identifier expression-opt)
-   ppelse
-   (ppif primary-expression translation-unit endif (lambda (p exp forms e)
-                                                     (declare (ignore e))
-                                                     `(,p ,exp ,@forms)))
-   (elif primary-expression translation-unit endif (lambda (p exp forms e)
-                                                     (declare (ignore e))
-                                                     `(,p ,exp ,@forms)))
-   )
-
-  ;; TODO distinguish these from ident objects (keep type of strings - char32_t)
   (string-literal
    (string #'(lambda (s) (list 'string s)))
    (wide-string #'(lambda (s) (list 'wide-string s)))
    (character #'(lambda (s) (list 'character s)))
    (wide-character #'(lambda (s) (list 'wide-character s))))
 
-  ;; adjacent string literals are concatenated in translation phase 6, meaning
-  ;; I need to run the preprocessor prior to execution (needs user compilation flags)
-  ;;
-  ;; The hack here covers parsing of adjacent str literals and #defined identifiers,
-  ;; assuming keywords are not #defined to be idents/string literal constants (dumb)
-  (string-literals
-   string-literal
-   (identifier (lambda (a) (list a))) ; these have no enclosing list
-   (string-literal string-literals (lambda (a b) (append (list a) b)))
-   (identifier string-literals (lambda (a b) (append (list a) b))))
-
   (primary-expression
    number
-   string-literals ; covers solitary identifiers
+   identifier
+   string-literal
    (|(| expression |)| #'(lambda (a b c) (declare (ignore a c)) b)))
 
   (postfix-expression
@@ -371,7 +336,7 @@
    (direct-declarator |[| fn-qualifier-list-opt assignment-expression-opt |]| ; a[3] primary exp
                       (extract 'array 3 2 0))
    (direct-declarator |[| fn-qualifier-list-opt |*| |]| (extract 'array '* 2 0))
-   (direct-declarator |(| parameter-type-list |)|
+   (direct-declarator |(| parameter-type-list-opt |)|
                       (lambda (a b c d)
                         (declare (ignore b d))
                         (list* 'function a c))))
@@ -539,15 +504,11 @@
    (break |;| (constantly (list 'break)))
    (return expression-opt |;| (extract 0 1)))
 
-  (toplevel-item
-   preprocessor-directive
-   external-declaration)
-
   (translation-unit
-   (toplevel-item)
-   (translation-unit toplevel-item #'rcons))
+   (external-declaration)
+   (translation-unit external-declaration #'rcons))
 
-  (external-declaration ; TODO checkpoint file-position here
+  (external-declaration
    function-definition
    declaration)
 

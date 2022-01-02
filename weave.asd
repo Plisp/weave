@@ -14,9 +14,8 @@
                ;;#:trivial-clipboard
                )
   :pathname "src"
-  :serial t
   :components ((:file "nodes")
                (:file "c-lex")
-               (:file "c-parse")
-               (:file "main")
+               (:file "c-parse" :depends-on ("c-lex"))
+               (:file "main" :depends-on ("nodes"))
                ))
