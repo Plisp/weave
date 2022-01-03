@@ -513,7 +513,7 @@
    declaration)
 
   (function-definition
-   (declaration-specifiers declarator ;declaration-list-opt k&r?
+   (declaration-specifiers declarator declaration-list-opt ; k&r style
                            compound-statement
                            (extract 'definition 0 1 2)))
 
@@ -531,11 +531,12 @@
   (let ((*line-number* 1)
         (*typedef-names* (make-hash-table :test 'equal))
         (*comments* (list))
-        (*in-define* nil))
+        (*in-cpp* nil))
     (declare (special *typedef-names* *line-number* *c-parser* *comments* *in-define*))
     (dolist (tok typedefs) (notice-typedef tok))
     (handler-case
         (values (yacc:parse-with-lexer (make-c-lexer in) *c-parser*)
-                (list :comments *comments*))
+                ;(list :comments *comments*)
+                )
       (yacc:yacc-parse-error (e)
         (error "Parse error at line ~A:~%~A" *line-number* e)))))

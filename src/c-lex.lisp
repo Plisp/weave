@@ -325,7 +325,9 @@
 
 (defun get-next-token (in preprocessor-state)
   (declare (stream in))
-  (prog ((c (skip-whitespace in)))
+  (prog (c)
+   start
+     (setf c (skip-whitespace in))
      (cond (preprocessor-state
             (go preprocessor))
            (*in-cpp* ; falls through to # scan/normal processing
@@ -333,11 +335,11 @@
               (#\\
                (when (eql (peek-char nil in nil) #\Newline)
                  (lexer-read-char in)) ; throw away newline
-               (setf c (skip-whitespace in))
-               (go simple)) ; do not start a new directive
+               (go start)) ; do not start a new directive
               (#\Newline
                (setf *in-cpp* nil)
-               (go newline-loop)))))
+               (lexer-unread-char c in)
+               (return (values 'cpp-end 'cpp-end))))))
    newline-loop ; normal lexing doesn't care for newlines, only the pp
      (let ((first-char? (= 1 (file-position in))) ; we just read the 0th char
            (newline? (char= c #\Newline)))
@@ -386,8 +388,7 @@
                 (let ((fpos (file-position in)))
                   (push (list fpos (get-comment in next) (file-position in))
                         *comments*)
-                  ;; TODO SHOULD BE TAIL CALL, make sure
-                  (get-next-token in nil))
+                  (go start))
                 (let ((s (intern (get-punctuator-token in c) 'weave-c)))
                   (values s s)))))
          (t
