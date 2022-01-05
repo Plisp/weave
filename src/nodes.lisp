@@ -7,19 +7,32 @@
   (:export #:main))
 (in-package #:weave)
 
-(defparameter *cursor* nil)
-
 (defclass node ()
-  ((name :initarg :name
-         :accessor name
-         :type string) ; TODO SHOULD BE A ROPE
-   (fg :initform '(147 161 161)
-       ;;:type fixnum
-       :initarg :fg
-       :accessor fg
-       )
-   (bg :initform '(108 113 196)
-       ;;:type fixnum
-       :initarg :bg
-       :accessor bg
-       )))
+  ((value :initarg :value
+          :accessor value))
+  (:documentation "represents a node in the AST"))
+
+(defclass string-literal (node)
+  ((value :initarg value
+          :accessor value
+          :type string)))
+
+(defclass number-literal (node)
+  ((value :initarg value
+          :accessor value
+          :type number)))
+
+(defclass typename (node)
+  ((value :initarg value
+          :accessor value
+          :type symbol)))
+
+(defgeneric value (node)
+  (:method (node)
+    (values nil nil)))
+
+(defun make-children (&rest objects)
+  (let ((v (make-array 1 :fill-pointer t :adjustable t)))
+    (loop for object in objects
+          do (vector-push-extend object v)
+          finally (return v))))

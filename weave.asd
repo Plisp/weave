@@ -5,6 +5,7 @@
   :description "A semantic C editor"
   :license "BSD 3-clause license"
   :depends-on (#:alexandria
+               #:trivia
                #:trivial-features
                #:yacc
                ;;
@@ -15,7 +16,8 @@
                )
   :pathname "src"
   :components ((:file "nodes")
+               (:file "draw" :depends-on ("nodes"))
                (:file "c-lex")
-               (:file "c-parse" :depends-on ("c-lex"))
-               (:file "main" :depends-on ("nodes"))
+               (:file "c-parse" :depends-on ("c-lex" "nodes"))
+               (:file "main" :depends-on ("draw" "nodes"))
                ))

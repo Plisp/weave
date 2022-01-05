@@ -417,3 +417,9 @@
                     collect token))
             ;; (list :comments *comments*)
             )))
+
+(defun preprocess-c-file (file)
+  (setf file (namestring (truename file)))
+  (uiop:run-program
+   (list "gcc" "-E" "-P" "-D__extension__=" "-D __attribute__(x)=" file
+         "-o" (concatenate 'string file ".i"))))
