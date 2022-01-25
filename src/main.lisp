@@ -36,13 +36,11 @@
                  (cffi:foreign-slot-value event 'sdl:sdl-mouse-motion-event 'x)
                  (cffi:foreign-slot-value event 'sdl:sdl-mouse-motion-event 'y)))
 
-        (#.sdl:+sdl-mousewheel+
-         (case (print (cffi:foreign-slot-value event 'sdl:sdl-mouse-wheel-event 'y))
-           (1 (incf *offset* 3))
-           (-1 (setf *offset* (max 0 (- *offset* 3))))))
-
         (#.sdl:+sdl-keydown+
-         ())
+         (print (cffi:foreign-slot-value
+                 (cffi:foreign-slot-value event 'sdl:sdl-keyboard-event 'sdl:keysym)
+                 'sdl:sdl-keysym
+                 'sdl:sym)))
         )
     (never-gonna-give-you-up ()
       (return-from %handle-event))))

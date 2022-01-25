@@ -1,4 +1,4 @@
-(in-package :weave)
+(in-package #:weave)
 
 (defgeneric draw-node (draw-fn node x y &key &allow-other-keys)
   (:documentation "calls DRAW-FN, which is implemented by frontend:
