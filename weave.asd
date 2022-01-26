@@ -17,7 +17,5 @@
   :pathname "src"
   :components ((:file "nodes")
                (:file "draw" :depends-on ("nodes"))
-               (:file "c-lex")
-               (:file "c-parse" :depends-on ("c-lex" "nodes"))
                (:file "main" :depends-on ("draw" "nodes"))
                ))
