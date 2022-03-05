@@ -1,10 +1,10 @@
-# An integrated editor and lisp? in Common Lisp
+# An WIP programming language and IDE
 
 An editor and language runtime that utilises a
 [full semantic graph](https://plisp.github.io/posts/Editing-abstraction-not-text-updated.html)
 of the program as the sole internal representation, 'projecting' to text for persistence
-when necessary. In theory this allows support for:
+when necessary.
 
-* live redefinition and inspection of running programs
-* typed macros with access to full compiler analysis
-* calls to existing C libraries
+# Dependencies
+* https://github.com/Zulu-Inuoe/raw-bindings-sdl2
+* https://github.com/Zulu-Inuoe/raw-bindings-sdl2-ttf

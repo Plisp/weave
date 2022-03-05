@@ -1,3 +1,12 @@
+(defpackage #:weave
+  (:use :cl :alexandria)
+  (:import-from #:raw-bindings-sdl2 #:x #:y #:h #:w)
+  (:local-nicknames (#:r #:weave.runtime)
+                    (#:ui #:weave.ui)
+                    (#:fonts #:org.shirakumo.font-discovery)
+                    (#:sdl #:raw-bindings-sdl2)
+                    (#:sdl-ttf #:raw-bindings-sdl2-ttf))
+  (:export #:main))
 (in-package #:weave)
 
 ;;;
@@ -7,7 +16,7 @@
 ;; editor state
 (defvar *running* nil)
 (defparameter *tree*
-  (make-instance 'node :value "test"))
+  (make-instance 'r:node :value "test"))
 
 (defparameter *cursor* (list)
   "A stack of nodes and editing context for the current node, for functional updates.")
@@ -52,34 +61,33 @@
 
 (defun sdl-draw (text x y &key color)
   "TODO handle wrapping/clipping"
-  (trivia:match (theme-lookup nil)
-    ((vector fg bg)
-     (apply #'sdl:sdl-set-render-draw-color *sdl-renderer*
-            `(,@(or (bg color) bg) 0))
-     (sdl:sdl-render-clear *sdl-renderer*)
-     (let* ((surface
-              (sdl-ttf:ttf-render-utf8-blended *sdl-ttf-font* text
-                                               (sdlify-color (or (fg color) fg))))
-            (texture
-              (sdl:sdl-create-texture-from-surface *sdl-renderer* surface)))
-       ;;
-       (flet ((surface-w (surface)
-                (cffi:foreign-slot-value surface 'sdl:sdl-surface 'sdl:w))
-              (surface-h (surface)
-                (cffi:foreign-slot-value surface 'sdl:sdl-surface 'sdl:h)))
-         (cffi:with-foreign-object (rect 'sdl:sdl-rect)
-           (let ((pos-x x)
-                 (pos-y y))
-             (cffi:with-foreign-slots ((x y w h) rect sdl:sdl-rect)
-               (setf x pos-x
-                     y pos-y
-                     w (surface-w surface)
-                     h (surface-h surface))
-               (sdl:sdl-render-copy *sdl-renderer* texture
-                                    (cffi:null-pointer)
-                                    rect)))))
-       (sdl:sdl-free-surface surface)
-       (sdl:sdl-destroy-texture texture))))
+  (apply #'sdl:sdl-set-render-draw-color *sdl-renderer*
+         `(,@(or (ui:bg color) (svref (ui:theme-lookup nil) 1)) 0))
+  (sdl:sdl-render-clear *sdl-renderer*)
+
+  (let* ((default-fg (svref (ui:theme-lookup nil) 0))
+         (surface
+           (sdl-ttf:ttf-render-utf8-blended *sdl-ttf-font* text
+                                            (sdlify-color (or (ui:fg color) default-fg))))
+         (texture (sdl:sdl-create-texture-from-surface *sdl-renderer* surface)))
+    ;;
+    (flet ((surface-w (surface)
+             (cffi:foreign-slot-value surface 'sdl:sdl-surface 'sdl:w))
+           (surface-h (surface)
+             (cffi:foreign-slot-value surface 'sdl:sdl-surface 'sdl:h)))
+      (cffi:with-foreign-object (rect 'sdl:sdl-rect)
+        (let ((pos-x x)
+              (pos-y y))
+          (cffi:with-foreign-slots ((x y w h) rect sdl:sdl-rect)
+            (setf x pos-x
+                  y pos-y
+                  w (surface-w surface)
+                  h (surface-h surface))
+            (sdl:sdl-render-copy *sdl-renderer* texture
+                                 (cffi:null-pointer)
+                                 rect)))))
+    (sdl:sdl-free-surface surface)
+    (sdl:sdl-destroy-texture texture))
   (sdl:sdl-render-present *sdl-renderer*))
 
 (defun main ()
@@ -120,7 +128,7 @@
                    :while *running*
                    :do (sdl:sdl-wait-event event) ; 10ms poll
                        (%handle-event event)
-                       (draw-node #'sdl-draw *tree* 0 0))))
+                       (ui:draw-node #'sdl-draw *tree* 0 0))))
       ;; unwind
       (format t "stopped~%")
       (setf *running* nil)

@@ -1,35 +1,43 @@
-(defpackage #:weave
-  (:use :cl :alexandria)
-  (:import-from #:raw-bindings-sdl2 #:x #:y #:h #:w)
-  (:local-nicknames (#:fonts #:org.shirakumo.font-discovery)
-                    (#:sdl #:raw-bindings-sdl2)
-                    (#:sdl-ttf #:raw-bindings-sdl2-ttf))
-  (:export #:main))
-(in-package #:weave)
-
-(defclass node ()
-  ((value :initarg :value
-          :accessor value))
-  (:documentation "represents a node in the AST"))
-
-(defclass string-literal (node)
-  ((value :initarg value
-          :accessor value
-          :type string)))
-
-(defclass number-literal (node)
-  ((value :initarg value
-          :accessor value
-          :type number)))
-
-(defclass typename (node)
-  ((value :initarg value
-          :accessor value
-          :type symbol)))
+(defpackage #:weave.runtime
+  (:use :cl :alexandria))
+(in-package #:weave.runtime)
 
 (defgeneric value (node)
   (:method (node)
     (values nil nil)))
+
+(defmacro defs (name parents slots)
+  `(progn
+     (defclass ,name (,@parents)
+       ,(mapcar (lambda (name)
+                  `(,name :initarg ,(make-keyword name)
+                          :accessor ,name))
+         slots))
+     ,@(mapcar (lambda (name) `(export ',name))
+               slots)
+     (export ',name)))
+
+(defs node ()
+  (value))
+
+(defs expr (node)
+  ())
+
+(defs number-lit (node) ())
+
+(defs var (node) ())
+(defs val (node) ())
+
+;; control flow
+
+(defs if-expr (node)
+  ())
+
+(defs assign-expr (node)
+  ())
+
+(defs fn-expr (node)
+  ())
 
 (defun make-children (&rest objects)
   (let ((v (make-array 1 :fill-pointer t :adjustable t)))
