@@ -1,16 +1,15 @@
-(asdf:defsystem #:weave
+(asdf:defsystem :weave
   :author "tianlin qu <tianlinqu@gmail.com>"
-  :description "A semantic C editor"
+  :description "A semantic lisp editor"
   :license "BSD 3-clause license"
   :depends-on (#:alexandria
-			   #:cl-environments
+               ;;:bordeaux-threads
+			   :cl-environments
 			   #:eclector
-			   #:slynk
+			   :slynk
                #:trivial-features
-               ;;
-               ;#:cffi-libffi ; for sdl bindings
-               ;#:font-discovery
-               ;#:raw-bindings-sdl2 #:raw-bindings-sdl2-ttf ; *not on quicklisp*
+               :trivia
+               ;;:uncursed
                )
   :pathname "src"
   :components ((:file "ast")
