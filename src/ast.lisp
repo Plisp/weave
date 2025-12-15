@@ -14,7 +14,7 @@
 (defmacro disp (form)
   (once-only ((res form))
     `(progn
-       (format t "~s|> ~a~%" ',form ,res)
+       (format t "~s~%|> ~a~%" ',form ,res)
        ,res)))
 
 (defun addr-str (obj)
@@ -25,6 +25,25 @@
     (if (>= length 3)
         (subseq str (- length 3))
         str)))
+
+(defun lfind (item list &key (key #'identity) (test #'eql) (start 0) (end (length list)))
+  "NIL-detecting version of find for lists, only searches forwards"
+  (declare (optimize speed)
+           (type fixnum start end)
+           (type list list))
+  (assert (<= 0 start end (length list)))
+  (loop for elt in (nthcdr start list)
+        do (when (funcall (the function test) item (funcall (the function key) elt))
+             (return (values elt t)))))
+
+(defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
+  (with-gensyms (blockname present-p)
+    `(block ,blockname
+       (multiple-value-bind (,name ,present-p)
+           ,mvcall
+         (when ,present-p
+           (return-from ,blockname (progn ,@then))))
+       ,default)))
 
 ;;
 ;;; eclector reader
@@ -210,20 +229,23 @@ copy-env can exploit structure sharing, remember to PUSH!"
 (defmethod (setf tags) (new (env env)) (setf (%tags env) new))
 
 (defun env-variable-info (name env)
-  (find name (variable-bindings env) :key #'first))
+  (find name (variable-bindings env) :key 'first))
 (defun env-function-info (name env)
-  (find name (function-bindings env) :key #'first))
+  (find name (function-bindings env) :key 'first))
 
 (defun env-with-variables (env bindings)
   (let ((new-env (copy-env env)))
-    (dolist (v bindings)
-      (push (list v) (variable-bindings new-env)))
+    (setf (variable-bindings new-env) (append bindings (variable-bindings new-env)))
     new-env))
 
 (defun env-with-functions (env bindings)
   (let ((new-env (copy-env env)))
-    (dolist (v bindings)
-      (push (list v) (function-bindings new-env)))
+    (setf (function-bindings new-env) (append bindings (function-bindings new-env)))
+    new-env))
+
+(defun env-with-blocks (env bindings)
+  (let ((new-env (copy-env env)))
+    (setf (blocks new-env) (append bindings (blocks new-env)))
     new-env))
 
 (defun wrap-with-wrapper (form entries wrapper)
@@ -278,7 +300,7 @@ copy-env can exploit structure sharing, remember to PUSH!"
     "The list of nonportable hardwired macros, not macroexpanded"))
 
 (defun hardwired-p (macro-name)
-  (find macro-name *hardwired-operators*))
+  (position macro-name *hardwired-operators*))
 
 (defmethod env-macroexpand-1 (x env)
   "Tries macroexpanding a non-hardwired form x in evaluation position, once"
@@ -323,50 +345,65 @@ copy-env can exploit structure sharing, remember to PUSH!"
 ;; we need to be more permissive for lambda lists. It makes little sense to preserve
 ;; well-formedness when it often breaks with edits due to positional &keyword context
 ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
-(defun lambda-list-variable-names (list)
+(defun map-lambda-list (list on-binder value-mapper specializer-list-p)
   "Requires a list but otherwise doesn't force well-formedness and tries to be very
-tolerant. Returns an ordered list of symbols suitable for constructing cumulative scopes."
-  (loop for name in list
-        when (and (not (find name lambda-list-keywords))
-                  (trivia:match name
-                    ((type symbol) name)
-                    ((list* (and (type symbol) x) _) x) ; methods and defaults
-                    ((list* (list _ (and (type symbol) x)) _) x)))
-          collect it
-        when (trivia:match name
-               ((list _ _ (and (type symbol) supplied-p-var)) supplied-p-var))
-          collect it))
-;; could be a method lambda list, or an intermediate &key editing state. allow it
-(assert (equal (lambda-list-variable-names '((a t))) '(A)))
-(assert (equal (lambda-list-variable-names '(a a)) '(A A))) ; XXX are duplicates fine?
-(assert (equal (lambda-list-variable-names '(a &key ((:weave name) default supplied-p)))
-               '(A NAME SUPPLIED-P)))
+tolerant. Previous calls to ON-BINDER give exactly the environment of VALUE-MAPPER calls.
+Reconstructs the list structure from the return values of ON-BINDER and VALUE-MAPPER."
+  (loop with seen-opt-key-aux := nil
+        with res := nil
+        for elt in list
+        do (when (member elt '(&optional &rest &key &aux))
+             (setf seen-opt-key-aux t))
+           (labels ((maybe-default (val)
+                      (if (and specializer-list-p (not seen-opt-key-aux))
+                          val
+                          (funcall value-mapper val)))
+                    (map-param (elt)
+                      (trivia:match elt
+                        ((or (and (type symbol) x)
+                             (list (and (type symbol) x))) ; keyword or method-like
+                         (funcall on-binder x))
+                        ;; default value or specializer
+                        ((list (and (type symbol) x) val)
+                         (let ((value (maybe-default val)))
+                           (list (funcall on-binder x) value)))
+                        ;; supplied-p
+                        ((list (and (type symbol) x) val
+                               (and (type symbol) supplied-p))
+                         (let ((value (maybe-default val)))
+                           (list (funcall on-binder x) value
+                                 (funcall on-binder supplied-p))))
+                        ;; keyword name
+                        ((list (list call-name (and (type symbol) x)) val)
+                         (let ((value (maybe-default val)))
+                           (list* (list call-name (funcall on-binder x)) value)))
+                        ;; everything
+                        ((list (list call-name (and (type symbol) x)) val
+                               (and (type symbol) supplied-p))
+                         (let ((value (maybe-default val)))
+                           (list* (list call-name (funcall on-binder x)) value
+                                  (funcall on-binder supplied-p))))
+                        (_ (funcall value-mapper elt)))))
+             (if (find elt lambda-list-keywords)
+                 (push elt res)
+                 (push (map-param elt) res))) ; invalid
+        finally (return (nreverse res))))
 
-(defun macro-lambda-variable-names (list)
-  (loop with names := (list t) ; sentinel cons
-        with lastcons = names
+(defun map-macro-lambda (list on-binder value-mapper)
+  (loop with res := nil
         for rest on list
         for this = (car rest)
-        do (cond ((member this '(&body &rest &key &optional &aux) :test #'eq)
-                  (rplacd lastcons (lambda-list-variable-names rest))
-                  (return (cdr names)))
-                 ((find this lambda-list-keywords) nil)
-                 ((consp this)
-                  (when-let (rec (macro-lambda-variable-names this))
-                    (rplacd lastcons rec)
-                    (setf lastcons (last rec))))
-                 (t ; nil being a list sucks
-                  (when (and this (symbolp this))
-                    (rplacd lastcons (list this))
-                    (setf lastcons (cdr lastcons)))))
-        finally (return (cdr names))))
-
-(assert (equal (macro-lambda-variable-names '(() &body body)) '(BODY)))
-(assert (equal (macro-lambda-variable-names '((stream filespec &rest options) &body body))
-               '(STREAM FILESPEC OPTIONS BODY)))
+        do (cond ((member this '(&body &rest &key &optional &aux) :test 'eq)
+                  (return (nreconc res (map-lambda-list rest on-binder value-mapper nil))))
+                 ((find this lambda-list-keywords) (push this res))
+                 ((consp this) (push (map-macro-lambda this on-binder value-mapper) res))
+                 ((null this) (push nil res))
+                 ((symbolp this) (push (funcall on-binder this) res))
+                 (t (push (funcall value-mapper this) res)))
+        finally (return (nreverse res))))
 
 (defun parse-body-declarations (body documentation)
-  "wraps alexandria but throws a form-parse-error"
+  "Wraps alexandria but throws a form-parse-error"
   (declare (optimize speed))
   (handler-case (parse-body body :documentation documentation)
     (error ()
@@ -383,17 +420,7 @@ tolerant. Returns an ordered list of symbols suitable for constructing cumulativ
 ;;; if lisp is mud then parsing is the experience of it slipping through your fingers
 ;;
 
-;; return-from
-;; catch load-time-value setq
-;; eval-when locally
-;; tagbody
-;; function multiple-value-call the
-;; go multiple-value-prog1 throw
-;; if progn unwind-protect
-;; progv
-;; quote
-
-(defparameter *special-walkers* (make-hash-table :test #'eq))
+(defparameter *special-walkers* (make-hash-table :test 'eq))
 
 (eval-when (:compile-toplevel)
   (defparameter *parser-keywords* '(&rest &body &or &declarations &rest-qualifiers
@@ -404,17 +431,17 @@ tolerant. Returns an ordered list of symbols suitable for constructing cumulativ
     "Validates the spec and returns an alist of tag names and their arity-1 specifier
 if applicable."
     (flet ((spec-keyword-p (sym)
-             (member sym *parser-keywords* :test #'eq)))
+             (member sym *parser-keywords* :test 'eq)))
       (cond ((null spec) nil)
             ((consp (car spec)) ; list pattern
              (append (spec-names (car spec)) (spec-names (cdr spec))))
-            ;; spec keyword, expect a symbol immediately after, except for &or
+            ;; spec keyword, expect a non-NIL symbol immediately after, except for &or
             ((spec-keyword-p (car spec))
              (assert (or (eq (car spec) '&or)
                          (and (second spec)
                               (symbolp (second spec))
                               (not (spec-keyword-p (second spec))))))
-             (when (member (car spec) *arity-1-parser-keywords* :test #'eq)
+             (when (member (car spec) *arity-1-parser-keywords* :test 'eq)
                (assert (= 2 (length spec)))
                (return-from spec-names (list (cons (second spec) (car spec)))))
              (spec-names (cdr spec)))
@@ -430,13 +457,12 @@ if applicable."
             (some (lambda (m) (search-tree o m)) (cdr tree)))))
 
   (defstruct function-info
-    (kind '&lambda :type (or (eql &lambda) (eql &macro-lambda) (eql &method-lambda)))
     (arglist nil)
     (documentation nil :type (or null string))
     (decls nil)
     (body nil)))
 
-(defmacro deform ((name &rest spec) &key var fun block rest-patterns)
+(defmacro defform ((name &rest spec) &key binds rest-patterns)
   "Generates an AST type and scope parser associated with a macro or
 special operator NAME. The generated parser performs checking and signals form-parse-error
 when runtime matching fails.
@@ -444,48 +470,66 @@ when runtime matching fails.
 Keywords starting with & have special meaning and have arity 1, except for &or.
 Only one &body/&rest may occur per scope, designating an implicit progn similar to lambda
 lists. Rest-patterns destructure and parse subforms but do not create fields.
-Any binding (see below) forces a symbol match.
+Any binding forces a symbol match.
 
-VAR, FUN and BLOCK are alists with entries (binding-tag . body-tag), where each BINDING-TAG
-establishes the corresponding kind of lexical binding in the evaluation contexts named
-by BODY-TAG. BINDING-TAG can be NIL to indicate BODY-TAG refers to evaluated forms.
-Binding tag names may not be (member < > *)"
-  (let ((parser-name (symbolicate name "-CONS-PARSER")))
-    (flet ((validate-custom-binds (entries)
-             (loop
-               for (bind-tag . form-tag) in entries
-               do (trivia:match bind-tag
-                    ((list (or (eql '<) (eql '*)) bind-name)
-                     (assert (symbolp bind-name))
-                     (loop
-                       for (rest-tag . pattern) in rest-patterns
-                       do (when (search-tree bind-name pattern)
-                            (assert (search-tree form-tag pattern))
-                            (assert
-                             (trivia:match pattern
-                               ((list (eql bind-name) (eql form-tag)) t)
-                               ((list (eql bind-name) keyword (eql form-tag))
-                                (member keyword *arity-1-parser-keywords*))
-                               ((list* (eql '&or) rest)
-                                (loop
-                                  for pattern in rest
-                                  thereis
-                                  (trivia:match pattern
-                                    ((list (eql bind-name) (eql form-tag)) t)
-                                    ((list (eql bind-name) keyword (eql form-tag))
-                                     (member keyword *arity-1-parser-keywords*))))))))))))))
-      (validate-custom-binds var)
-      (validate-custom-binds fun)
-      (validate-custom-binds block))
+Every entry (ctx . entries) in BINDS denotes an evaluation context 'ctx' in which the
+corresponding lexical entries are bound. ctx is a symbol and entries is a plist (see below)
+Binding tag names **must not** be (member NIL < =). For each ctx, may have either:
+`<` for sequential variable binding
+`=` to indicate a rest entry in which parallel block bindings occur
+There's also a special syntax for macro bindings, but that isn't settled."
+  (let ((parser-name (symbolicate name "-CONS-PARSER"))
+        (custom-bind-rest-labels nil)
+        (tag-kinds (nconc (spec-names spec)
+                          (mapcan (lambda (pair) (spec-names (cdr pair)))
+                                  rest-patterns))))
+    (loop
+      for (ctx . entries) in binds
+      do (assert (symbolp ctx))
+         (loop
+           with special-seen
+           for (kind bind-tag) on entries
+           while bind-tag
+           do (trivia:ematch bind-tag
+                ((type symbol))
+                ((list (or (eql '<) (eql '=)) bind-name)
+                 (assert (not special-seen))
+                 (setf special-seen t)
+                 (when (eq (car bind-tag) '<) (assert (or (eq kind :variable))))
+                 (when (eq (car bind-tag) '=) (assert (or (eq kind :block))))
+                 (assert (symbolp bind-name))
+                 (loop
+                   for (rest-tag . pattern) in rest-patterns
+                   do (when (search-tree bind-name pattern)
+                        (assert (search-tree ctx pattern))
+                        (assert
+                         (trivia:match pattern
+                           ((list (eql bind-name) (eql ctx))
+                            (push (cons bind-name rest-tag) custom-bind-rest-labels))
+                           ((list (eql bind-name) keyword (eql ctx))
+                            (when (member keyword *arity-1-parser-keywords*)
+                              (push (cons bind-name rest-tag) custom-bind-rest-labels)))
+                           ((list* (eql '&or) rest)
+                            (loop
+                              for pattern in rest
+                              thereis
+                              (trivia:match pattern
+                                ((list (eql bind-name) (eql ctx))
+                                 (push (cons bind-name rest-tag)
+                                       custom-bind-rest-labels))
+                                ((list (eql bind-name) keyword (eql ctx))
+                                 (when (member keyword *arity-1-parser-keywords*)
+                                   (push (cons bind-name rest-tag)
+                                         custom-bind-rest-labels)))))))))))
+                ((list (type symbol) (type symbol))))))
 
     `(progn
        (defclass ,(symbolicate name "-FORM") (irregular-form)
          ((op :initform ',name)
-          ,@(loop for name in (delete-duplicates (mapcar #'car (spec-names spec)))
+          ,@(loop for name in (delete-duplicates (mapcar 'car (spec-names spec)))
                   collect `(,name :initarg ,(make-keyword name)
                                   :accessor ,name))
-          ,@(when (or var fun block)
-              `((envmap :initarg :envmap :initform (error "no env!"))))))
+          ,@(when binds `((envmap :initarg :envmap :initform (error "no env!"))))))
        ;; spec validated above by spec-names ^
        (defmacro ,parser-name (spec)
          (cond
@@ -495,9 +539,9 @@ Binding tag names may not be (member < > *)"
                                (form-parse-error "expected null, got ~a" form))))
            ((atom spec)
             `(lambda (form tagmap)
-               (when (and (or (assoc ',spec ',',var)
-                              (assoc ',spec ',',fun)
-                              (assoc ',spec ',',block))
+               (when (and ,(loop for (ctx . entries) in ',binds
+                                 thereis (loop for (kind tag) on entries
+                                               thereis (eq spec tag)))
                           (not (symbolp form)))
                  (form-parse-error "expected bound symbol match: ~a" form))
                (push form (gethash ',spec tagmap))
@@ -525,17 +569,23 @@ Binding tag names may not be (member < > *)"
                         for pattern in (cdr spec)
                         collect
                         `(handler-case
-                             (return (funcall (,',parser-name ,pattern) form tagmap))
+                             (let ((res (funcall (,',parser-name ,pattern) form tagmap)))
+                               ;;(push (cons res ',pattern) (gethash ',(cdr spec) tagmap))
+                               (return res))
                            (form-parse-error ())))
                     (form-parse-error "expected one of ~a got ~a" ',(cdr spec) form))))
               ((&method-lambda &lambda &macro-lambda)
                `(lambda (forms tagmap)
                   (when (null forms)
                     (form-parse-error "missing lambda list"))
-                  ;; special treatment is needed after parsing the body forms
-                  ;; the walker only needs the source unlike the parser
-                  (push forms (gethash ',(second spec) tagmap))
-                  forms))
+                  (multiple-value-bind (body decls doc)
+                      (parse-body-declarations (cdr forms) t)
+                    (let ((res (make-function-info :arglist (car forms)
+                                                   :documentation doc
+                                                   :decls decls
+                                                   :body body)))
+                      (push res (gethash ',(second spec) tagmap))
+                      res))))
               (&body
                `(lambda (body tagmap)
                   (symbol-macrolet ((res (gethash ',(second spec) tagmap)))
@@ -545,10 +595,10 @@ Binding tag names may not be (member < > *)"
                `(lambda (body tagmap)
                   (symbol-macrolet ((res (gethash ',(second spec) tagmap)))
                     ,(if-let (pattern (cdr (assoc (second spec) ',rest-patterns)))
-                       `(let ((body-parsed
-                                (loop for form in body
-                                      collect (funcall (,',parser-name ,pattern)
-                                                       form tagmap))))
+                       `(let (body-parsed)
+                          (loop for form in body
+                                do (push (funcall (,',parser-name ,pattern) form tagmap)
+                                         body-parsed))
                           (push body-parsed res)
                           body-parsed)
                        `(progn (push body res) body)))))
@@ -572,92 +622,245 @@ Binding tag names may not be (member < > *)"
 
        (defun ,(symbolicate name "-TAGGER") (form)
          "(tagmap form ctx..) -> new form. Returns parsed result as s expr"
-         (let ((tagmap (make-hash-table :test #'eq)))
+         (let ((tagmap (make-hash-table :test 'eq)))
            (funcall (,parser-name ,spec) (cdr form) tagmap)
            tagmap))
 
        (defun ,(symbolicate name "-WALKER") (tagmap walker env)
-         `(progn
-            ,@(loop
-                with res-code := nil
-                for (bind-tag . form-tag) in var
-                collect
-                (trivia:match bind-tag
-                  ((list (or (eql '<) (eql '*)) bind-name)
-                   (let ((custom (find-custom-binds var)))
-                     (error "")))
-                  ((list* name expansion) ; symbol macro
-                   (error ""))
-                  (_ ; variable TODO handle symbol macro and non-rest bindings
-                   `(loop
-                      for body-form in (apply #'append (gethash ',form-tag tagmap))
-                      do (funcall walker
-                                  body-form
-                                  (env-with-variables env (gethash ',bind-tag tagmap))))
-                   )))))
+         (declare (ignorable tagmap walker env))
+         ,@
+         (loop
+           for (ctx-tag . %entries) in binds
+           for entries := (plist-alist %entries)
+           collect ;tag-kinds var < (block =)
+           (labels ((sequential-p (entry) (and (listp entry) (eq (first entry) '<)))
+                    (parallel-p (entry)   (and (listp entry) (eq (first entry) '=)))
+                    (augment-env (env-exp entries)
+                      (if entries
+                          (destructuring-bind ((kind . record) &rest rest)
+                              entries
+                            (augment-env
+                             (if (or (sequential-p record) (parallel-p record))
+                                 env-exp
+                                 (case kind
+                                   (:variable
+                                    `(env-with-variables
+                                      ,env-exp
+                                      ,(trivia:ematch record
+                                         ((list (type symbol) whole-tag)
+                                          `(apply 'append (gethash ',whole-tag tagmap)))
+                                         ((type symbol)
+                                          `(mapcar 'list (gethash ',record tagmap))))))
+                                   (:function
+                                    `(env-with-functions
+                                      ,env-exp
+                                      ,(trivia:ematch record
+                                         ((list (type symbol) whole-tag)
+                                          `(loop
+                                             for (name . info)
+                                               in (apply 'append
+                                                          (gethash ',whole-tag tagmap))
+                                             collect
+                                             (list* name (function-info-arglist info)
+                                                    (function-info-body info))))
+                                         ((type symbol)
+                                          `(mapcar 'list (gethash ',record tagmap))))))
+                                   (:block `(env-with-blocks
+                                             ,env-exp (gethash ',record tagmap)))))
+                             rest))
+                          env-exp)))
+             (let ((seq-tag (third (rassoc-if #'sequential-p entries)))
+                   (par-tag (third (rassoc-if #'parallel-p entries)))
+                   (ctx-kind (cdr (assoc ctx-tag tag-kinds))))
+               (flet ((walk-function-body (env info augment-body)
+                        `(loop initially
+                          (flet ((note-binder (binder)
+                                   (setf newenv-with-params
+                                         (env-with-variables newenv-with-params
+                                                             (list binder)))))
+                            ,(if (eq ctx-kind '&macro-lambda)
+                                 `(map-macro-lambda (function-info-arglist ,info)
+                                                    #'note-binder
+                                                      (rcurry walker newenv-with-params))
+                                 `(map-lambda-list (function-info-arglist ,info)
+                                                   #'note-binder
+                                                     (rcurry walker newenv-with-params)
+                                                     ,(eq ctx-kind '&method-lambda))))
+                               with newenv-with-params = ,env
+                               for body-form in (function-info-body ,info)
+                               do (funcall walker body-form ,augment-body))))
+                 (cond
+                   (seq-tag
+                    (let ((whole-tag (cdr (assoc seq-tag custom-bind-rest-labels))))
+                      ;; TODO compile path to binder instead of using (first wholeform)
+                      `(or ; first detect whether a rest pattern was matched at all
+                        (with-lookup (wholeforms (gethash ',whole-tag tagmap))
+                          (loop for newenv := ,(augment-env `env entries)
+                                  then (if (symbolp whole)
+                                           (env-with-variables newenv (list whole))
+                                           (env-with-variables newenv
+                                                               (list (first whole))))
+                                ;; note: must reverse since tags are backwards
+                                for whole in (reverse (apply #'append wholeforms))
+                                do (when (listp whole)
+                                     ,(if ctx-kind
+                                          `(loop for bodyform in (second whole)
+                                                 do (funcall walker bodyform newenv))
+                                          `(funcall walker (second whole) newenv))))
+                          t)
+                        (loop for initform
+                                in ,(if ctx-kind
+                                        `(apply 'append (gethash ',ctx-tag tagmap))
+                                        `(gethash ',ctx-tag tagmap))
+                              do (funcall walker initform env)))))
+                   (par-tag
+                    (ecase ctx-kind
+                      ((&body &rest nil) (error "unimplemented"))
+                      ((&lambda &macro-lambda &method-lambda)
+                       (let ((whole (cdr (assoc par-tag custom-bind-rest-labels))))
+                         `(loop
+                            with newenv = ,(augment-env `env entries)
+                            for (name . info)
+                              in (apply #'append (gethash ',whole tagmap))
+                            ;; parallel bind the block only in the body
+                            ;; newenv-with-params is CAPTURED
+                            do ,(walk-function-body
+                                 `newenv `info
+                                 `(env-with-blocks newenv-with-params (list name))))))))
+                   (t
+                    (ecase ctx-kind
+                      ((&body &rest nil)
+                       `(loop with newenv = ,(augment-env `env entries)
+                              for body-form
+                                in ,(if ctx-kind
+                                        `(apply 'append (gethash ',ctx-tag tagmap))
+                                        `(gethash ',ctx-tag tagmap))
+                              do (funcall walker body-form newenv)))
+                      ((&lambda &macro-lambda &method-lambda)
+                       `(loop with newenv = ,(augment-env `env entries)
+                              for info in (gethash ',ctx-tag tagmap)
+                              do ,(walk-function-body `newenv `info ; vv CAPTURED
+                                                      `newenv-with-params)))))))))))
 
        (setf (gethash ',name *special-walkers*) ',(symbolicate name "-WALKER"))
        (values))))
 
-(deform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
-  :fun ((name . fun-code))
-  :block ((name . fun-code)))
+(defun test-walker (form)
+  (disp (hash-table-plist (funcall (symbolicate (car form) "-TAGGER") form)))
+  (funcall (symbolicate (car form) "-WALKER")
+           (funcall (symbolicate (car form) "-TAGGER") form)
+           (lambda (form env) (disp (list form env))) (make-env)))
 
-(deform (alexandria:when-let* (&or (name init) (&rest vars))
-          &body body)
-  :var ((name . body) ((< name) . init))
-  :rest-patterns ((vars . (name init))))
+(defform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
+  :binds ((fun-code :function name :block name)))
 
-(deform (let (&rest vars)
-          &declarations decls
-          &body body)
-  :var ((name . body) (nil . init))
-  :rest-patterns ((vars . (&or name (name init)))))
+(defform (let (&rest vars)
+           &declarations decls
+           &body body)
+  :rest-patterns ((vars . (&or name (name init))))
+  :binds ((init) (body :variable name)))
 
-(deform (let* (&rest vars)
-          &declarations decls
-          &body body)
-  :var ((name . body) ((< name) . init)) ; XXX extremely hacky handling
-  :rest-patterns ((vars . (&or name (name init)))))
+(defform (let* (&rest vars)
+           &declarations decls
+           &body body)
+  :rest-patterns ((vars . (&or name (name init))))
+  ;; XXX extremely annoying bespoke behavior since names may not line up with initforms
+  :binds ((init :variable (< name))
+          (body :variable name)))
 
-(deform (flet (&rest funs)
-          &declarations decls
-          &body body)
-  :fun ((name . body))
-  :block ((name . fcode))
-  :rest-patterns ((funs . (name &lambda fcode))))
+(defform (alexandria:when-let* (&or (name init) (&rest vars))
+           &body body)
+  :rest-patterns ((vars . (name init)))
+  :binds ((init :variable (< name))
+          (body :variable name)))
 
-(deform (labels (&rest funs)
-          &declarations decls
-          &body body)
-  :fun (((* name) . fcode) (name . body))
-  :block ((name . fcode))
-  :rest-patterns ((funs . (name &lambda fcode))))
+(defform (flet (&rest funs)
+           &declarations decls
+           &body body)
+  :rest-patterns ((funs . (name &lambda funcode)))
+  :binds ((body :function name)
+          (funcode :block (= name))))
 
-(deform (macrolet (&rest macro-defs)
-          &declarations decls
-          &body body)
-  :fun (((name macro-code) . body))
-  :block ((name . macro-code))
-  :rest-patterns ((macro-defs . (name &macro-lambda macro-code))))
+(defform (labels (&rest funs)
+           &declarations decls
+           &body body)
+  :rest-patterns ((funs . (name &lambda funcode)))
+  :binds ((body :function name)
+          (funcode :block (= name) :function name)))
 
-(deform (symbol-macrolet (&rest macro-code)
-          &declarations decls
-          &body body)
-  :var (((name expansion) . body))
-  :rest-patterns ((macro-code . (name expansion))))
+(defform (macrolet (&rest macro-defs)
+           &declarations decls
+           &body body)
+  :rest-patterns ((macro-defs . (name &macro-lambda macro-code)))
+  :binds ((body :function (name macro-defs))
+          (macro-code :block (= name))))
 
-(deform (block name &body body)
-        :block ((name . body)))
+(defform (symbol-macrolet (&rest macro-code) ; does not define an eval context
+           &declarations decls
+           &body body)
+  :rest-patterns ((macro-code . (name expansion)))
+  :binds ((body :variable (name macro-code))))
 
-(deform (defun name &lambda fun-code)
-  :fun ((name . fun-code))
-  :block ((name . fun-code)))
+(defform (block name &body body)
+  :binds ((body :block name)))
 
-(deform (lambda &lambda fun-code))
+(defform (defun name &lambda fun-code)
+  :binds ((fun-code :block name :function name)))
 
-(deform (defmacro name &macro-lambda macro-code)
-  :block ((name . macro-code)))
+(defform (lambda &lambda fun-code)
+  :binds ((fun-code)))
+
+(defform (defmacro name &macro-lambda macro-code)
+  :binds ((macro-code :block name)))
+
+(defform (function symbol-or-lambda)
+  :binds ((symbol-or-lambda)))
+
+(defform (quote thing))
+
+(defform (if test then &body else) ; optional, but need structural editing
+  :binds ((then) (else)))
+
+(defform (setq &rest pairs)
+  :rest-patterns ((pairs . (place value)))
+  :binds ((place) (value)))
+
+(defform (return-from name &body value) ; optional, but may need to edit multiple forms
+  :binds ((value)))
+
+(defform (catch tag &body body)
+  :binds ((body)))
+(defform (throw catch-tag result)
+  :binds ((result)))
+
+(defform (load-time-value &body form-and-read-only-p)
+  :binds ((form-and-read-only-p)))
+
+(defform (eval-when (&rest-qualifiers directives) &body body)
+  :binds ((body)))
+
+(defform (locally &body body)
+  :binds ((body)))
+(defform (the type-specifier form)
+  :binds ((form)))
+
+(defform (tagbody &body tags-and-forms) ; XXX tags should be stored in env and not walked
+  :binds ((tags-and-forms)))
+(defform (go tag))
+
+(defform (unwind-protect protected &body cleanup)
+  :binds ((protected) (cleanup)))
+
+(defform (multiple-value-call fun arg &body args)
+  :binds ((fun) (arg) (args)))
+
+(defform (multiple-value-prog1 value-form &rest forms)
+  :binds ((value-form) (forms)))
+
+(defform (progn &body forms)
+  :binds ((forms)))
+(defform (progv var-list val-list &body body) ; don't track dynamic bindings
+  :binds ((var-list) (val-list) (body)))
 
 ;; test:
 ;; (loop for it from 1 to 10
@@ -667,19 +870,3 @@ Binding tag names may not be (member < > *)"
 ;; test:
 ;; (loop for it from from
 ;;       do (print it))
-
-;; special operators
-;; (when nil
-;;   (defun handle-let (bindings body-forms env)
-;;     (let* ((body-env
-;;              (env-with-variables env (mapcar #'first (canonicalize-bindings bindings))))
-;;            (body-asts (mapcar (rcurry 'form-ast body-env) body-forms))
-;;            (ast (make-instance 'let-form :body body-asts :lexenv env)))
-;;       (loop for binding in bindings
-;;             do (if (symbolp binding)
-;;                    (push (cons (make-instance 'binder :name binding) nil)
-;;                                (bindings ast))
-;;                    (push (cons (make-instance 'binder :name (car binding))
-;;                                (form-ast (second binding) env))
-;;                          (bindings ast))))
-;;       ast)))
