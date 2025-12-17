@@ -14,7 +14,7 @@
 (defmacro disp (form)
   (once-only ((res form))
     `(progn
-       (format t "~s~%|> ~a~%" ',form ,res)
+       (format t "~%~s~%|> ~a~%" ',form ,res)
        ,res)))
 
 (defun addr-str (obj)
@@ -303,19 +303,21 @@ copy-env can exploit structure sharing, remember to PUSH!"
   (position macro-name *hardwired-operators*))
 
 (defmethod env-macroexpand-1 (x env)
-  "Tries macroexpanding a non-hardwired form x in evaluation position, once"
+  "Tries macroexpanding a form x in evaluation position once,
+does not touch hardwired operators."
   (cond ((symbolp x)
          (if-let (local-expansion (second (env-variable-info x env)))
            (values local-expansion t)
            (macroexpand-1 x))) ; possible global macro, or function call
         ((consp x)
-         (assert (not (hardwired-p (first x))))
          (let* ((lexical-info (env-function-info (first x) env))
-                (local-expansion (cdr lexical-info)))
+                (local-expansion (cdr lexical-info))
+                (op (car x)))
            (cond ((null lexical-info) ; global
-                  (cond ((consp (first x)) x) ; lambda in head position
-                        ((macro-function (first x)) (macroexpand-with-env x env))
-                        (t nil)))
+                  (if (and (symbolp op) ; could be lambda
+                           (macro-function op) (not (hardwired-p op)))
+                      (macroexpand-with-env x env)
+                      x))
                  ((null local-expansion) x) ; flet/labels bound
                  (t (macroexpand-with-env x env))))) ; local macro
         (t x)))
@@ -626,121 +628,137 @@ There's also a special syntax for macro bindings, but that isn't settled."
            (funcall (,parser-name ,spec) (cdr form) tagmap)
            tagmap))
 
-       (defun ,(symbolicate name "-WALKER") (tagmap walker env)
-         (declare (ignorable tagmap walker env))
-         ,@
-         (loop
-           for (ctx-tag . %entries) in binds
-           for entries := (plist-alist %entries)
-           collect ;tag-kinds var < (block =)
-           (labels ((sequential-p (entry) (and (listp entry) (eq (first entry) '<)))
-                    (parallel-p (entry)   (and (listp entry) (eq (first entry) '=)))
-                    (augment-env (env-exp entries)
-                      (if entries
-                          (destructuring-bind ((kind . record) &rest rest)
-                              entries
-                            (augment-env
-                             (if (or (sequential-p record) (parallel-p record))
-                                 env-exp
-                                 (case kind
-                                   (:variable
-                                    `(env-with-variables
-                                      ,env-exp
-                                      ,(trivia:ematch record
-                                         ((list (type symbol) whole-tag)
-                                          `(apply 'append (gethash ',whole-tag tagmap)))
-                                         ((type symbol)
-                                          `(mapcar 'list (gethash ',record tagmap))))))
-                                   (:function
-                                    `(env-with-functions
-                                      ,env-exp
-                                      ,(trivia:ematch record
-                                         ((list (type symbol) whole-tag)
-                                          `(loop
-                                             for (name . info)
-                                               in (apply 'append
-                                                          (gethash ',whole-tag tagmap))
-                                             collect
-                                             (list* name (function-info-arglist info)
-                                                    (function-info-body info))))
-                                         ((type symbol)
-                                          `(mapcar 'list (gethash ',record tagmap))))))
-                                   (:block `(env-with-blocks
-                                             ,env-exp (gethash ',record tagmap)))))
-                             rest))
-                          env-exp)))
-             (let ((seq-tag (third (rassoc-if #'sequential-p entries)))
-                   (par-tag (third (rassoc-if #'parallel-p entries)))
-                   (ctx-kind (cdr (assoc ctx-tag tag-kinds))))
-               (flet ((walk-function-body (env info augment-body)
-                        `(loop initially
-                          (flet ((note-binder (binder)
-                                   (setf newenv-with-params
-                                         (env-with-variables newenv-with-params
-                                                             (list binder)))))
-                            ,(if (eq ctx-kind '&macro-lambda)
-                                 `(map-macro-lambda (function-info-arglist ,info)
-                                                    #'note-binder
-                                                      (rcurry walker newenv-with-params))
-                                 `(map-lambda-list (function-info-arglist ,info)
-                                                   #'note-binder
-                                                     (rcurry walker newenv-with-params)
-                                                     ,(eq ctx-kind '&method-lambda))))
-                               with newenv-with-params = ,env
-                               for body-form in (function-info-body ,info)
-                               do (funcall walker body-form ,augment-body))))
-                 (cond
-                   (seq-tag
-                    (let ((whole-tag (cdr (assoc seq-tag custom-bind-rest-labels))))
-                      ;; TODO compile path to binder instead of using (first wholeform)
-                      `(or ; first detect whether a rest pattern was matched at all
-                        (with-lookup (wholeforms (gethash ',whole-tag tagmap))
-                          (loop for newenv := ,(augment-env `env entries)
-                                  then (if (symbolp whole)
-                                           (env-with-variables newenv (list whole))
-                                           (env-with-variables newenv
-                                                               (list (first whole))))
-                                ;; note: must reverse since tags are backwards
-                                for whole in (reverse (apply #'append wholeforms))
-                                do (when (listp whole)
-                                     ,(if ctx-kind
-                                          `(loop for bodyform in (second whole)
-                                                 do (funcall walker bodyform newenv))
-                                          `(funcall walker (second whole) newenv))))
-                          t)
-                        (loop for initform
-                                in ,(if ctx-kind
-                                        `(apply 'append (gethash ',ctx-tag tagmap))
-                                        `(gethash ',ctx-tag tagmap))
-                              do (funcall walker initform env)))))
-                   (par-tag
-                    (ecase ctx-kind
-                      ((&body &rest nil) (error "unimplemented"))
-                      ((&lambda &macro-lambda &method-lambda)
-                       (let ((whole (cdr (assoc par-tag custom-bind-rest-labels))))
-                         `(loop
-                            with newenv = ,(augment-env `env entries)
-                            for (name . info)
-                              in (apply #'append (gethash ',whole tagmap))
-                            ;; parallel bind the block only in the body
-                            ;; newenv-with-params is CAPTURED
-                            do ,(walk-function-body
-                                 `newenv `info
-                                 `(env-with-blocks newenv-with-params (list name))))))))
-                   (t
-                    (ecase ctx-kind
-                      ((&body &rest nil)
-                       `(loop with newenv = ,(augment-env `env entries)
-                              for body-form
-                                in ,(if ctx-kind
-                                        `(apply 'append (gethash ',ctx-tag tagmap))
-                                        `(gethash ',ctx-tag tagmap))
-                              do (funcall walker body-form newenv)))
-                      ((&lambda &macro-lambda &method-lambda)
-                       `(loop with newenv = ,(augment-env `env entries)
-                              for info in (gethash ',ctx-tag tagmap)
-                              do ,(walk-function-body `newenv `info ; vv CAPTURED
-                                                      `newenv-with-params)))))))))))
+       (defun ,(symbolicate name "-WALKER") (form env walker on-binder)
+         (declare (ignorable walker env on-binder))
+         (let ((tagmap (,(symbolicate name "-TAGGER") form)))
+           (declare (ignorable tagmap))
+           ,@(loop for (ctx-tag . entries) in binds
+                   append
+                   (loop for (kind record) on entries by 'cddr
+                         while record
+                         collect (trivia:ematch record
+                                   ((list (or (eql '<) (eql '=)) name)
+                                    `(loop for name in (gethash ',name tagmap)
+                                           do (funcall on-binder name ,kind)))
+                                   ((list name _) ; macro
+                                    `(loop for name in (gethash ',name tagmap)
+                                           do (funcall on-binder name ,kind)))
+                                   ((type symbol)
+                                    `(loop for name in (gethash ',record tagmap)
+                                           do (funcall on-binder name ,kind))))))
+           ,@
+           (loop
+             for (ctx-tag . %entries) in binds
+             for entries := (plist-alist %entries)
+             collect ;tag-kinds var < (block =)
+             (labels ((sequential-p (entry) (and (listp entry) (eq (first entry) '<)))
+                      (parallel-p (entry)   (and (listp entry) (eq (first entry) '=)))
+                      (augment-env (env-exp entries)
+                        (if entries
+                            (destructuring-bind ((kind . record) &rest rest)
+                                entries
+                              (augment-env
+                               (if (or (sequential-p record) (parallel-p record))
+                                   env-exp
+                                   (case kind
+                                     (:variable
+                                      `(env-with-variables
+                                        ,env-exp
+                                        ,(trivia:ematch record
+                                           ((list (type symbol) whole-tag)
+                                            `(apply 'append (gethash ',whole-tag tagmap)))
+                                           ((type symbol)
+                                            `(mapcar 'list (gethash ',record tagmap))))))
+                                     (:function
+                                      `(env-with-functions
+                                        ,env-exp
+                                        ,(trivia:ematch record
+                                           ((list (type symbol) whole-tag)
+                                            `(loop
+                                               for (name . info)
+                                                 in (apply 'append
+                                                            (gethash ',whole-tag tagmap))
+                                               collect
+                                               (list* name (function-info-arglist info)
+                                                      (function-info-body info))))
+                                           ((type symbol)
+                                            `(mapcar 'list (gethash ',record tagmap))))))
+                                     (:block `(env-with-blocks
+                                               ,env-exp (gethash ',record tagmap)))))
+                               rest))
+                            env-exp)))
+               (let ((seq-tag (third (rassoc-if #'sequential-p entries)))
+                     (par-tag (third (rassoc-if #'parallel-p entries)))
+                     (ctx-kind (cdr (assoc ctx-tag tag-kinds))))
+                 (flet ((walk-function-body (env info augment-body)
+                          `(loop initially
+                            (flet ((note-binder (binder)
+                                     (setf newenv-with-params
+                                           (env-with-variables newenv-with-params
+                                                               (list binder)))))
+                              ,(if (eq ctx-kind '&macro-lambda)
+                                   `(map-macro-lambda (function-info-arglist ,info)
+                                                      #'note-binder
+                                                        (rcurry walker newenv-with-params))
+                                   `(map-lambda-list (function-info-arglist ,info)
+                                                     #'note-binder
+                                                       (rcurry walker newenv-with-params)
+                                                       ,(eq ctx-kind '&method-lambda))))
+                                 with newenv-with-params = ,env
+                                 for body-form in (function-info-body ,info)
+                                 do (funcall walker body-form ,augment-body))))
+                   (cond
+                     (seq-tag
+                      (let ((whole-tag (cdr (assoc seq-tag custom-bind-rest-labels))))
+                        ;; TODO compile path to binder instead of using (first wholeform)
+                        `(or ; first detect whether a rest pattern was matched at all
+                          (with-lookup (wholeforms (gethash ',whole-tag tagmap))
+                            (loop for newenv := ,(augment-env `env entries)
+                                    then (if (symbolp whole)
+                                             (env-with-variables newenv (list whole))
+                                             (env-with-variables newenv
+                                                                 (list (first whole))))
+                                  ;; note: must reverse since tags are backwards
+                                  for whole in (reverse (apply #'append wholeforms))
+                                  do (when (listp whole)
+                                       ,(if ctx-kind
+                                            `(loop for bodyform in (second whole)
+                                                   do (funcall walker bodyform newenv))
+                                            `(funcall walker (second whole) newenv))))
+                            t)
+                          (loop for initform
+                                  in ,(if ctx-kind
+                                          `(apply 'append (gethash ',ctx-tag tagmap))
+                                          `(gethash ',ctx-tag tagmap))
+                                do (funcall walker initform env)))))
+                     (par-tag
+                      (ecase ctx-kind
+                        ((&body &rest nil) (error "unimplemented"))
+                        ((&lambda &macro-lambda &method-lambda)
+                         (let ((whole (cdr (assoc par-tag custom-bind-rest-labels))))
+                           `(loop
+                              with newenv = ,(augment-env `env entries)
+                              for (name . info)
+                                in (apply #'append (gethash ',whole tagmap))
+                              ;; parallel bind the block only in the body
+                              ;; newenv-with-params is CAPTURED
+                              do ,(walk-function-body
+                                   `newenv `info
+                                   `(env-with-blocks newenv-with-params (list name))))))))
+                     (t
+                      (ecase ctx-kind
+                        ((&body &rest nil)
+                         `(loop with newenv = ,(augment-env `env entries)
+                                for body-form
+                                  in ,(if ctx-kind
+                                          `(apply 'append (gethash ',ctx-tag tagmap))
+                                          `(gethash ',ctx-tag tagmap))
+                                do (funcall walker body-form newenv)))
+                        ((&lambda &macro-lambda &method-lambda)
+                         `(loop with newenv = ,(augment-env `env entries)
+                                for info in (gethash ',ctx-tag tagmap)
+                                do ,(walk-function-body `newenv `info ; vv CAPTURED
+                                                        `newenv-with-params))))))))))))
 
        (setf (gethash ',name *special-walkers*) ',(symbolicate name "-WALKER"))
        (values))))
@@ -748,8 +766,9 @@ There's also a special syntax for macro bindings, but that isn't settled."
 (defun test-walker (form)
   (disp (hash-table-plist (funcall (symbolicate (car form) "-TAGGER") form)))
   (funcall (symbolicate (car form) "-WALKER")
-           (funcall (symbolicate (car form) "-TAGGER") form)
-           (lambda (form env) (disp (list form env))) (make-env)))
+           form (make-env)
+           (lambda (form env) (disp (list form env)))
+           (lambda (binder kind) (disp (list binder kind)))))
 
 (defform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
   :binds ((fun-code :function name :block name)))
@@ -819,11 +838,10 @@ There's also a special syntax for macro bindings, but that isn't settled."
 (defform (quote thing))
 
 (defform (if test then &body else) ; optional, but need structural editing
-  :binds ((then) (else)))
+  :binds ((test) (then) (else)))
 
-(defform (setq &rest pairs)
-  :rest-patterns ((pairs . (place value)))
-  :binds ((place) (value)))
+(defform (setq &body forms)
+  :binds ((forms)))
 
 (defform (return-from name &body value) ; optional, but may need to edit multiple forms
   :binds ((value)))
@@ -861,6 +879,123 @@ There's also a special syntax for macro bindings, but that isn't settled."
   :binds ((forms)))
 (defform (progv var-list val-list &body body) ; don't track dynamic bindings
   :binds ((var-list) (val-list) (body)))
+
+;;
+;;; macro analysis via perturbation
+;;
+;; TODO detect non-parametric macros, check binding type doesn't vary
+(defun macro-call-envmap (form env)
+  "Identifies body forms and binding scopes to return an envmap for FORM"
+  (let ((call-tree-forms (make-hash-table :test 'eq))
+        (possible-binders (make-hash-table :test 'eq)))
+    ;; 1. identify all forms in the original call for classification
+    ;;    some may be constants, others are binders and expressions
+    ;;    record their source sym-paths for reconstruction
+    (labels ((walk-collecting-forms (form path)
+               (cond ((atom form)
+                      (when form
+                        (push path (gethash form call-tree-forms))))
+                     ((consp (car form))
+                      (push path (gethash (car form) call-tree-forms))
+                      (walk-collecting-forms (car form) (cons 'car path))
+                      (walk-collecting-forms (cdr form) (cons 'cdr path)))
+                     (t ; atom in car
+                      (push (cons 'car path) (gethash (car form) call-tree-forms))
+                      (walk-collecting-forms (cdr form) (cons 'cdr path))))))
+      (walk-collecting-forms form ())
+      (disp (hash-table-keys call-tree-forms))
+      (remhash form call-tree-forms))
+    ;; 2. macroexpand fully up to special (or hardwired macro) forms,
+    ;;    and record all binders seen in the output
+    (labels ((note-expansion-binder (sym kind)
+               (when (gethash sym call-tree-forms)
+                 (setf (gethash sym possible-binders) kind)))
+
+             (walk-until-known (form env)
+               ;; don't walk constants
+               (when (consp form)
+                 ;; if head expression occurs in the original, stop immediately
+                 (unless (gethash form call-tree-forms)
+                   (let ((op (car form)))
+                     (if (gethash op *special-walkers*)
+                         (funcall (gethash op *special-walkers*)
+                                  form env
+                                  #'walk-until-known #'note-expansion-binder)
+                         (multiple-value-bind (newform expanded-p)
+                             (env-macroexpand form env)
+                           (when expanded-p
+                             (let ((newop (car newform)))
+                               (if (gethash newop *special-walkers*)
+                                   (funcall (gethash newop *special-walkers*)
+                                            newform env
+                                            #'walk-until-known #'note-expansion-binder)
+                                   ;; must be function call
+                                   (mapcar (rcurry #'walk-until-known env)
+                                           (cdr newform))))))))))))
+      (walk-until-known (env-macroexpand form env) env))
+
+    (disp (hash-table-plist call-tree-forms))
+    (hash-table-plist possible-binders)
+    ;; 3. for each env entry, substitute with a gensym then macroexpand,
+    ;;    reexamine the expansion to see if it's still binding
+    ;;    and record the call forms which are under its scope
+    (let ((sym-paths (loop for binder being the hash-keys in possible-binders
+                           ;; using (hash-value kind) TODO
+                           append (loop for path in (gethash binder call-tree-forms)
+                                        collect (cons binder path))))
+          (path->gensym (make-hash-table :test 'equal))
+          (gensym->path (make-hash-table :test 'eq))
+          (gensym->call-forms (make-hash-table :test 'eq)))
+      (labels ((note-gensym (path gensym)
+                 (setf (gethash path path->gensym) gensym
+                       (gethash gensym gensym->path) path))
+               ;; substitute the symbol on PATH for another
+               (substitute-sym (path form sym)
+                 (loop for rest on (reverse path)
+                       for op := (car rest)
+                       do (if (= 1 (length rest))
+                              (case op
+                                (car (setf (car form) sym))
+                                (cdr (setf (cdr form) sym)))
+                              (setf form (funcall op form))))))
+        (loop
+          for (binder . path) in sym-paths
+          for gensym := (gensym "PB")
+          do (substitute-sym path form gensym)
+             (note-gensym path gensym)
+             (disp (list 'expanding form))
+             (let* ((failsym (gensym))
+                    (expansion (handler-case (env-macroexpand form env)
+                                 (error () failsym))))
+               (unless (eq expansion failsym)
+                 (labels
+                     ((walk-analyse (form env)
+                        (when (consp form)
+                          ;; if this expression is from the call, mark it
+                          (if (gethash form call-tree-forms)
+                              (when (or (assoc gensym (variable-bindings env))
+                                        (assoc gensym (function-bindings env))
+                                        (assoc gensym (blocks env)))
+                                (push form (gethash gensym gensym->call-forms)))
+                              (let ((op (car form)))
+                                (if (gethash op *special-walkers*)
+                                    (funcall (gethash op *special-walkers*)
+                                             form env
+                                             #'walk-analyse (constantly nil))
+                                    (multiple-value-bind (newform expanded-p)
+                                        (env-macroexpand form env)
+                                      (when expanded-p
+                                        (let ((newop (car newform)))
+                                          (if (gethash newop *special-walkers*)
+                                              (funcall (gethash newop *special-walkers*)
+                                                       newform env
+                                                       #'walk-analyse (constantly nil))
+                                              ;; must be function call
+                                              (mapcar (rcurry #'walk-analyse env)
+                                                      (cdr newform))))))))))))
+                   (walk-analyse expansion env))))
+             (substitute-sym path form binder))
+        (disp (hash-table-plist gensym->call-forms))))))
 
 ;; test:
 ;; (loop for it from 1 to 10
