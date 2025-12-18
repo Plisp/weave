@@ -1,6 +1,5 @@
 ;;;;
-;;;; incremental lisp parsing and type inference
-;;;; TODO test anaphoric macros, cffi, quasiquote: with-gensyms, once-only
+;;;; incremental lisp parsing
 ;;;;
 
 (defpackage :infrared
@@ -44,6 +43,8 @@
          (when ,present-p
            (return-from ,blockname (progn ,@then))))
        ,default)))
+
+(define-modify-macro or-f (&rest forms) or)
 
 ;;
 ;;; eclector reader
@@ -327,8 +328,8 @@ does not touch hardwired operators."
   (loop with any-expanded-p
         for (newform expanded-p) := (multiple-value-list (env-macroexpand-1 form env))
         until (and (not expanded-p) (eq newform form))
-        do (setf form newform
-                 any-expanded-p (or any-expanded-p expanded-p))
+        do (setf form newform)
+           (or-f any-expanded-p expanded-p)
         finally (return (values form any-expanded-p))))
 
 ;;
@@ -352,7 +353,7 @@ does not touch hardwired operators."
 tolerant. Previous calls to ON-BINDER give exactly the environment of VALUE-MAPPER calls.
 Reconstructs the list structure from the return values of ON-BINDER and VALUE-MAPPER."
   (loop with seen-opt-key-aux := nil
-        with res := nil
+        with res := (list)
         for elt in list
         do (when (member elt '(&optional &rest &key &aux))
              (setf seen-opt-key-aux t))
@@ -392,7 +393,7 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
         finally (return (nreverse res))))
 
 (defun map-macro-lambda (list on-binder value-mapper)
-  (loop with res := nil
+  (loop with res := (list)
         for rest on list
         for this = (car rest)
         do (cond ((member this '(&body &rest &key &optional &aux) :test 'eq)
@@ -410,12 +411,6 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
   (handler-case (parse-body body :documentation documentation)
     (error ()
       (form-parse-error "docstring after declarations"))))
-
-(defun canonicalize-bindings (bindings)
-  (loop for b in bindings
-        collect (if (symbolp b) `(,b nil) b)))
-
-(assert (equal (canonicalize-bindings '(x (y 0))) '((X NIL) (Y 0))))
 
 ;;
 ;;; parsing
@@ -695,14 +690,15 @@ There's also a special syntax for macro bindings, but that isn't settled."
                             (flet ((note-binder (binder)
                                      (setf newenv-with-params
                                            (env-with-variables newenv-with-params
-                                                               (list binder)))))
+                                                               (list (list binder))))
+                                     (funcall on-binder binder :variable)))
                               ,(if (eq ctx-kind '&macro-lambda)
                                    `(map-macro-lambda (function-info-arglist ,info)
                                                       #'note-binder
-                                                        (rcurry walker newenv-with-params))
+                                                      (rcurry walker newenv-with-params))
                                    `(map-lambda-list (function-info-arglist ,info)
                                                      #'note-binder
-                                                       (rcurry walker newenv-with-params)
+                                                     (rcurry walker newenv-with-params)
                                                        ,(eq ctx-kind '&method-lambda))))
                                  with newenv-with-params = ,env
                                  for body-form in (function-info-body ,info)
@@ -710,7 +706,7 @@ There's also a special syntax for macro bindings, but that isn't settled."
                    (cond
                      (seq-tag
                       (let ((whole-tag (cdr (assoc seq-tag custom-bind-rest-labels))))
-                        ;; TODO compile path to binder instead of using (first wholeform)
+                        ;; to generalise for patterns: compile path to binder instead
                         `(or ; first detect whether a rest pattern was matched at all
                           (with-lookup (wholeforms (gethash ',whole-tag tagmap))
                             (loop for newenv := ,(augment-env `env entries)
@@ -880,10 +876,33 @@ There's also a special syntax for macro bindings, but that isn't settled."
 (defform (progv var-list val-list &body body) ; don't track dynamic bindings
   :binds ((var-list) (val-list) (body)))
 
+(defun walk-form (form env on-form &optional (note-binder (constantly nil)))
+  (if (atom form)
+      (funcall on-form form env)
+      (when (funcall on-form form env)
+        (let ((op (car form)))
+          (if (gethash op *special-walkers*)
+              (funcall (gethash op *special-walkers*)
+                       form env
+                       (rcurry #'walk-form on-form note-binder)
+                       note-binder)
+              (multiple-value-bind (newform expanded-p)
+                  (env-macroexpand form env)
+                (when expanded-p
+                  (let ((newop (car newform)))
+                    (if (gethash newop *special-walkers*)
+                        (funcall (gethash newop *special-walkers*)
+                                 newform env
+                                 (rcurry #'walk-form on-form note-binder)
+                                 note-binder)
+                        ;; must be function call
+                        (when (funcall on-form newform env)
+                          (mapcar (rcurry #'walk-form env on-form note-binder)
+                                  (cdr newform))))))))))))
+
 ;;
 ;;; macro analysis via perturbation
-;;
-;; TODO detect non-parametric macros, check binding type doesn't vary
+;; TODO detect non-parametric, effectful macros, check binding type doesn't vary
 (defun macro-call-envmap (form env)
   "Identifies body forms and binding scopes to return an envmap for FORM"
   (let ((call-tree-forms (make-hash-table :test 'eq))
@@ -891,56 +910,34 @@ There's also a special syntax for macro bindings, but that isn't settled."
     ;; 1. identify all forms in the original call for classification
     ;;    some may be constants, others are binders and expressions
     ;;    record their source sym-paths for reconstruction
-    (labels ((walk-collecting-forms (form path)
+    (labels ((walk-call-collecting-forms (form path)
                (cond ((atom form)
                       (when form
                         (push path (gethash form call-tree-forms))))
                      ((consp (car form))
                       (push path (gethash (car form) call-tree-forms))
-                      (walk-collecting-forms (car form) (cons 'car path))
-                      (walk-collecting-forms (cdr form) (cons 'cdr path)))
+                      (walk-call-collecting-forms (car form) (cons 'car path))
+                      (walk-call-collecting-forms (cdr form) (cons 'cdr path)))
                      (t ; atom in car
                       (push (cons 'car path) (gethash (car form) call-tree-forms))
-                      (walk-collecting-forms (cdr form) (cons 'cdr path))))))
-      (walk-collecting-forms form ())
-      (disp (hash-table-keys call-tree-forms))
-      (remhash form call-tree-forms))
+                      (walk-call-collecting-forms (cdr form) (cons 'cdr path))))))
+      (walk-call-collecting-forms form (list))
+      (disp (hash-table-keys call-tree-forms)))
     ;; 2. macroexpand fully up to special (or hardwired macro) forms,
     ;;    and record all binders seen in the output
-    (labels ((note-expansion-binder (sym kind)
-               (when (gethash sym call-tree-forms)
-                 (setf (gethash sym possible-binders) kind)))
-
-             (walk-until-known (form env)
-               ;; don't walk constants
-               (when (consp form)
-                 ;; if head expression occurs in the original, stop immediately
-                 (unless (gethash form call-tree-forms)
-                   (let ((op (car form)))
-                     (if (gethash op *special-walkers*)
-                         (funcall (gethash op *special-walkers*)
-                                  form env
-                                  #'walk-until-known #'note-expansion-binder)
-                         (multiple-value-bind (newform expanded-p)
-                             (env-macroexpand form env)
-                           (when expanded-p
-                             (let ((newop (car newform)))
-                               (if (gethash newop *special-walkers*)
-                                   (funcall (gethash newop *special-walkers*)
-                                            newform env
-                                            #'walk-until-known #'note-expansion-binder)
-                                   ;; must be function call
-                                   (mapcar (rcurry #'walk-until-known env)
-                                           (cdr newform))))))))))))
-      (walk-until-known (env-macroexpand form env) env))
-
+    (walk-form (env-macroexpand form env) env
+               (lambda (form env) ; continue if:
+                 (declare (ignore env))
+                 (and (consp form) (null (gethash form call-tree-forms))))
+               (lambda (sym kind)
+                 (when (gethash sym call-tree-forms)
+                   (setf (gethash sym possible-binders) kind))))
     (disp (hash-table-plist call-tree-forms))
-    (hash-table-plist possible-binders)
+    (disp (hash-table-plist possible-binders))
     ;; 3. for each env entry, substitute with a gensym then macroexpand,
     ;;    reexamine the expansion to see if it's still binding
     ;;    and record the call forms which are under its scope
     (let ((sym-paths (loop for binder being the hash-keys in possible-binders
-                           ;; using (hash-value kind) TODO
                            append (loop for path in (gethash binder call-tree-forms)
                                         collect (cons binder path))))
           (path->gensym (make-hash-table :test 'equal))
@@ -963,37 +960,20 @@ There's also a special syntax for macro bindings, but that isn't settled."
           for gensym := (gensym "PB")
           do (substitute-sym path form gensym)
              (note-gensym path gensym)
-             (disp (list 'expanding form))
-             (let* ((failsym (gensym))
-                    (expansion (handler-case (env-macroexpand form env)
-                                 (error () failsym))))
-               (unless (eq expansion failsym)
-                 (labels
-                     ((walk-analyse (form env)
-                        (when (consp form)
-                          ;; if this expression is from the call, mark it
-                          (if (gethash form call-tree-forms)
-                              (when (or (assoc gensym (variable-bindings env))
-                                        (assoc gensym (function-bindings env))
-                                        (assoc gensym (blocks env)))
-                                (push form (gethash gensym gensym->call-forms)))
-                              (let ((op (car form)))
-                                (if (gethash op *special-walkers*)
-                                    (funcall (gethash op *special-walkers*)
-                                             form env
-                                             #'walk-analyse (constantly nil))
-                                    (multiple-value-bind (newform expanded-p)
-                                        (env-macroexpand form env)
-                                      (when expanded-p
-                                        (let ((newop (car newform)))
-                                          (if (gethash newop *special-walkers*)
-                                              (funcall (gethash newop *special-walkers*)
-                                                       newform env
-                                                       #'walk-analyse (constantly nil))
-                                              ;; must be function call
-                                              (mapcar (rcurry #'walk-analyse env)
-                                                      (cdr newform))))))))))))
-                   (walk-analyse expansion env))))
+             ;;(disp (list 'expanding form))
+             (let ((expansion (handler-case (env-macroexpand form env)
+                                (error () '#1=#:fail#))))
+               (unless (eq expansion '#1#)
+                 (walk-form expansion env
+                            (lambda (form env)
+                              (when (consp form)
+                                (if (gethash form call-tree-forms)
+                                    (when (or (assoc gensym (variable-bindings env))
+                                              (assoc gensym (function-bindings env))
+                                              (position gensym (blocks env)))
+                                      (push form (gethash gensym gensym->call-forms))
+                                      nil)
+                                    t))))))
              (substitute-sym path form binder))
         (disp (hash-table-plist gensym->call-forms))))))
 
@@ -1005,3 +985,5 @@ There's also a special syntax for macro bindings, but that isn't settled."
 ;; test:
 ;; (loop for it from from
 ;;       do (print it))
+
+;; TODO test anaphoric macros, cffi, quasiquote: with-gensyms, once-only
