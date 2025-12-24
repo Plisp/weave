@@ -234,9 +234,17 @@ copy-env can exploit structure sharing, remember to PUSH!"
 (defmethod tags ((env env)) (%tags env))
 
 (defun env-variable-info (name env)
-  (find name (variable-bindings env) :key 'first))
+  (loop for entry in (variable-bindings env)
+        do (when (and (symbolp name) (eq name entry))
+             (return (values name nil)))
+           (when (and (consp entry) (eq name (car entry)))
+             (return (values (car entry) (cdr entry))))))
 (defun env-function-info (name env)
-  (find name (function-bindings env) :key 'first))
+  (loop for entry in (function-bindings env)
+        do (when (and (symbolp name) (eq name entry))
+             (return (values name nil)))
+           (when (and (consp entry) (eq name (car entry)))
+             (return (values (car entry) (cdr entry))))))
 
 (defun env-with-variables (env bindings)
   (let ((new-env (copy-env env)))
@@ -262,15 +270,15 @@ copy-env can exploit structure sharing, remember to PUSH!"
 (defun wrap-function-like-env (form entries)
   (wrap-with-wrapper form entries
                      (lambda (form entry)
-                       (if (null (cdr entry))
-                           (flet-wrap (first entry) form)
+                       (if (symbolp entry)
+                           (flet-wrap entry form)
                            (macrolet-code-wrap (first entry) (cdr entry) form)))))
 
 (defun wrap-variable-like-env (form entries)
   (wrap-with-wrapper form entries
                      (lambda (form entry)
-                       (if (null (second entry))
-                           (let-wrap (first entry) form)
+                       (if (symbolp entry)
+                           (let-wrap entry form)
                            (symbol-macrolet-wrap (first entry) (second entry) form)))))
 
 (defun wrap-block-env (form entries)
@@ -311,20 +319,23 @@ copy-env can exploit structure sharing, remember to PUSH!"
   "Tries macroexpanding a form x in evaluation position once,
 does not touch hardwired operators."
   (cond ((symbolp x)
-         (if-let (local-expansion (second (env-variable-info x env)))
-           (values local-expansion t)
-           (macroexpand-1 x))) ; possible global macro, or function call
+         (multiple-value-bind (result local-expansion)
+             (env-variable-info x env)
+           (declare (ignore result))
+           (if local-expansion
+               (values local-expansion t)
+               (macroexpand-1 x)))) ; possible global
         ((consp x)
-         (let* ((lexical-info (env-function-info (first x) env))
-                (local-expansion (cdr lexical-info))
-                (op (car x)))
-           (cond ((null lexical-info) ; global
-                  (if (and (symbolp op) ; could be lambda
-                           (macro-function op) (not (hardwired-p op)))
-                      (macroexpand-with-env x env)
-                      x))
-                 ((null local-expansion) x) ; flet/labels bound
-                 (t (macroexpand-with-env x env))))) ; local macro
+         (let ((op (car x)))
+           (multiple-value-bind (result local-expansion)
+               (env-function-info op env)
+             (cond ((null result) ; global
+                    (if (and (symbolp op) ; don't expand direct lambda call
+                             (macro-function op) (not (hardwired-p op)))
+                        (macroexpand-with-env x env)
+                        x))
+                   ((null local-expansion) x) ; flet/labels bound
+                   (t (macroexpand-with-env x env)))))) ; local macro
         (t x)))
 
 (defun env-macroexpand (form env)
@@ -655,8 +666,8 @@ Any binding forces a symbol match."
                                    ,(trivia:ematch record
                                       ((list (type symbol) whole-tag)
                                        `(apply 'append (gethash ',whole-tag tagmap)))
-                                      ((type symbol)
-                                       `(mapcar 'list (gethash ',record tagmap))))))
+                                      ((type symbol) ; binding records may SHARE STRUCTURE
+                                       `(gethash ',record tagmap)))))
                                 (:function
                                  `(env-with-functions
                                    ,env-exp
@@ -664,13 +675,12 @@ Any binding forces a symbol match."
                                       ((list (type symbol) whole-tag)
                                        `(loop
                                           for (name . info)
-                                            in (apply 'append
-                                                      (gethash ',whole-tag tagmap))
+                                            in (apply 'append (gethash ',whole-tag tagmap))
                                           collect
                                           (list* name (function-info-arglist info)
                                                  (function-info-body info))))
                                       ((type symbol)
-                                       `(mapcar 'list (gethash ',record tagmap))))))
+                                       `(gethash ',record tagmap)))))
                                 (:block `(env-with-blocks
                                           ,env-exp (gethash ',record tagmap)))))
                           rest))
@@ -707,8 +717,7 @@ Any binding forces a symbol match."
                             `(loop initially
                               (flet ((note-binder (binder)
                                        (setf newenv-with-params
-                                             (env-with-variables newenv-with-params
-                                                                 `((,binder))))
+                                             (env-with-variables newenv-with-params`(,binder)))
                                        (funcall on-binder binder :variable)))
                                 ;; capture of newenv-with-params to pass binder info
                                 ,(if (eq ctx-kind '&macro-lambda)
@@ -729,11 +738,12 @@ Any binding forces a symbol match."
                               (with-lookup (wholeforms (gethash ',whole-tag tagmap))
                                 (loop for newenv := ,(augment-env `env entries)
                                         then (if (symbolp whole)
-                                                 (env-with-variables newenv `((,whole)))
-                                                 (env-with-variables newenv
-                                                                     `((,(car whole)))))
+                                                 (env-with-variables newenv `(,whole))
+                                                 (env-with-variables newenv `(,(car whole))))
                                       ;; note: must reverse since tags are backwards
-                                      for whole in (reverse (apply #'append wholeforms))
+                                      ;; we own the tags and exit right afterwards
+                                      ;; so it's fine to destructively modify
+                                      for whole in (nreverse (first wholeforms))
                                       do (when (listp whole)
                                            ,(if ctx-kind
                                                 `(loop for bodyform in (second whole)
@@ -742,7 +752,7 @@ Any binding forces a symbol match."
                                 t)
                               (loop for initform
                                       in ,(if ctx-kind
-                                              `(apply 'append (gethash ',ctx-tag tagmap))
+                                              `(apply 'nconc (gethash ',ctx-tag tagmap))
                                               `(gethash ',ctx-tag tagmap))
                                     do (funcall walker initform env)))))
                          ;; to generalise for patterns: compile path to binder instead
@@ -754,14 +764,12 @@ Any binding forces a symbol match."
                              (let ((whole (cdr (assoc par-tag custom-bind-rest-labels))))
                                `(loop
                                   with newenv := ,(augment-env `env entries)
-                                  for (name . info)
-                                    in (apply #'append (gethash ',whole tagmap))
+                                  for (name . info) in (first (gethash ',whole tagmap))
                                   ;; parallel bind the block only in the body
                                   ;; newenv-with-params is CAPTURED
                                   do ,(walk-function-body
                                        `newenv `info
-                                       `(env-with-blocks newenv-with-params
-                                                         (list name))))))))
+                                       `(env-with-blocks newenv-with-params `(,name))))))))
                          (t
                           (ecase ctx-kind
                             ((&declarations &rest-qualifiers))
@@ -769,7 +777,7 @@ Any binding forces a symbol match."
                              `(loop with newenv := ,(augment-env `env entries)
                                     for body-form
                                       in ,(if ctx-kind
-                                              `(apply 'append (gethash ',ctx-tag tagmap))
+                                              `(apply 'nconc (gethash ',ctx-tag tagmap))
                                               `(gethash ',ctx-tag tagmap))
                                     do (funcall walker body-form newenv)))
                             ((&lambda &macro-lambda &method-lambda)
@@ -803,9 +811,9 @@ Any binding forces a symbol match."
                                (flet ((note-binder (binder)
                                         (setf newenv-with-params
                                               (env-with-variables newenv-with-params
-                                                                  `((,binder))))
+                                                                  `(,binder)))
                                         (setf binder-env (env-with-variables binder-env
-                                                                             `((,binder))))
+                                                                             `(,binder)))
                                         binder)
                                       (wrapper (form)
                                         (let ((o (funcall walker form newenv-with-params)))
@@ -852,13 +860,13 @@ Any binding forces a symbol match."
                                     with res := (list)
                                     for newenv := ,(augment-env `env init-binds)
                                       then (if (symbolp whole)
-                                               (env-with-variables newenv `((,whole)))
-                                               (env-with-variables newenv `((,(car whole)))))
-                                    for whole in (nreverse (car (gethash ',tag tagmap)))
+                                               (env-with-variables newenv `(,whole))
+                                               (env-with-variables newenv `(,(car whole))))
+                                    for whole in (nreverse (first (gethash ',tag tagmap)))
                                     do (if (symbolp whole)
                                            (progn
                                              (setf binder-env
-                                                  (env-with-variables binder-env `((,whole))))
+                                                   (env-with-variables binder-env `(,whole)))
                                              (push whole res))
                                            (let ((b (first whole)))
                                              (flet ((wrapper (form)
@@ -873,14 +881,14 @@ Any binding forces a symbol match."
                                                 res))
                                              ;; note this binder for later initforms
                                              (setf binder-env
-                                                   (env-with-variables binder-env `((,b))))))
+                                                   (env-with-variables binder-env `(,b)))))
                                     finally (setf (,tag ast) (nreverse res)))
-                                 ;; normal, no bindings
+                                 ;; normal, parallel bindings
                                  `(loop
                                     with res := (list)
                                     with newenv := (env-with-variables
                                                     env (gethash ',name-tag tagmap))
-                                    for whole in (nreverse (car (gethash ',tag tagmap)))
+                                    for whole in (nreverse (first (gethash ',tag tagmap)))
                                     do (if (symbolp whole)
                                            (push whole res)
                                            (let ((b (first whole)))
@@ -901,7 +909,7 @@ Any binding forces a symbol match."
                            `(loop
                               with res := (list)
                               with newenv := ,(augment-env `env entries)
-                              for (name . info) in (apply #'append (gethash ',tag tagmap))
+                              for (name . info) in (first (gethash ',tag tagmap))
                               for fun = ,(walk-function-body
                                           `newenv `info
                                           `(env-with-blocks newenv-with-params (list name)))
