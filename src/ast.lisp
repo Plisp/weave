@@ -13,7 +13,7 @@
 (defmacro disp (form)
   (once-only ((res form))
     `(progn
-       (format t "~%~s~%|> ~a~%" ',form ,res)
+       (format t "~%~s~%|> ~s~%" ',form ,res)
        ,res)))
 
 (defun addr-str (obj)
@@ -77,8 +77,9 @@
                     children
                     `(read-quote ,@children)))
                (read-eval `(read-eval ,@children))
-               (eclector.reader:quasiquote `(read-quasiquote ,@children))
-               (eclector.reader:unquote `(read-unquote ,@children))
+               ((eclector.reader:quasiquote
+                 eclector.reader:unquote eclector.reader:unquote-splicing)
+                `(,(car result) ,@children))
                (t children))
              children))))
 
@@ -91,7 +92,76 @@
   (list 'read-eval expression))
 
 (defmethod eclector.reader:fixup ((client my-client) obj state)
-  (error "TODO handle circular lists using fixup"))
+  (declare (ignore obj state))
+  (error "TODO handle circular lists, ask how eclector does it"))
+
+;; TODO reimplement this but with structure sharing to handle quasiquote
+;; (defun transform (form &optional (wrap-in-list t))
+;;   (flet ((maybe-wrap (thing)
+;;            (if wrap-in-list
+;;                `(list ,thing)
+;;                thing)))
+;;     (typecase form
+;;       ((cons (eql unquote))
+;;        (maybe-wrap (second form)))
+;;       ((cons (eql unquote-splicing))
+;;        (second form))
+;;       (t
+;;        (maybe-wrap (transform-quasiquote-argument form))))))
+
+;; (defun transform-compound (compound)
+;;   (labels ((rec (object)
+;;              (typecase object
+;;                ((cons t (or (not cons) (cons (eql unquote))))
+;;                 (list (transform (car object)) (transform (cdr object) nil)))
+;;                ((cons t (cons (eql unquote-splicing)))
+;;                 (error 'unquote-splicing-in-dotted-list
+;;                        :argument (second object)))
+;;                (t
+;;                 (list* (transform (car object)) (rec (cdr object)))))))
+;;     (rec compound)))
+
+;; (defun transform-quasiquote-argument (argument)
+;;   (typecase argument
+;;     ((cons (eql unquote))
+;;      (second argument))
+;;     ((cons (eql unquote-splicing))
+;;      (error "unquote splice at top"))
+;;     (cons
+;;      `(append ,@(transform-compound argument)))
+;;     ((and vector (not string))
+;;      `(apply #'vector
+;;              ,(transform-quasiquote-argument
+;;                (coerce argument 'list))))
+;;     (t
+;;      `(quote ,argument))))
+
+;; (defun expand (form)
+;;   (if (atom form)
+;;       form
+;;       (let ((expanded (cons (expand (car form)) (expand (cdr form)))))
+;;         (if (eq (first expanded) 'quasiquote)
+;;             (transform-quasiquote-argument (second expanded))
+;;             expanded))))
+
+;; (defmacro quasiquote (&whole form argument)
+;;   (declare (ignore argument))
+;;   (expand form))
+
+;; (defmacro unquote ()
+;;   (error "comma outside backquote"))
+;; (defmacro unquote-splicing ()
+;;   (error "comma-at outside backquote"))
+
+;; (defun read-translate (form)
+;;   (labels ((translate-no-quasiquote (form)
+;;              (if (atom form)
+;;                  form
+;;                  (case (car form)
+;;                    (read-function `(function ,(translate-no-quasiquote (second form))))
+;;                    (read-quote `(quote ,(translate-no-quasiquote (second form))))
+;;                    (t (mapcar #'translate-no-quasiquote form))))))
+;;     (translate-no-quasiquote (eclector.reader::expand form))))
 
 ;;
 ;;; class defs: mainly we want a structure that's
@@ -122,42 +192,50 @@
 (defclass literal-form (eval-form)
   ((form :initarg :form
          :type string :initform (error "literal not provided")
-         :accessor form))
+         :reader form))
   (:documentation "Atomic literal"))
 
 (defclass symbol-ref (eval-form)
   ((name :initarg :name
          :initform (error "must provide symbol ref name")
-         :accessor name))
+         :reader name))
   (:documentation "Represents a symbol or symbol macro?"))
 
 (defclass function-call (eval-form)
   ((name :initarg :name
          :initform (error "must provide function name")
-         :accessor name)
+         :reader name)
    (args :initarg :args
          :initform (error "must provide function argument list")
-         :accessor args))
+         :reader args))
   (:documentation "args is a list of eval-forms"))
 
 (defclass irregular-form (eval-form)
   ((op :initarg :op
-       :accessor op))
+       :reader op))
   (:documentation "macro invocation or special operator"))
+
+(defclass macro-call (irregular-form)
+  ((args :initarg :args
+         :initform (error "must provide unknown call args")
+         :reader args)
+   (gensym-names :initarg :gensym-names
+                 :reader gensym-names)
+   (eval-binders :initarg :eval-binders
+                 :reader eval-binders)
+   (subform-asts :initarg :subform-asts
+                 :reader subform-asts)))
 
 (defclass function-code ()
   ((lambda-list :initarg :lambda-list
-                :accessor lambda-list)
+                :reader lambda-list)
    (docstring :initarg :docstring
-              :accessor docstring
+              :reader docstring
               :type string)
    (declarations :initarg :declarations
-                 :accessor declarations)
+                 :reader declarations)
    (body :initarg :body
-         :accessor body)
-   (envmap :initform (make-hash-table :test 'eq)
-           :reader envmap
-           :documentation "where -> (binder . kind)*"))
+         :reader body))
   (:documentation "(macro) lambda list and body list of eval-forms"))
 
 (defmethod print-object ((object literal-form) stream)
@@ -216,7 +294,7 @@
      (declare (ignorable ,name))
      ,form))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
+(eval-when (:compile-toplevel :execute)
   (defstruct (env (:conc-name nil))
     "variable-bindings: (v &optional macroexpansion)
 function-bindings: (f &optional macro-params-body)
@@ -224,7 +302,11 @@ copy-env can exploit structure sharing, remember to PUSH!"
     (%function-bindings (list))
     (%variable-bindings (list))
     (%blocks (list))
-    (%tags (list))))
+    (%tags (list)))
+
+  (defmethod make-load-form ((o env) &optional env)
+    (declare (ignore env))
+    (make-load-form-saving-slots o)))
 
 (define-constant +nullenv+ (make-env) :test 'equalp)
 
@@ -429,13 +511,14 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
 
 ;;
 ;;; parsing
-;;; if lisp is mud then parsing is the experience of it slipping through your fingers
+;;
+;; if lisp is mud then parsing is the experience of it slipping through your fingers
 ;;
 
 (defparameter *special-walkers* (make-hash-table :test 'eq))
 (defparameter *special-parsers* (make-hash-table :test 'eq))
 
-(eval-when (:compile-toplevel)
+(eval-when (:compile-toplevel :execute)
   (defparameter *parser-keywords* '(&rest &body &or &declarations &rest-qualifiers
                                     &lambda &method-lambda &macro-lambda))
   (defparameter *arity-1-parser-keywords* '(&rest &body
@@ -510,7 +593,7 @@ Any binding forces a symbol match."
              (assert (not (eq '&rest (cdr (assoc ctx tag-kinds)))))
              (loop
                with special-seen := nil
-               for (kind bind-tag) on entries by 'cddr
+               for (kind bind-tag) on entries by #'cddr
                do (trivia:ematch bind-tag
                     ((type symbol))
                     ((list (or (eql '<) (eql '=)) bind-name)
@@ -551,11 +634,11 @@ Any binding forces a symbol match."
          ((op :initform ',name)
           ,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
                   collect `(,name :initarg ,(make-keyword name)
-                                  :accessor ,name))
-          ,@(when binds `((envmap :initarg :envmap ; where -> (kind . binder)*
-                                  :initform (make-hash-table :test 'eq)
-                                  :reader envmap)))))
+                                  ;; XXX could generate initargs instead
+                                  :accessor ,name))))
        ;; spec validated above by spec-names ^
+       ;; TODO turn this into a macrolet within lexical scope of tagnames
+       ;;      and write a with-tags macro, no need for hash table
        (defmacro ,parser-name (spec)
          (cond
            ((null spec) `(lambda (form tagmap)
@@ -565,7 +648,7 @@ Any binding forces a symbol match."
            ((atom spec)
             `(lambda (form tagmap)
                (when (and ,(loop for (ctx . entries) in ',binds
-                                 thereis (loop for (kind tag) on entries by 'cddr
+                                 thereis (loop for (kind tag) on entries by #'cddr
                                                thereis (eq spec tag)))
                           (not (symbolp form)))
                  (form-parse-error "expected bound symbol match: ~a" form))
@@ -692,7 +775,7 @@ Any binding forces a symbol match."
                  (declare (ignorable tagmap))
                  ,@(loop for (ctx-tag . entries) in binds
                          append
-                         (loop for (kind record) on entries by 'cddr
+                         (loop for (kind record) on entries by #'cddr
                                while record
                                collect (trivia:ematch record
                                          ((list (or (eql '<) (eql '=)) name)
@@ -814,22 +897,19 @@ Any binding forces a symbol match."
                                                                   `(,binder)))
                                         (setf binder-env (env-with-variables binder-env
                                                                              `(,binder)))
-                                        binder)
-                                      (wrapper (form)
-                                        (let ((o (funcall walker form newenv-with-params)))
-                                          (setf (gethash o (envmap fun)) binder-env)
-                                          o)))
+                                        binder))
                                  (setf (lambda-list fun)
                                        ,(if (eq tag-kind '&macro-lambda)
-                                            `(map-macro-lambda (function-info-arglist ,info)
-                                                               #'note-binder #'wrapper)
-                                            `(map-lambda-list (function-info-arglist ,info)
-                                                              #'note-binder #'wrapper
-                                                             ,(eq tag-kind '&method-lambda)))))
+                                            `(map-macro-lambda
+                                              (function-info-arglist ,info)
+                                              #'note-binder (rcurry walker newenv-with-params))
+                                            `(map-lambda-list
+                                              (function-info-arglist ,info)
+                                              #'note-binder (rcurry walker newenv-with-params)
+                                              ,(eq tag-kind '&method-lambda)))))
                              for body-form in (function-info-body ,info)
                              for body-ast = (funcall walker body-form ,augment-body)
                              do (push body-ast (body fun))
-                                (setf (gethash body-ast (envmap fun)) binder-env)
                              finally (nreversef (body fun))
                                      (return fun))))
                      (cond
@@ -869,16 +949,13 @@ Any binding forces a symbol match."
                                                    (env-with-variables binder-env `(,whole)))
                                              (push whole res))
                                            (let ((b (first whole)))
-                                             (flet ((wrapper (form)
-                                                      (let ((o (funcall walker form newenv)))
-                                                        (setf (gethash o (envmap ast))
-                                                              binder-env)
-                                                        o)))
-                                               (push
-                                                `(,b ,,(if (cdr (assoc value-tag tag-kinds))
-                                                           `(mapcar #'wrapper (cdr whole))
-                                                           `(wrapper (second whole))))
-                                                res))
+                                             (push
+                                              `(,b ,,(if (cdr (assoc value-tag tag-kinds))
+                                                         `(mapcar (rcurry walker newenv)
+                                                                  (cdr whole))
+                                                         `(funcall walker (second whole)
+                                                                   newenv)))
+                                              res)
                                              ;; note this binder for later initforms
                                              (setf binder-env
                                                    (env-with-variables binder-env `(,b)))))
@@ -892,16 +969,12 @@ Any binding forces a symbol match."
                                     do (if (symbolp whole)
                                            (push whole res)
                                            (let ((b (first whole)))
-                                             (flet ((wrapper (form)
-                                                      (let ((o (funcall walker form env)))
-                                                        (setf (gethash o (envmap ast))
-                                                              +nullenv+)
-                                                        o)))
-                                               (push
-                                                `(,b ,,(if (cdr (assoc value-tag tag-kinds))
-                                                           `(mapcar #'wrapper (cdr whole))
-                                                           `(wrapper (second whole))))
-                                                res))))
+                                             (push
+                                              `(,b ,,(if (cdr (assoc value-tag tag-kinds))
+                                                         `(mapcar (rcurry walker env)
+                                                                  (cdr whole)) ;(b &body ...)
+                                                         `(funcall walker (second whole) env)))
+                                              res)))
                                     finally (setf (,tag ast) (nreverse res))))))
                           ;; function-like bindings
                           ((list (type symbol) (or (eql '&lambda) (eql '&macro-lambda))
@@ -916,36 +989,25 @@ Any binding forces a symbol match."
                               do (push (cons name fun) res)
                               finally (setf (,tag ast) (nreverse res))))))
                        (t ; body tags aren't duplicated, so just take the first
-                        `(flet ((record-env (o env)
-                                  (declare (ignorable env))
-                                  ,@(loop for entry in entries
-                                          collect `(setf (gethash o (envmap ast)) env))
-                                  o))
-                           (with-lookup (record (gethash ',tag tagmap))
-                             ,(ecase tag-kind
-                                ((&declarations &rest-qualifiers)
-                                 `(setf (,tag ast) (first record)))
-                                ((&body &rest nil)
-                                 `(setf (,tag ast)
-                                        ,(if tag-kind
-                                             `(loop
-                                                with newenv := ,(augment-env `env entries)
-                                                with fresh := ,(augment-env `+nullenv+ entries)
-                                                for body-form in (first record)
-                                                for o = (funcall walker body-form newenv)
-                                                collect (record-env o fresh))
-                                             `(let ((fresh ,(augment-env `+nullenv+ entries))
-                                                    (o (funcall walker (first record)
-                                                                ,(augment-env `env entries))))
-                                                (record-env o fresh)))))
-                                ((&lambda &macro-lambda &method-lambda)
-                                 `(let ((newenv ,(augment-env `env entries))
-                                        (fresh ,(augment-env `+nullenv+ entries)))
-                                    (let ((fun ,(walk-function-body
-                                                 `newenv `(first record)
-                                                 `newenv-with-params)))
-                                      (record-env fun fresh)
-                                      (setf (,tag ast) fun)))))))))))
+                        `(with-lookup (record (gethash ',tag tagmap))
+                           ,(ecase tag-kind
+                              ((&declarations &rest-qualifiers)
+                               `(setf (,tag ast) (first record)))
+                              ((&body &rest nil)
+                               `(setf (,tag ast)
+                                      ,(if tag-kind
+                                           `(loop
+                                              with newenv := ,(augment-env `env entries)
+                                              for body-form in (first record)
+                                              collect (funcall walker body-form newenv))
+                                           `(funcall walker (first record)
+                                                     ,(augment-env `env entries)))))
+                              ((&lambda &macro-lambda &method-lambda)
+                               `(let ((newenv ,(augment-env `env entries)))
+                                  (let ((fun ,(walk-function-body
+                                               `newenv `(first record)
+                                               `newenv-with-params)))
+                                    (setf (,tag ast) fun))))))))))
                  ast))))
 
        (setf (gethash ',name *special-walkers*) ',(symbolicate name "-WALKER"))
@@ -958,6 +1020,12 @@ Any binding forces a symbol match."
            form +nullenv+
            (lambda (form env) (disp (list form env)))
            (lambda (binder kind) (disp (list binder kind)))))
+
+(defun literal-parser (form env walker)
+  (declare (ignore walker env))
+  (make-instance 'literal-form :form form))
+(setf (gethash '*literal-magic* *special-parsers*) 'literal-parser)
+(setf (gethash '*literal-magic* *special-walkers*) (constantly nil))
 
 (defform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
   :binds ((fun-code :function name :block name)))
@@ -1074,101 +1142,143 @@ Any binding forces a symbol match."
       (funcall on-form form env)
       (when (funcall on-form form env)
         (let ((op (car form)))
-          (if (gethash op *special-walkers*)
-              (funcall (gethash op *special-walkers*)
-                       form env
-                       (rcurry #'walk-form on-form note-binder)
-                       note-binder)
-              (multiple-value-bind (newform expanded-p)
-                  (env-macroexpand form env)
-                (when expanded-p
+          (if-let (walker (gethash op *special-walkers*))
+            (funcall walker
+                     form env
+                     (rcurry #'walk-form on-form note-binder)
+                     note-binder)
+            (multiple-value-bind (newform expanded-p)
+                (env-macroexpand form env)
+              (if expanded-p
                   (let ((newop (car newform)))
-                    (if (gethash newop *special-walkers*)
-                        (funcall (gethash newop *special-walkers*)
-                                 newform env
-                                 (rcurry #'walk-form on-form note-binder)
-                                 note-binder)
-                        ;; must be function call
-                        (when (funcall on-form newform env)
-                          (mapcar (rcurry #'walk-form env on-form note-binder)
-                                  (cdr newform))))))))))))
+                    (if-let (walker (gethash newop *special-walkers*))
+                      (funcall walker
+                               newform env
+                               (rcurry #'walk-form on-form note-binder)
+                               note-binder)
+                      ;; must be function call
+                      (when (funcall on-form newform env)
+                        (mapcar (rcurry #'walk-form env on-form note-binder)
+                                (cdr newform)))))
+                  (when (funcall on-form form env)
+                    (mapcar (rcurry #'walk-form env on-form note-binder)
+                            (cdr form))))))))))
 
 ;;
 ;;; macro analysis via perturbation
-;; TODO detect non-parametric, effectful macros, check binding type doesn't vary
-(defun macro-call-envmap (form env)
-  "Identifies body forms and binding scopes to return an envmap for FORM"
+;;
+;; TODO detect non-parametric, effectful macros
+(defun macro-call-envmap (form env &optional (walker (constantly nil)))
+  "Identifies body forms and binding scopes to return a map of {sexp -> binding env}.
+Walks subforms of the call using WALKER during analysis."
   (let ((call-tree-forms (make-hash-table :test 'eq))
-        (possible-binders (make-hash-table :test 'eq)))
-    ;; 1. identify all forms in the original call for classification
-    ;;    some may be constants, others are binders and expressions
-    ;;    record their source sym-paths for reconstruction
+        (possible-identifiers (make-hash-table :test 'eq))
+        (eval->binders (make-hash-table :test 'eq)))
+    ;; identify all forms in the original call for classification
+    ;; some may be constants, others are binders and expressions
+    ;; record their source sym-paths for reconstruction
     (labels ((walk-call-collecting-forms (form path)
-               (cond ((atom form)
-                      (when form
-                        (push path (gethash form call-tree-forms))))
-                     ((consp (car form))
-                      (push path (gethash (car form) call-tree-forms))
-                      (walk-call-collecting-forms (car form) (cons 'car path))
-                      (walk-call-collecting-forms (cdr form) (cons 'cdr path)))
-                     (t ; atom in car
-                      (push (cons 'car path) (gethash (car form) call-tree-forms))
-                      (walk-call-collecting-forms (cdr form) (cons 'cdr path))))))
-      (walk-call-collecting-forms form (list))
-      (disp (hash-table-keys call-tree-forms)))
-    ;; 2. macroexpand fully up to special (or hardwired macro) forms,
-    ;;    and record all binders seen in the output
+               (loop for i from 0
+                     for subform in form
+                     for newpath = (cons i path)
+                     do (if (consp subform)
+                            (progn
+                              (push newpath (gethash subform call-tree-forms))
+                              (walk-call-collecting-forms subform newpath))
+                            (when (and (symbolp subform))
+                              (push newpath (gethash subform call-tree-forms)))))))
+      (walk-call-collecting-forms form (list)))
+    ;; - macroexpand fully up to special (or hardwired macro) forms,
+    ;;   and record all binders and obvious evaluation contexts seen in the output
+    ;; - call the walker meanwhile
     (walk-form (env-macroexpand form env) env
-               (lambda (form env) ; continue if:
-                 (declare (ignore env))
-                 (and (consp form) (null (gethash form call-tree-forms))))
+               (lambda (form env)
+                 (when (symbolp form)
+                   (setf (gethash form possible-identifiers) :ref))
+                 ;; continue if this isn't an cons, or not part of the call
+                 (if (and (consp form) (gethash form call-tree-forms))
+                     (progn
+                       (funcall walker form env) ; recurse subcalls with WALKER
+                       (ensure-gethash form eval->binders)
+                       nil)
+                     t))
                (lambda (sym kind)
-                 (when (gethash sym call-tree-forms)
-                   (setf (gethash sym possible-binders) kind))))
+                 (setf (gethash sym possible-identifiers) kind)))
     (disp (hash-table-plist call-tree-forms))
-    (disp (hash-table-plist possible-binders))
-    ;; 3. for each env entry, substitute with a gensym then macroexpand,
-    ;;    reexamine the expansion to see if it's still binding
-    ;;    and record the call forms which are under its scope
-    (let ((sym-paths (loop for binder being the hash-keys in possible-binders
-                           append (loop for path in (gethash binder call-tree-forms)
-                                        collect (cons binder path))))
-          (path->gensym (make-hash-table :test 'equal))
-          (gensym->path (make-hash-table :test 'eq))
-          (gensym->call-forms (make-hash-table :test 'eq)))
-      (labels ((note-gensym (path gensym)
-                 (setf (gethash path path->gensym) gensym
-                       (gethash gensym gensym->path) path))
-               ;; substitute the symbol on PATH for another
+    (disp (hash-table-plist possible-identifiers))
+    ;; analysis, first to understand syntax before constructing the returned maps
+    (let ((gensym->name (make-hash-table :test 'eq))
+          (name->gensym (make-hash-table :test 'eq))
+          (gensym->refpath (make-hash-table :test 'eq)))
+      (labels ((note-ident (name gensym)
+                 (setf (gethash gensym gensym->name) name
+                       (gethash name name->gensym) gensym))
+               ;; substitute the symbol on PATH in FORM for another
                (substitute-sym (path form sym)
                  (loop for rest on (reverse path)
-                       for op := (car rest)
-                       do (if (= 1 (length rest))
-                              (case op
-                                (car (setf (car form) sym))
-                                (cdr (setf (cdr form) sym)))
-                              (setf form (funcall op form))))))
-        (loop
-          for (binder . path) in sym-paths
-          for gensym := (gensym "PB")
-          do (substitute-sym path form gensym)
-             (note-gensym path gensym)
-             ;;(disp (list 'expanding form))
-             (let ((expansion (handler-case (env-macroexpand form env)
-                                (error () +fail+))))
-               (unless (eq expansion +fail+)
-                 (walk-form expansion env
-                            (lambda (form env)
-                              (when (consp form)
-                                (if (gethash form call-tree-forms)
-                                    (when (or (assoc gensym (variable-bindings env))
-                                              (assoc gensym (function-bindings env))
-                                              (position gensym (blocks env)))
-                                      (push form (gethash gensym gensym->call-forms))
-                                      nil)
-                                    t))))))
-             (substitute-sym path form binder))
-        (disp (hash-table-plist gensym->call-forms))))))
+                       for i := (car rest)
+                       do (if (null (cdr rest))
+                              (setf (nth i form) sym)
+                              (setf form (nth i form)))))
+               ;; (lookup-path (path form)
+               ;;   (loop for i in (reverse path)
+               ;;         do (setf form (nth i form))
+               ;;         finally (return form)))
+               )
+        ;; we need to know where the refs and binders are first
+        (loop for sym being the hash-keys of possible-identifiers using (hash-value kind)
+              do (loop for path in (gethash sym call-tree-forms)
+                       for gensym := (gensym "PB")
+                       for ident-kind := nil
+                       do (substitute-sym path form gensym)
+                          (let ((expansion (handler-case (env-macroexpand form env)
+                                             (error () +fail+))))
+                            (unless (eq expansion +fail+)
+                              (block walk
+                                (walk-form expansion env
+                                           (lambda (form env)
+                                             (declare (ignore env))
+                                             (cond ((gethash form call-tree-forms) nil)
+                                                   ((eq form gensym)
+                                                    (setf ident-kind :ref)
+                                                    (return-from walk))
+                                                   (t t)))
+                                           (lambda (sym kind)
+                                             (when (and (eq sym gensym) (eq kind :variable))
+                                               (setf ident-kind :variable)
+                                               (return-from walk)))))))
+                          ;; an actual reference will be independent of the binding name
+                          ;; counter: step forms may have spurious refs not from the call
+                          (if ident-kind
+                              (progn
+                                (note-ident sym gensym)
+                                (when (eq ident-kind :ref)
+                                  (setf (gethash gensym gensym->refpath) path)))
+                              (substitute-sym path form sym))))
+        (disp (hash-table-plist gensym->refpath))
+        ;;
+        (let ((expansion (handler-case (env-macroexpand form env)
+                           (error () +fail+))))
+          (unless (eq expansion +fail+)
+            (walk-form
+             expansion env
+             (lambda (form subenv)
+               (if (or (and (consp form) (gethash form call-tree-forms))
+                       (gethash form gensym->refpath))
+                   ;; TODO what about macro-introduced bindings like `it`?
+                   ;;      heuristic to distinguish from gensyms?
+                   (progn
+                     (setf (gethash form eval->binders)
+                           (remove-if-not
+                            (lambda (v)
+                              (loop for i being the hash-keys of gensym->name
+                                    thereis (eq v i)))
+                            (ldiff (variable-bindings subenv) (variable-bindings env))))
+                     nil)
+                   t)))))
+        (disp (hash-table-plist eval->binders))
+        (disp form)
+        (values gensym->name eval->binders)))))
 
 ;; test:
 ;; (loop for it from 1 to 10
@@ -1179,5 +1289,37 @@ Any binding forces a symbol match."
 ;; (loop for it from from
 ;;       do (print it))
 
-;; TODO test anaphoric macros, cffi,
-;; TODO relaxed conditions for quasiquote with-gensyms, once-only
+(defun parse (form env)
+  (if (atom form)
+      (if (symbolp form)
+          (make-instance 'symbol-ref :name form)
+          (error "found atom ~a, not symbol" form))
+      (let ((op (car form)))
+        (if-let (parser (gethash op *special-parsers*))
+          (funcall parser form env #'parse)
+          (multiple-value-bind (result local-expansion)
+              (env-function-info op env)
+            (flet ((parse-function (form)
+                     (make-instance 'function-call
+                                     :name (car form)
+                                     :args (mapcar (rcurry #'parse env) (cdr form))))
+                   ;; don't expand explicitly, we only care about explicit call subforms
+                   (parse-macro (form)
+                     (let ((macro-subforms (make-hash-table :test 'eq)))
+                       (multiple-value-bind (gensym->name eval->binders)
+                           (macro-call-envmap form env
+                                              (lambda (form env)
+                                                (setf (gethash form macro-subforms)
+                                                      (parse form env))))
+                         (make-instance 'macro-call :op op :args (cdr form)
+                                                    :subform-asts macro-subforms
+                                                    :eval-binders eval->binders
+                                                    :gensym-names gensym->name)))))
+              (cond ((null result) ; global
+                     (if (and (symbolp op) ; could be lambda in function position
+                              (macro-function op) (not (hardwired-p op)))
+                         (parse-macro form)
+                         (parse-function form)))
+                    ;; local
+                    ((null local-expansion) (parse-function form))
+                    (t (parse-macro form)))))))))
