@@ -2,51 +2,18 @@
 ;;;; incremental lisp parsing
 ;;;;
 
-(defpackage :infrared
-  (:use :cl :alexandria-2)
-  (:local-nicknames (#:read :eclector.parse-result)
+(defpackage #:weave-parser
+  (:use :cl #:alexandria-2 #:weave-utils)
+  (:local-nicknames (#:read #:eclector.parse-result)
                     (#:env  :cl-environments) ; function-information
                     (#:sly  :slynk-backend)) ; arglist
-  (:export))
-(in-package :infrared)
-
-(defmacro disp (form)
-  (once-only ((res form))
-    `(progn
-       (format t "~%~s~%|> ~s~%" ',form ,res)
-       ,res)))
-
-(defun addr-str (obj)
-  (let* ((str (delete-if (lambda (c) (member c '(#\# #\< #\> #\Space #\{ #\})))
-                         (with-output-to-string (s)
-                           (print-unreadable-object (obj s :identity t)))))
-         (length (length str)))
-    (if (>= length 3)
-        (subseq str (- length 3))
-        str)))
-
-(defun lfind (item list &key (key 'identity) (test 'eql) (start 0) (end (length list)))
-  "NIL-detecting version of find for lists, only searches forwards"
-  (declare (optimize speed)
-           (type fixnum start end)
-           (type list list))
-  (assert (<= 0 start end (length list)))
-  (loop for elt in (nthcdr start list)
-        do (when (funcall (the function test) item (funcall (the function key) elt))
-             (return (values elt t)))))
-
-(defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
-  (with-gensyms (blockname present-p)
-    `(block ,blockname
-       (multiple-value-bind (,name ,present-p)
-           ,mvcall
-         (when ,present-p
-           (return-from ,blockname (progn ,@then))))
-       ,default)))
-
-(define-modify-macro or-f (&rest forms) or)
-
-(define-constant +fail+ (list t) :test 'equal)
+  (:export #:form #:name
+           #:op #:args
+           #:parse
+           #:gensym-names #:eval-binders #:subform-asts
+           #:lambda-list #:docstring #:declarations #:body
+           #:make-env))
+(in-package #:weave-parser)
 
 ;;
 ;;; eclector reader
@@ -239,7 +206,7 @@
   (:documentation "(macro) lambda list and body list of eval-forms"))
 
 (defmethod print-object ((object literal-form) stream)
-  (princ (form object) stream))
+  (format stream "<lit: ~a>" (form object)))
 
 (defmethod print-object ((object symbol-ref) stream)
   (pprint-logical-block (stream (list))
@@ -306,9 +273,9 @@ copy-env can exploit structure sharing, remember to PUSH!"
 
   (defmethod make-load-form ((o env) &optional env)
     (declare (ignore env))
-    (make-load-form-saving-slots o)))
+    (make-load-form-saving-slots o))
 
-(define-constant +nullenv+ (make-env) :test 'equalp)
+  (define-constant +nullenv+ (make-env) :test 'equalp))
 
 (defmethod function-bindings ((env env)) (%function-bindings env))
 (defmethod variable-bindings ((env env)) (%variable-bindings env))
@@ -636,6 +603,9 @@ Any binding forces a symbol match."
                   collect `(,name :initarg ,(make-keyword name)
                                   ;; XXX could generate initargs instead
                                   :accessor ,name))))
+       (export ',(symbolicate name "-FORM"))
+       ,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
+               collect `(export ',name))
        ;; spec validated above by spec-names ^
        ;; TODO turn this into a macrolet within lexical scope of tagnames
        ;;      and write a with-tags macro, no need for hash table
@@ -883,42 +853,36 @@ Any binding forces a symbol match."
                    (flet
                        ((walk-function-body (env info augment-body)
                           `(loop
-                             with fun := (make-instance
-                                          'function-code
-                                          :docstring (function-info-documentation ,info)
-                                          :declarations (function-info-decls ,info)
-                                          :body (list))
                              with binder-env := +nullenv+
                              with newenv-with-params := ,env
-                             initially
-                               (flet ((note-binder (binder)
-                                        (setf newenv-with-params
-                                              (env-with-variables newenv-with-params
-                                                                  `(,binder)))
-                                        (setf binder-env (env-with-variables binder-env
-                                                                             `(,binder)))
-                                        binder))
-                                 (setf (lambda-list fun)
-                                       ,(if (eq tag-kind '&macro-lambda)
-                                            `(map-macro-lambda
-                                              (function-info-arglist ,info)
-                                              #'note-binder (rcurry walker newenv-with-params))
-                                            `(map-lambda-list
-                                              (function-info-arglist ,info)
-                                              #'note-binder (rcurry walker newenv-with-params)
-                                              ,(eq tag-kind '&method-lambda)))))
+                             with fun
+                               := (make-instance
+                                   'function-code
+                                   :docstring (function-info-documentation ,info)
+                                   :declarations (function-info-decls ,info)
+                                   :body (list)
+                                   :lambda-list
+                                   (flet ((note-binder (binder)
+                                            (setf newenv-with-params
+                                                  (env-with-variables newenv-with-params
+                                                                      `(,binder)))
+                                            (setf binder-env (env-with-variables binder-env
+                                                                                 `(,binder)))
+                                            binder))
+                                     ,(if (eq tag-kind '&macro-lambda)
+                                          `(map-macro-lambda
+                                            (function-info-arglist ,info)
+                                            #'note-binder (rcurry walker newenv-with-params))
+                                          `(map-lambda-list
+                                            (function-info-arglist ,info)
+                                            #'note-binder (rcurry walker newenv-with-params)
+                                            ,(eq tag-kind '&method-lambda)))))
                              for body-form in (function-info-body ,info)
                              for body-ast = (funcall walker body-form ,augment-body)
                              do (push body-ast (body fun))
                              finally (nreversef (body fun))
                                      (return fun))))
                      (cond
-                       ;; binder or otherwise unevaluated
-                       ((or (not (assoc tag binds))
-                            (loop for (ctx . %entries) in binds
-                                  thereis (cdr (rassoc tag (plist-alist %entries)))))
-                        `(with-lookup (record (gethash ',tag tagmap))
-                           (setf (,tag ast) (first record))))
                        ;; &rest special logic
                        ;; XXX basically hardcoded for now since it's not clear how to
                        ;; retain provenance after tagging/parsing: consider LABELS
@@ -988,6 +952,12 @@ Any binding forces a symbol match."
                                           `(env-with-blocks newenv-with-params (list name)))
                               do (push (cons name fun) res)
                               finally (setf (,tag ast) (nreverse res))))))
+                       ;; binder or otherwise unevaluated
+                       ((or (not (assoc tag binds))
+                            (loop for (ctx . %entries) in binds
+                                  thereis (cdr (rassoc tag (plist-alist %entries)))))
+                        `(with-lookup (record (gethash ',tag tagmap))
+                           (setf (,tag ast) (first record))))
                        (t ; body tags aren't duplicated, so just take the first
                         `(with-lookup (record (gethash ',tag tagmap))
                            ,(ecase tag-kind
@@ -1023,7 +993,7 @@ Any binding forces a symbol match."
 
 (defun literal-parser (form env walker)
   (declare (ignore walker env))
-  (make-instance 'literal-form :form form))
+  (make-instance 'literal-form :form (second form)))
 (setf (gethash '*literal-magic* *special-parsers*) 'literal-parser)
 (setf (gethash '*literal-magic* *special-walkers*) (constantly nil))
 
@@ -1295,7 +1265,7 @@ Walks subforms of the call using WALKER during analysis."
           (make-instance 'symbol-ref :name form)
           (error "found atom ~a, not symbol" form))
       (let ((op (car form)))
-        (if-let (parser (gethash op *special-parsers*))
+        (if-let (parser (disp (gethash op *special-parsers*)))
           (funcall parser form env #'parse)
           (multiple-value-bind (result local-expansion)
               (env-function-info op env)
