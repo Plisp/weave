@@ -152,17 +152,20 @@
          :accessor kind))
   (:documentation ""))
 
+(defclass atom-form ()
+  ())
+
 (defclass eval-form ()
   ()
   (:documentation "Form in an evaluation context, perhaps quoted."))
 
-(defclass literal-form (eval-form)
+(defclass literal-form (eval-form atom-form)
   ((form :initarg :form
          :type string :initform (error "literal not provided")
          :reader form))
   (:documentation "Atomic literal"))
 
-(defclass symbol-ref (eval-form)
+(defclass symbol-ref (eval-form atom-form)
   ((name :initarg :name
          :initform (error "must provide symbol ref name")
          :reader name))
@@ -261,7 +264,7 @@
      (declare (ignorable ,name))
      ,form))
 
-(eval-when (:compile-toplevel :execute)
+(eval-when (:compile-toplevel :load-toplevel :execute)
   (defstruct (env (:conc-name nil))
     "variable-bindings: (v &optional macroexpansion)
 function-bindings: (f &optional macro-params-body)
@@ -356,10 +359,9 @@ copy-env can exploit structure sharing, remember to PUSH!"
                        (wrap-block-env (blocks env))
                        (wrap-tag-env (tags env)))))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (declaim (type simple-vector *hardwired-operators*))
-  (defparameter *hardwired-operators* #(*literal-magic* lambda defun defmethod defmacro)
-    "The list of nonportable hardwired macros, not macroexpanded"))
+(declaim (type simple-vector *hardwired-operators*))
+(defparameter *hardwired-operators* #(*literal-magic* lambda defun defmethod defmacro)
+  "The list of nonportable hardwired macros, not macroexpanded")
 
 (defun hardwired-p (macro-name)
   (position macro-name *hardwired-operators*))
@@ -485,7 +487,7 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
 (defparameter *special-walkers* (make-hash-table :test 'eq))
 (defparameter *special-parsers* (make-hash-table :test 'eq))
 
-(eval-when (:compile-toplevel :execute)
+(eval-when (:compile-toplevel :load-toplevel :execute)
   (defparameter *parser-keywords* '(&rest &body &or &declarations &rest-qualifiers
                                     &lambda &method-lambda &macro-lambda))
   (defparameter *arity-1-parser-keywords* '(&rest &body
@@ -1265,14 +1267,14 @@ Walks subforms of the call using WALKER during analysis."
           (make-instance 'symbol-ref :name form)
           (error "found atom ~a, not symbol" form))
       (let ((op (car form)))
-        (if-let (parser (disp (gethash op *special-parsers*)))
+        (if-let (parser (gethash op *special-parsers*))
           (funcall parser form env #'parse)
           (multiple-value-bind (result local-expansion)
               (env-function-info op env)
             (flet ((parse-function (form)
                      (make-instance 'function-call
-                                     :name (car form)
-                                     :args (mapcar (rcurry #'parse env) (cdr form))))
+                                    :name (parse (car form) env)
+                                    :args (mapcar (rcurry #'parse env) (cdr form))))
                    ;; don't expand explicitly, we only care about explicit call subforms
                    (parse-macro (form)
                      (let ((macro-subforms (make-hash-table :test 'eq)))

@@ -7,10 +7,10 @@
   (:export #:disp #:addr-str #:lfind #:with-lookup #:or-f #:+fail+))
 (in-package #:weave-utils)
 
-(defmacro disp (form)
+(defmacro disp (form &optional (stream t))
   (once-only ((res form))
     `(progn
-       (format t "~%~s~%|> ~s~%" ',form ,res)
+       (format ,stream "~%~s~%|> ~s~%" ',form ,res)
        ,res)))
 
 (defun addr-str (obj)

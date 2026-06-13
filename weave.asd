@@ -1,5 +1,5 @@
 (asdf:defsystem #:weave
-  :author "tianlin qu <tianlinqu@gmail.com>"
+  :author "tianlin qu"
   :description "A semantic lisp editor"
   :license "BSD 3-clause license"
   :depends-on (#:alexandria
