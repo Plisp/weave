@@ -1,12 +1,12 @@
 ;;;;
 ;;;; incremental lisp parsing
 ;;;;
+;;
+;; note: can use cl-environments:function-information
+;; note: slynk-backend:arglist
 
-(defpackage #:weave-parser
+(uiop:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
-  (:local-nicknames (#:read #:eclector.parse-result)
-                    (#:env  :cl-environments) ; function-information
-                    (#:sly  :slynk-backend)) ; arglist
   (:export #:form #:name
            #:op #:args
            #:parse
@@ -1091,18 +1091,18 @@ Any binding forces a symbol match."
 (defform (the type-specifier form)
   :binds ((form)))
 
-(defform (tagbody &body tags-and-forms) ; XXX tags should be stored in env and not walked
-  :binds ((tags-and-forms)))
+(defform (tagbody &body body) ; XXX tags should be stored in env and not walked
+  :binds ((body)))
 (defform (go tag))
 
 (defform (unwind-protect protected &body cleanup)
   :binds ((protected) (cleanup)))
 
-(defform (multiple-value-call fun arg &body args)
-  :binds ((fun) (arg) (args)))
+(defform (multiple-value-call fun arg &body body)
+  :binds ((fun) (arg) (body)))
 
-(defform (multiple-value-prog1 value-form &body forms)
-  :binds ((value-form) (forms)))
+(defform (multiple-value-prog1 value-form &body body)
+  :binds ((value-form) (body)))
 
 (defform (progn &body forms)
   :binds ((forms)))

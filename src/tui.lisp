@@ -25,12 +25,29 @@
   #+(and sbcl slynk) (sb-concurrency:send-message *log* o)
   o)
 
+(defclass completion-state ()
+  ((anchor :initarg :anchor
+           :reader anchor
+           :documentation "the hole associated with this completion")
+   (candidates :initarg :candidates
+               :accessor candidates)
+   (selected :initform nil
+             :accessor selected)
+   (top-line :initform 0
+             :accessor top-line)))
+
 (defclass ui (tui:elemental)
   ((ast :initarg :ast
         :accessor ast)
    (stack :initform (list)
           :accessor stack
-          :type list)))
+          :type list)
+   (goal-col :initform 1
+             :accessor goal-col
+             :type positive-fixnum)
+   (completion-state :initform nil
+                     :accessor completion-state
+                     :type (or null completion-state))))
 
 (defclass context ()
   ((ui :initarg :ui
@@ -61,9 +78,6 @@
 ;;
 (defgeneric render-node (ast context rect))
 
-(defmethod tui:render ((o node-with-context) rect)
-  (render-node (node o) (context o) rect))
-
 (defmethod render-node :before (node context rect)
   (slog `(rendering ,node to ,rect)))
 
@@ -79,6 +93,46 @@
 adjust cursor state in the context, specialized for the `ast' node.
 Typically we will use the default implementation below."))
 
+(defclass hole ()
+  ((text :initarg :text
+         :initform ""
+         :accessor text
+         :type simple-string)))
+
+(defmethod render-node ((node hole) context rect)
+  (with-accessors ((text text)) node
+    (let* ((text (if (string= text "") "hole" text))
+           (outrect (tui:copy-rect rect :rows 1 :cols (tui:display-width text)))
+           (focused (node-active? node (ui context))))
+      (tui:puts text 1 1 rect (if focused
+                                  (tui:make-style :fg #x0
+                                                  :bg (when focused #xb58900)
+                                                  :underlinep t)
+                                  (tui:make-style :underlinep t)))
+      (values (make-instance 'ast-view :rect outrect :node node
+                                       :hoverable t
+                                       :focused focused
+                                       :key-handler (lambda (v e)
+                                                      (declare (ignore v))
+                                                      (handle-key-for node (ui context) e)))
+              0 #x993300))))
+
+(defmethod handle-key-for ((node hole) context event)
+  (let ((c (tui:event-kind event)))
+    (cond ((and (alpha-char-p c)
+                (not (or (tui:event-controlp event)
+                         (tui:event-altp event) (tui:event-metap event))))
+           ;; TODO edit - swap with symbol node, begin completion
+           )
+          ((and (digit-char-p c)
+                (not (or (tui:event-controlp event)
+                         (tui:event-altp event) (tui:event-metap event))))
+           ;; TODO edit - swap with literal number node
+           )
+          ((char= c #\Tab)
+           ;; TODO edit - swap with function-call node, begin function completion
+           (slog 'tab)))))
+
 ;; ASSUME leaf nodes are non-overlapping
 ;; we index them into an array of blocks sorted by line then column
 (defun build-atom-array (tree rows)
@@ -92,56 +146,47 @@ Typically we will use the default implementation below."))
     (map-into rows (lambda (row) (sort row #'< :key (lambda (v) (tui:rect-x (tui:rect v)))))
               rows)))
 
-(defun node-below (atom-array y col)
+(defun view-below (atom-array y col)
   "Takes a y-offset from 0 to rows, this way it's possible to search the first row.
 COL should essentially indicate some preferred column. Returns NIL if not found."
   ;; note: must bounds-check y first
   (let ((new-y (position-if-not #'null atom-array :start y)))
-    (or new-y (return-from node-below nil))
+    (or new-y (return-from view-below nil))
     ;; if offset y has no views after it then we will find our current view
-    (slog atom-array)
-    (slog (format nil "down to y: ~d, col: ~d" new-y col))
     (loop for view in (aref atom-array new-y)
           for x1 = (tui:rect-x (tui:rect view))
-          for x2 = (+ (tui:rect-x (tui:rect view)) (tui:rect-cols (tui:rect view)))
-          do (when (<= (1+ x1) col x2)
+          for x2 = (tui:rect-x2 (tui:rect view))
+          do (when (<= col x2)
                (loop-finish))
-          finally (return (slog (node view))))))
+          finally (return view))))
 
-(defun node-above (atom-array y col)
-  "Same as `node-below'"
+(defun view-above (atom-array y col)
+  "Same as `view-below'"
   (let ((new-y (position-if-not #'null atom-array :end y :from-end t)))
-    (or new-y (return-from node-above nil))
+    (or new-y (return-from view-above nil))
     ;; if offset y has no views after it then we will find our current view
-    (slog atom-array)
-    (slog (format nil "up to y: ~d, col: ~d" new-y col))
     (loop for view in (aref atom-array new-y)
           for x1 = (tui:rect-x (tui:rect view))
-          for x2 = (+ (tui:rect-x (tui:rect view)) (tui:rect-cols (tui:rect view)))
-          do (when (<= (1+ x1) col x2)
+          for x2 = (tui:rect-x2 (tui:rect view))
+          do (when (<= col x2)
                (loop-finish))
-          finally (return (slog (node view))))))
+          finally (return view))))
 
-(defun node-left (atom-array y x)
-  (slog (list atom-array y x))
-  (if-let (res (find-if (lambda (view)
-                          (let* ((rect (tui:rect view))
-                                 (view-x2 (+ (tui:rect-x rect) (tui:rect-cols rect))))
-                            (< view-x2 x)))
+(defun view-left (atom-array y x)
+  (if-let (res (find-if (lambda (view) (< (tui:rect-x2 (tui:rect view)) x))
                         (aref atom-array y)
                         :from-end t))
-    (node res)
-    (node-above atom-array y 1)))
+    res ; most-positive-fixnum = very last
+    (view-above atom-array y most-positive-fixnum)))
 
-(defun node-right (atom-array y x)
-  (slog (list atom-array y x))
-  (if-let (res (find-if (lambda (view)
-                          (<= x (tui:rect-x (tui:rect view))))
+(defun view-right (atom-array y x)
+  (if-let (res (find-if (lambda (view) (<= x (tui:rect-x (tui:rect view))))
                         (aref atom-array y)))
-    (node res)
-    (node-below atom-array (1+ y) 1)))
+    res
+    (view-below atom-array (1+ y) 1)))
 
 (defun reconstruct-stack (node root-view)
+  "ASSUMES: view tree contains node tree"
   (let ((found-stack (list)))
     (block nil
       (labels ((rec (view stack)
@@ -150,12 +195,11 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                        (setf found-stack stack)
                        (return))
                      (map nil (lambda (c) (if (typep c 'ast-view) ; oops, was view
-                                         (rec c (cons c stack))
+                                         (rec c (cons (node c) stack))
                                          (rec c stack)))
                           (tui:children view)))))
         (rec root-view (list))))
-    (slog (mapcar 'node found-stack))
-    (assert found-stack)
+    (assert (slog found-stack))
     found-stack))
 
 (defun find-view-for-thing (atom-array node)
@@ -165,65 +209,50 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                       (return-from find-view-for-thing v)))))
 
 (defun node-active? (node ui)
-  (and (stack ui) (eq node (node (first (stack ui))))))
+  (and (stack ui) (eq node (first (stack ui)))))
 
 (defvar *atom-key-handlers* (make-hash-table :test 'equalp))
 (defmethod handle-key-for ((node parse::atom-form) ui event)
-  (slog (list 'moving-in-atom node event))
+  (slog (list 'event (tui:event-kind event)))
   (funcall (gethash event *atom-key-handlers*) node ui))
 
-(defun atom-move-downwards (node ui)
+(defun atom-move (view-finder node ui)
   (let* ((atom-array (build-atom-array (tui:root-view ui) (tui:rows ui)))
          (this-rect (tui:rect (find-view-for-thing atom-array node))))
-    (setf (stack ui)
-          (reconstruct-stack (or (node-below atom-array
-                                             (1+ (tui:rect-y this-rect))
-                                             (+ (tui:rect-x this-rect)
-                                                (truncate (tui:rect-x this-rect) 2)))
-                                 node)
-                             (tui:root-view ui)))))
+    (multiple-value-bind (new-view new-goal)
+        (funcall view-finder atom-array this-rect)
+      (when new-view
+        (setf (stack ui) (reconstruct-stack (node new-view) (tui:root-view ui)))
+        (when new-goal
+          (slog (format nil "goal is ~d" new-goal))
+          (setf (goal-col ui) new-goal))))))
 
 (setf (gethash (uncursed-sys::make-event :kind :down-arrow) *atom-key-handlers*)
-      'atom-move-downwards)
-
-(defun atom-move-upwards (node ui)
-  (let* ((atom-array (build-atom-array (tui:root-view ui) (tui:rows ui)))
-         (this-rect (tui:rect (find-view-for-thing atom-array node))))
-    (setf (stack ui)
-          (reconstruct-stack (or (node-above atom-array
-                                             (tui:rect-y this-rect)
-                                             (+ (tui:rect-x this-rect)
-                                                (truncate (tui:rect-x this-rect) 2)))
-                                 node)
-                             (tui:root-view ui)))))
+      (lambda (node ui)
+        (atom-move (lambda (atom-array this-rect)
+                     (view-below atom-array
+                                 (1+ (tui:rect-y this-rect)) (goal-col ui)))
+                   node ui)))
 
 (setf (gethash (uncursed-sys::make-event :kind :up-arrow) *atom-key-handlers*)
-      'atom-move-upwards)
-
-(defun atom-move-left (node ui)
-  (let* ((atom-array (build-atom-array (tui:root-view ui) (tui:rows ui)))
-         (this-rect (tui:rect (find-view-for-thing atom-array node))))
-    (setf (stack ui)
-          (reconstruct-stack (or (node-left atom-array (tui:rect-y this-rect)
-                                            (tui:rect-x this-rect))
-                                 node)
-                             (tui:root-view ui)))))
+      (lambda (node ui)
+        (atom-move (lambda (atom-array this-rect)
+                     (view-above atom-array (tui:rect-y this-rect) (goal-col ui)))
+         node ui)))
 
 (setf (gethash (uncursed-sys::make-event :kind :left-arrow) *atom-key-handlers*)
-      'atom-move-left)
-
-(defun atom-move-right (node ui)
-  (let* ((atom-array (build-atom-array (tui:root-view ui) (tui:rows ui)))
-         (this-rect (tui:rect (find-view-for-thing atom-array node))))
-    (setf (stack ui)
-          (reconstruct-stack (or (node-right atom-array (tui:rect-y this-rect)
-                                             (+ (tui:rect-x this-rect)
-                                                (tui:rect-cols this-rect)))
-                                 node)
-                             (tui:root-view ui)))))
+      (curry #'atom-move
+             (lambda (atom-array this-rect)
+               (let ((view (view-left atom-array
+                                      (tui:rect-y this-rect) (tui:rect-x this-rect))))
+                 (values view (when view (tui:rect-x2 (tui:rect view))))))))
 
 (setf (gethash (uncursed-sys::make-event :kind :right-arrow) *atom-key-handlers*)
-      'atom-move-right)
+      (curry #'atom-move
+             (lambda (atom-array this-rect)
+               (let ((view (view-right atom-array
+                                       (tui:rect-y this-rect) (tui:rect-x2 this-rect))))
+                 (values view (when view (tui:rect-x2 (tui:rect view))))))))
 
 ;;; literals - no cursor state needed
 (defmethod render-node ((node parse::literal-form) context rect)
@@ -262,16 +291,17 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   ;;      ...)
   (let* ((name-view (render-node (parse:name node) context rect))
          (name-rect (tui:rect name-view))
-         (name-x2 (+ (tui:rect-x name-rect) (tui:rect-cols name-rect))))
+         (name-x2 (tui:rect-x2 name-rect)))
     (incf (depth context))
     ;; TODO test empty vertical container
     (let* ((args-view (tui:vertical-container
-                       (tui::clamp-rect (tui:copy-rect rect :x (+ 1 name-x2)) rect)
+                       (tui:clamp-rect (tui:copy-rect rect :x (+ 1 name-x2)) rect)
                        (mapcar (lambda (n)
                                  (make-instance 'node-with-context :node n
                                                                    :context context))
                                (parse:args node))))
            (args-rect (tui:rect args-view)))
+      (decf (depth context))
       (let* ((outrect (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
                                           :cols (+ 1
                                                    (tui:rect-cols name-rect)
@@ -282,49 +312,39 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                    :children (list name-view args-view))))
         (values view 0 #x339900)))))
 
-;; TODO be generic
-;; (defmethod handle-key-for ((node parse::function-call) context event)
-;;   (when (node-active? node context)
-;;     ;; navigate to the next argument
-;;     ))
-
 ;;; let form
-;; (defclass let-cursor ()
-;;   ((form :initarg :form
-;;          :initform (error "cursor form not provided")
-;;          :reader form)
-;;    (bodyform :initform nil
-;;              :accessor bodyform)
-;;    (bind :initform nil
-;;          :accessor bind)
-;;    (init :initform nil
-;;          :accessor init)))
+(defclass let-cursor ()
+  ((bodyform :initform nil
+             :accessor bodyform)
+   (bind :initform nil
+         :accessor bind)
+   (init :initform nil
+         :accessor init)))
 
-;; ;; XXX child reationshpi
-;; (defmethod render-node ((node parse:let*-form) context rect)
-;;   (let ((prefix "let* ")
-;;         (*print-case* :downcase)
-;;         (pos-y (1+ (tui:rect-y rect)))
-;;         (pos-x (1+ (tui:rect-x rect))))
-;;     (tui:puts prefix pos-x pos-y rect)
-;;     ;; bindings
-;;     (with-slots ((vars parse:vars)) node
-;;       (loop for (var init) in vars
-;;             do (tui:puts (format nil "~a ~a" var init) pos-y (1+ (length prefix)) rect)
-;;                (incf pos-y)))
-;;     ;; thing
-;;     (let* ((bview (tui:vertical-container
-;;                    (tui:copy-rect rect :x (+ 2 (tui:rect-x rect))
-;;                                        :y (slog (1- pos-y)))
-;;                    (parse:body node)))
-;;            (brect (tui:rect bview)))
-;;       (values (make-instance 'tui:view
-;;                              :rect (tui:copy-rect rect
-;;                                                   :rows (- (+ (tui:rect-y brect)
-;;                                                               (tui:rect-rows brect))
-;;                                                            (tui:rect-y rect))
-;;                                                   :cols (max (tui:rect-cols brect))))
-;;               0 #x993300))))
+(defmethod render-node ((node parse:let*-form) context rect)
+  (let ((prefix "let* ")
+        (*print-case* :downcase)
+        (pos-y (1+ (tui:rect-y rect)))
+        (pos-x (1+ (tui:rect-x rect))))
+    (tui:puts prefix pos-x pos-y rect)
+    ;; bindings
+    (with-slots ((vars parse:vars)) node
+      (loop for (var init) in vars
+            do (tui:puts (format nil "~a ~a" var init) pos-y (1+ (length prefix)) rect)
+               (incf pos-y)))
+    ;; thing
+    (let* ((bview (tui:vertical-container
+                   (tui:copy-rect rect :x (+ 2 (tui:rect-x rect))
+                                       :y (1- pos-y))
+                   (parse:body node)))
+           (brect (tui:rect bview)))
+      (values (make-instance 'tui:view
+                             :rect (tui:copy-rect rect
+                                                  :rows (- (+ (tui:rect-y brect)
+                                                              (tui:rect-rows brect))
+                                                           (tui:rect-y rect))
+                                                  :cols (max (tui:rect-cols brect))))
+              0 #x993300))))
 
 ;;
 ;;; main loop
@@ -334,6 +354,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   (make-instance 'context :ui ui))
 (defmethod tui:render ((ctx context) rect)
   (render-node (ast (ui ctx)) ctx rect))
+(defmethod tui:render ((o node-with-context) rect)
+  (render-node (node o) (context o) rect))
 
 (defmethod tui:redisplay :after ((ui ui))
   (slog (make-string 100 :initial-element #\-))
@@ -355,12 +377,13 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
               ;;                      (b (1+ a)))
               ;;                (1- b))
               ;;              (parse:make-env))
+
            (parse:parse '(foo (bar (bazaar (parse::*literal-magic* 5)
-                                    (parse::*literal-magic* #\9)))
+                                    (parse::*literal-magic* #\9))
+                               (parse::*literal-magic* #\9))
                           (parse::*literal-magic* 3)
                           b)
-                         (parse:make-env))
-              )
+                        (parse:make-env)))
          (tui (make-instance 'ui :ast ast)))
     (setf *tui* tui)
     (tui:run tui :redisplay-on-input t)
