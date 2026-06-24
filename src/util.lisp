@@ -2,9 +2,10 @@
 ;;;; misc utilities, :used everywhere
 ;;;;
 
-(defpackage #:weave-utils
+(uiop:define-package #:weave-utils
   (:use :cl #:alexandria-2)
-  (:export #:disp #:addr-str #:lfind #:with-lookup #:or-f #:+fail+))
+  (:export #:disp #:addr-str #:lfind #:with-lookup #:or-f #:+fail+
+           #:flex-vector))
 (in-package #:weave-utils)
 
 (defmacro disp (form &optional (stream t))
@@ -39,8 +40,12 @@
            ,mvcall
          (when ,present-p
            (return-from ,blockname (progn ,@then))))
+       ;; don't leak name to the else branch
        ,default)))
 
 (define-modify-macro or-f (&rest forms) or)
 
 (define-constant +fail+ (list t) :test 'equal)
+
+(defun flex-vector ()
+  (make-array 0 :fill-pointer t :adjustable t))
