@@ -7,11 +7,9 @@
 
 (uiop:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
-  (:export #:form #:name
+  (:export #:make-env
            #:parse
-           #:gensym-names #:eval-binders #:subform-asts
-           #:lambda-list #:docstring #:declarations #:body
-           #:make-env))
+           #:is-atom))
 (in-package #:weave-parser)
 
 ;;
@@ -161,10 +159,10 @@
   ()
   (:documentation "Form in an evaluation context, perhaps quoted."))
 
-(defclass literal-form (eval-form atom-form)
-  ((form :initarg :form
-         :type string :initform (error "literal not provided")
-         :reader form))
+(defclass literal (eval-form atom-form)
+  ((str :initarg :str
+        :type string :initform (error "literal not provided")
+        :reader str))
   (:documentation "Atomic literal"))
 
 (defclass symbol-ref (eval-form atom-form)
@@ -216,8 +214,48 @@
          :reader body))
   (:documentation "(macro) lambda list and body list of eval-forms"))
 
-(defmethod print-object ((object literal-form) stream)
-  (format stream "<lit: ~a>" (form object)))
+(defgeneric is-atom (node)
+  (:method (node) nil))
+(defmethod is-atom ((node binder)) t)
+(defmethod is-atom ((node literal)) t)
+
+(defstruct location
+  "`id's usually contain a symbol (slot), possibly list index and should respect `cl:equal'.
+These are specific to the `node' type."
+  (node (error "must provide parent node"))
+  (id nil))
+
+(defgeneric getloc (node location)
+  (:documentation "Returns the current value at `location'."))
+(defgeneric is-body (node id)
+  (:documentation "A body form is suitable for structural editing operations.")
+  (:method (node id) nil)
+  (:method (node (id (eql 'body))) t))
+(defgeneric update (node id new-value)
+  (:documentation "Functionally updates the location corresponding to `id',
+returns a new node with all child nodes identical except the hole indicated.
+List structure may share conses with the old node."))
+
+(defun location= (n1 n2)
+  (and (eq (location-node n1) (location-node n2))
+       (equal (location-id n1) (location-id n2))))
+
+(defmethod update ((node function-call) id new-value)
+  (trivia:cmatch id
+    ((eql 'name)
+     (make-instance 'function-call :name new-value :body (body node)))
+    ((eql 'body)
+     (make-instance 'function-call :name (name node) :body new-value))
+    ;; maybe add body
+    ((type integer)
+     (let ((old-body (body node)))
+       (make-instance 'function-call :name (name node)
+                                     :body `(,@(subseq old-body 0 id)
+                                             ,new-value
+                                             ,@(nthcdr (1+ id) old-body)))))))
+
+(defmethod print-object ((object literal) stream)
+  (format stream "<lit: ~a>" (str object)))
 
 (defmethod print-object ((object symbol-ref) stream)
   (pprint-logical-block (stream (list))
@@ -292,10 +330,10 @@ copy-env can exploit structure sharing, remember to PUSH!"
 
   (define-constant +nullenv+ (make-env) :test 'equalp))
 
-(defun function-bindings ((env env)) (%function-bindings env))
-(defun variable-bindings ((env env)) (%variable-bindings env))
-(defun blocks ((env env)) (%blocks env))
-(defun tags ((env env)) (%tags env))
+(defun function-bindings (env) (%function-bindings env))
+(defun variable-bindings (env) (%variable-bindings env))
+(defun blocks (env) (%blocks env))
+(defun tags (env) (%tags env))
 
 (defun env-variable-info (name env)
   (loop for entry in (variable-bindings env)
@@ -1013,7 +1051,7 @@ Any binding forces a symbol match."
 
 (defun literal-parser (form env walker)
   (declare (ignore walker env))
-  (make-instance 'literal-form :form (second form)))
+  (make-instance 'literal :str (second form)))
 (setf (gethash '*literal-magic* *special-parsers*) 'literal-parser)
 (setf (gethash '*literal-magic* *special-walkers*) (constantly nil))
 

@@ -4,7 +4,10 @@
 
 (uiop:define-package #:weave-utils
   (:use :cl #:alexandria-2)
-  (:export #:disp #:addr-str #:lfind #:with-lookup #:or-f #:+fail+
+  (:export #:disp #:addr-str
+           #:enumerate
+           #:lfind #:list-insert
+           #:with-lookup #:or-f #:+fail+
            #:flex-vector))
 (in-package #:weave-utils)
 
@@ -23,6 +26,11 @@
         (subseq str (- length 3))
         str)))
 
+(defun enumerate (f list)
+  (loop for i from 0
+        for x in list
+        collect (funcall f x i)))
+
 (defun lfind (item list &key (key 'identity) (test 'eql) (start 0) (end (length list)))
   "NIL-detecting version of find for lists, only searches forwards"
   (declare (optimize speed)
@@ -32,6 +40,10 @@
   (loop for elt in (nthcdr start list)
         do (when (funcall (the function test) item (funcall (the function key) elt))
              (return (values elt t)))))
+
+(defun list-insert (list item i)
+  "functional insertion, may share structure"
+  `(,@(subseq list 0 i) ,item ,@(nthcdr i list)))
 
 (defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
   (with-gensyms (blockname present-p)

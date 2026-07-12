@@ -2,7 +2,6 @@
 ;;;; terminal frontend
 ;;;;
 ;;
-;; TODO
 ;; highlight lexical occurrences of the symbol under cursor using envmaps
 ;; need a generic method for inserting and deleting nodes
 ;; add a window for list serialization
@@ -13,17 +12,42 @@
 
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
+  (:import-from #:weave-parser
+                #:location
+                #:make-location #:location-node #:location-id #:location=
+                #:getloc #:update)
   (:local-nicknames (#:parse #:weave-parser)
                     (#:tui #:uncursed))
   (:export))
 (in-package #:weave-tui)
 
 ;; dynamic vars for debugging, should not be used
-(defvar *log*)
+(defvar *log* (sb-concurrency:make-mailbox :name "log"))
 (defvar *tui*)
-(defun slog (o)
-  #+(and sbcl slynk) (sb-concurrency:send-message *log* o)
-  o)
+(defmacro slog (form)
+  (once-only ((res form))
+    `(progn
+       (sb-concurrency:send-message *log* (cons ',form ,res))
+       ,res)))
+
+(defstruct context-wrapper thing stack (context (error "no context")))
+(defun wrap-context (thing stack context)
+  (make-context-wrapper :thing thing :stack stack :context context))
+
+(defclass ast-view (tui:view)
+  ((location :initarg :loc
+             :initform (error "ast view must correspond to a location")
+             :accessor location
+             :type location)
+   (hoverable :initarg :hoverable
+              :initform nil
+              :accessor hoverable)))
+
+(defgeneric handle-key (node view location context event)
+  (:documentation "event is a uncursed key event. If this node is active then
+adjust cursor state in the context, specialized for the `cursor'.
+If this returns NIL, propagate up the cursor stack.")
+  (:method (node view location context event) nil))
 
 (defclass completion-state ()
   ((anchor :initarg :anchor
@@ -39,99 +63,52 @@
 (defclass ui (tui:elemental)
   ((ast :initarg :ast
         :accessor ast)
-   (stack :initform (list)
-          :accessor stack
-          :type list)
+   (focus :initarg :focus
+          :accessor focus
+          :type location)
    (goal-col :initform 1
              :accessor goal-col
              :type positive-fixnum)
    (completion-state :initform nil
                      :accessor completion-state
-                     :type (or null completion-state))))
+                     :type (or null completion-state))
+   ;; these are caches computed on every redisplay
+   (stack :initarg :stack
+          :accessor stack ; stack is always non-empty
+          :type list)
+   (node-views :initform (make-hash-table)
+               :accessor node-views)))
 
-(defclass context ()
-  ((ui :initarg :ui
-       :initform (error "no ui in context")
-       :accessor ui
-       :type ui)
-   (depth :initarg :depth
-          :initform 0
-          :accessor depth
-          :type non-negative-fixnum)))
-
-(defclass ast-view (tui:view)
-  ((node :initarg :node
-         :initform (error "no node in ast view?")
-         :accessor node)
-   (hoverable :initarg :hoverable
-              :initform nil
-              :accessor hoverable)))
-
-(defclass node-with-context ()
-  ((node :initarg :node
-         :reader node)
-   (context :initarg :context
-            :reader context)))
+(defun ast-replace (newnode stack ui)
+  (loop for new = newnode then (update (location-node old-loc) (location-id old-loc) new)
+        for old-loc in stack
+        until (eq t (location-node old-loc))
+        finally (setf (ast ui) new)))
 
 ;;
 ;;; ast classes
 ;;
-(defgeneric render-node (ast context rect))
 
-(defmethod render-node :before (node context rect)
-  (slog `(rendering ,node to ,rect)))
+(defgeneric render-node (node stack context rect))
 
 ;; contract: do NOT overwrite child render
-(defmethod render-node :before (node context rect)
-  (let ((i (* 10 (depth context))))
+(defmethod render-node :before (node stack context rect)
+  (let ((i (* 25 (1- (length stack))))) ; stack is always nonempty
     (tui:fill-rect (tui:make-style :bg (tui:color i i i))
                    (tui:copy-rect rect :x 0 :y 0)
                    rect)))
 
-(defgeneric handle-key-for (ast context event)
-  (:documentation "event is a uncursed key event. If this node is active then
-adjust cursor state in the context, specialized for the `ast' node.
-Typically we will use the default implementation below."))
-
-(defclass hole ()
-  ((text :initarg :text
-         :initform ""
-         :accessor text
-         :type simple-string)))
-
-(defmethod render-node ((node hole) context rect)
-  (with-accessors ((text text)) node
-    (let* ((text (if (string= text "") "hole" text))
-           (outrect (tui:copy-rect rect :rows 1 :cols (tui:display-width text)))
-           (focused (node-active? node (ui context))))
-      (tui:puts text 1 1 rect (if focused
-                                  (tui:make-style :fg #x0
-                                                  :bg (when focused #xb58900)
-                                                  :underlinep t)
-                                  (tui:make-style :underlinep t)))
-      (values (make-instance 'ast-view :rect outrect :node node
-                                       :hoverable t
-                                       :focused focused
-                                       :key-handler (lambda (v e)
-                                                      (declare (ignore v))
-                                                      (handle-key-for node (ui context) e)))
-              0 #x993300))))
-
-(defmethod handle-key-for ((node hole) context event)
-  (let ((c (tui:event-kind event)))
-    (cond ((and (alpha-char-p c)
-                (not (or (tui:event-controlp event)
-                         (tui:event-altp event) (tui:event-metap event))))
-           ;; TODO edit - swap with symbol node, begin completion
-           )
-          ((and (digit-char-p c)
-                (not (or (tui:event-controlp event)
-                         (tui:event-altp event) (tui:event-metap event))))
-           ;; TODO edit - swap with literal number node
-           )
-          ((char= c #\Tab)
-           ;; TODO edit - swap with function-call node, begin function completion
-           (slog 'tab)))))
+(defvar *global-key-handlers* (make-hash-table :test 'equalp))
+(defun global-key-handler (node location context)
+  " handler may return t to stop propagation up the stack"
+  (lambda (view event)
+    (slog event)
+    (assert (loc-active location context))
+    (if-let (handler (gethash event *global-key-handlers*))
+      (funcall handler view context)
+      (loop for thisnode = (slog node) then (slog (location-node location))
+            for location in (slog (stack context))
+            thereis (handle-key thisnode view location context event)))))
 
 ;; ASSUME leaf nodes are non-overlapping
 ;; we index them into an array of blocks sorted by line then column
@@ -143,7 +120,7 @@ Typically we will use the default implementation below."))
                                  (let ((rect (tui:rect view)))
                                    (push view (aref rows (tui:rect-y rect)))))
                                t))
-    (map-into rows (lambda (row) (sort row #'< :key (lambda (v) (tui:rect-x (tui:rect v)))))
+    (map-into rows (lambda (row) (sort row #'< :key (compose #'tui:rect-x #'tui:rect)))
               rows)))
 
 (defun view-below (atom-array y col)
@@ -185,184 +162,275 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     res
     (view-below atom-array (1+ y) 1)))
 
-(defun reconstruct-stack (node root-view)
-  "ASSUMES: view tree contains node tree"
-  (let ((found-stack (list)))
-    (block nil
-      (labels ((rec (view stack)
-                 (if (and (typep view 'ast-view) (eq (node view) node))
-                     (progn
-                       (setf found-stack stack)
-                       (return))
-                     (map nil (lambda (c) (if (typep c 'ast-view) ; oops, was view
-                                         (rec c (cons (node c) stack))
-                                         (rec c stack)))
-                          (tui:children view)))))
-        (rec root-view (list))))
-    (assert (slog found-stack))
-    found-stack))
-
-(defun find-view-for-thing (atom-array node)
-  (loop for row across atom-array
-        do (loop for v in row
-                 do (when (eq node (node v)) ; NOTE: must be a node
-                      (return-from find-view-for-thing v)))))
-
-(defun node-active? (node ui)
-  (and (stack ui) (eq node (first (stack ui)))))
-
-(defvar *atom-key-handlers* (make-hash-table :test 'equalp))
-(defmethod handle-key-for ((node parse::atom-form) ui event)
-  (slog (list 'event (tui:event-kind event)))
-  (funcall (gethash event *atom-key-handlers*) node ui))
-
-(defun atom-move (view-finder node ui)
+(defun atom-move (view-finder view ui)
   (let* ((atom-array (build-atom-array (tui:root-view ui) (tui:rows ui)))
-         (this-rect (tui:rect (find-view-for-thing atom-array node))))
+         (this-rect (tui:rect view)))
     (multiple-value-bind (new-view new-goal)
         (funcall view-finder atom-array this-rect)
-      (when new-view
-        (setf (stack ui) (reconstruct-stack (node new-view) (tui:root-view ui)))
+      (when new-view ; assumes atoms are all ast-views
+        (setf (focus ui) (location new-view))
         (when new-goal
-          (slog (format nil "goal is ~d" new-goal))
+          (slog (format nil "goal col is ~d" new-goal))
           (setf (goal-col ui) new-goal))))))
 
-(setf (gethash (uncursed-sys::make-event :kind :down-arrow) *atom-key-handlers*)
-      (lambda (node ui)
+(setf (gethash (uncursed-sys::make-event :kind :down-arrow) *global-key-handlers*)
+      (lambda (view ui)
         (atom-move (lambda (atom-array this-rect)
-                     (view-below atom-array
-                                 (1+ (tui:rect-y this-rect)) (goal-col ui)))
-                   node ui)))
+                     (view-below atom-array (1+ (tui:rect-y this-rect)) (goal-col ui)))
+                   view ui)))
 
-(setf (gethash (uncursed-sys::make-event :kind :up-arrow) *atom-key-handlers*)
-      (lambda (node ui)
+(setf (gethash (uncursed-sys::make-event :kind :up-arrow) *global-key-handlers*)
+      (lambda (view ui)
         (atom-move (lambda (atom-array this-rect)
                      (view-above atom-array (tui:rect-y this-rect) (goal-col ui)))
-         node ui)))
+                   view ui)))
 
-(setf (gethash (uncursed-sys::make-event :kind :left-arrow) *atom-key-handlers*)
-      (curry #'atom-move
-             (lambda (atom-array this-rect)
-               (let ((view (view-left atom-array
-                                      (tui:rect-y this-rect) (tui:rect-x this-rect))))
-                 (values view (when view (tui:rect-x2 (tui:rect view))))))))
+(setf (gethash (uncursed-sys::make-event :kind :left-arrow) *global-key-handlers*)
+      (lambda (view ui)
+        (atom-move
+         (lambda (atom-array this-rect)
+           (let ((view (view-left atom-array
+                                  (tui:rect-y this-rect) (tui:rect-x this-rect))))
+             (values view (when view (tui:rect-x2 (tui:rect view))))))
+         view ui)))
 
-(setf (gethash (uncursed-sys::make-event :kind :right-arrow) *atom-key-handlers*)
-      (curry #'atom-move
-             (lambda (atom-array this-rect)
-               (let ((view (view-right atom-array
-                                       (tui:rect-y this-rect) (tui:rect-x2 this-rect))))
-                 (values view (when view (tui:rect-x2 (tui:rect view))))))))
+(setf (gethash (uncursed-sys::make-event :kind :right-arrow) *global-key-handlers*)
+      (lambda (view ui)
+        (atom-move
+         (lambda (atom-array this-rect)
+           (let ((view (view-right atom-array
+                                   (tui:rect-y this-rect) (tui:rect-x2 this-rect))))
+             (values view (when view (tui:rect-x2 (tui:rect view))))))
+         view ui)))
+
+;;; hole
+(defclass hole ()
+  ((text :initarg :text
+         :initform ""
+         :accessor text
+         :type simple-string)))
+
+(defun loc-active (location context)
+  (when (stack context)
+    (location= location (focus context))))
+
+(defmethod render-node :around (node stack context rect)
+  (let ((vals (multiple-value-list (call-next-method))))
+    ;; save window
+    (setf (gethash node (node-views context)) (first vals))
+    ;; cache stack
+    (when (location= (car stack) (focus context))
+      (setf (stack context) stack))
+    (values-list vals)))
+
+(defmethod parse::is-atom ((node hole)) t)
+(defmethod render-node ((node hole) stack context rect)
+  (with-accessors ((text text)) node
+    (let* ((text (if (string= text "") "hole" text))
+           (focused (eq (car stack) (focus context))))
+      (tui:puts text 1 1 rect (if focused
+                                  (tui:make-style :fg #x0
+                                                  :bg (when focused #xb58900)
+                                                  :underlinep t)
+                                  (tui:make-style :fg (tui:color 30 200 0)
+                                                  :underlinep t)))
+      (make-instance 'ast-view
+                      :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                      :loc (car stack)
+                      :hoverable t
+                      ;; leaf handler never called unless focused
+                      :key-handler (when focused
+                                     (global-key-handler node (car stack) context))
+                      :focused focused))))
+
+(defun narrow-completions (candidates prefix)
+  (loop for s in candidates
+        when (alexandria:starts-with-subseq prefix s)
+          collect it))
+
+(defmethod handle-key ((node hole) view location context event)
+  (let ((c (tui:event-kind event)))
+    (cond
+      ((and (alpha-char-p c)
+            (not (or (tui:event-controlp event)
+                     (tui:event-altp event) (tui:event-metap event))))
+       ;;
+       (let ((newnode (make-instance 'parse::symbol-ref :name "")))
+         (ast-replace newnode
+                      (position-if (lambda (l) (location= location l)) (stack context))
+                      context)
+         ;; begin completion
+         (setf (focus context) newnode)
+         (setf (completion-state context)
+               (make-instance
+                'completion-state
+                :anchor node
+                :candidates (narrow-completions
+                             (loop for s being the symbols of (find-package "CL")
+                                   collect (string s))
+                             (string c)))))
+       t)
+      ((and (digit-char-p c)
+            (not (or (tui:event-controlp event)
+                     (tui:event-altp event) (tui:event-metap event))))
+       ;; TODO edit - swap with literal number node
+       (slog 'digit)
+       (let ((newnode (make-instance 'parse::literal :str (string c))))
+         (setf (focus context) newnode)
+         (ast-replace newnode
+                      (position-if (lambda (l) (location= location l)) (stack context))
+                      context))
+       t)
+      (t (slog `(unhandled ,c))))))
 
 ;;; literals - no cursor state needed
-(defmethod render-node ((node parse::literal-form) context rect)
-  (let* ((str (format nil "~a" (parse:form node)))
-         (outrect (tui:copy-rect rect :rows 1 :cols (tui:display-width str)))
-         (focused (node-active? node (ui context))))
+(defmethod render-node ((node parse::literal) stack context rect)
+  (let* ((location (car stack))
+         (str (format nil "~a" (parse::str node)))
+         (focused (location= location (focus context))))
     (tui:puts str 1 1 rect (if focused
-                               (tui:make-style :fg #x0
-                                               :bg (when focused #xb58900))
+                               (tui:make-style :fg #x0 :bg (when focused #xb58900))
                                (tui:make-style :fg #x2aa198)))
-    (values (make-instance 'ast-view :rect outrect :node node
-                                     :hoverable t
-                                     :focused focused
-                                     :key-handler (lambda (v e)
-                                                    (declare (ignore v))
-                                                    (handle-key-for node (ui context) e)))
-            0 #x993300)))
+    (make-instance 'ast-view
+                   :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                   :loc location
+                   :hoverable t
+                   :key-handler (when focused
+                                  (global-key-handler node location context))
+                   :focused focused)))
 
 ;;; symbol-references
-(defmethod render-node ((node parse::symbol-ref) context rect)
-  (let* ((str (format nil "~a" (parse:name node)))
-         (outrect (tui:copy-rect rect :rows 1 :cols (tui:display-width str)))
-         (focused (node-active? node (ui context))))
+(defmethod render-node ((node parse::symbol-ref) stack context rect)
+  (let* ((location (car stack))
+         (str (format nil "~a" (parse::name node)))
+         (focused (location= location (focus context))))
     (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900)))
-    (values (make-instance 'ast-view :rect outrect :node node
-                                     :hoverable t
-                                     :focused focused
-                                     :key-handler (lambda (v e)
-                                                    (declare (ignore v))
-                                                    (handle-key-for node (ui context) e)))
-            0 #x993300)))
+    (make-instance 'ast-view
+                   :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                   :loc location
+                   :hoverable t
+                   :key-handler (when focused
+                                  (global-key-handler node location context))
+                   :focused focused)))
+
+;;; binders
+(defmethod render-node ((node parse::binder) stack context rect)
+  (let* ((location (car stack))
+         (str (format nil "~a" (parse::name node)))
+         (focused (location= location (focus context))))
+    (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900) :italicp t))
+    (make-instance 'ast-view
+                   :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                   :loc location
+                   :hoverable t
+                   :key-handler (when focused
+                                  (global-key-handler node location context))
+                   :focused focused)))
 
 ;;; function call
-(defmethod render-node ((node parse::function-call) context rect)
-  ;; name(args
-  ;;      ...)
-  (let* ((name-view (render-node (parse:name node) context rect))
+(defvar *fun-key-handlers* (make-hash-table :test 'equalp))
+(defmethod handle-key ((node parse::function-call) view location ui event)
+  (when-let ((handler (gethash event *fun-key-handlers*)))
+    ;; dispatch is based on dynamic properties, not just class
+    (funcall handler node location ui)))
+
+(defun insert-hole (node call-loc ui)
+  (slog `("insert hole" ,node))
+  ;; inserts a hole after the current item and focuses it
+  (let ((i (position-if (lambda (l) (location= call-loc l)) (stack ui))))
+    (when (zerop i)
+      (return-from insert-hole nil))
+    ;; non-toplevel, child (1- i) >= 0
+    ;; assume: singular body, idx: location index of child to insert after
+    (let* ((id (location-id (nth (1- i) (stack ui))))
+           (idx (if (integerp id) (1+ id) 0))
+           (new-call (update node 'parse::body (list-insert (parse::body node)
+                                                            (make-instance 'hole)
+                                                            idx))))
+      (setf (focus ui) (make-location :node new-call :id idx))
+      (ast-replace new-call (nthcdr i (stack ui)) ui)
+      t)))
+(setf (gethash (uncursed-sys::make-event :kind #\newline) *fun-key-handlers*)
+      #'insert-hole)
+
+(defmethod render-node ((node parse::function-call) stack context rect)
+  (let* ((location (car stack))
+         (name-loc (make-location :node node :id 'name))
+         (name-view (render-node (parse::name node)
+                                 (cons name-loc stack) context rect))
          (name-rect (tui:rect name-view))
-         (name-x2 (tui:rect-x2 name-rect)))
-    (incf (depth context))
-    ;; TODO test empty vertical container
-    (let* ((args-view (tui:vertical-container
-                       (tui:clamp-rect (tui:copy-rect rect :x (+ 1 name-x2)) rect)
-                       (mapcar (lambda (n)
-                                 (make-instance 'node-with-context :node n
-                                                                   :context context))
-                               (parse:args node))))
-           (args-rect (tui:rect args-view)))
-      (decf (depth context))
-      (let* ((outrect (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
-                                          :cols (+ 1
-                                                   (tui:rect-cols name-rect)
-                                                   (tui:rect-cols args-rect))))
-             (view (make-instance 'ast-view
-                                   :node node
-                                   :rect outrect
-                                   :children (list name-view args-view))))
-        (values view 0 #x339900)))))
+         (args-view (tui:vertical-container
+                     (tui:clamp-rect (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
+                                     rect)
+                     (enumerate
+                      (lambda (argnode i)
+                        (wrap-context argnode
+                                      (cons (make-location :node node :id i) stack)
+                                      context))
+                      (parse::body node))))
+         (args-rect (tui:rect args-view)))
+    (make-instance 'ast-view
+                    :loc location
+                    :rect (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
+                                              :cols (+ 1
+                                                       (tui:rect-cols name-rect)
+                                                       (tui:rect-cols args-rect)))
+                    :children (list name-view args-view)
+                    :key-handler (global-key-handler node location context)
+                    :focused (location= location (focus context)))))
 
 ;;; let form
-(defclass let-cursor ()
-  ((bodyform :initform nil
-             :accessor bodyform)
-   (bind :initform nil
-         :accessor bind)
-   (init :initform nil
-         :accessor init)))
 
-(defmethod render-node ((node parse:let*-form) context rect)
-  (let ((prefix "let* ")
-        (*print-case* :downcase)
-        (pos-y (1+ (tui:rect-y rect)))
-        (pos-x (1+ (tui:rect-x rect))))
-    (tui:puts prefix pos-x pos-y rect)
-    ;; bindings
-    (with-slots ((vars parse:vars)) node
-      (loop for (var init) in vars
-            do (tui:puts (format nil "~a ~a" var init) pos-y (1+ (length prefix)) rect)
-               (incf pos-y)))
-    ;; thing
-    (let* ((bview (tui:vertical-container
-                   (tui:copy-rect rect :x (+ 2 (tui:rect-x rect))
-                                       :y (1- pos-y))
-                   (parse:body node)))
-           (brect (tui:rect bview)))
-      (values (make-instance 'tui:view
-                             :rect (tui:copy-rect rect
-                                                  :rows (- (+ (tui:rect-y brect)
-                                                              (tui:rect-rows brect))
-                                                           (tui:rect-y rect))
-                                                  :cols (max (tui:rect-cols brect))))
-              0 #x993300))))
+;; (defmethod render-node ((node parse:let*-form) location stack context rect)
+;;   (let ((prefix "let* "))
+;;     (tui:puts prefix 1 1 rect (tui:make-style :boldp t))
+;;     (let* ((bindings
+;;              (tui:vertical-container
+;;               (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect)
+;;                                                         (tui:display-width prefix)))
+;;                               rect)
+;;               (loop for (var initform) in (parse:vars node)
+;;                     for i from 0
+;;                     collect (wrap-context (make-bind-pair :var var :init initform :index i)
+;;                                          context))))
+;;            (bindrect (tui:rect bindings)))
+;;       (incf (stack context))
+;;       (let* ((bview (tui:vertical-container
+;;                      (tui:clamp-rect (tui:copy-rect rect :x (+ 2 (tui:rect-x rect))
+;;                                                          :y (tui:rect-y2 bindrect))
+;;                                      rect)
+;;                      (mapcar (lambda (node) (wrap-context node context))
+;;                              (parse:body node))))
+;;              (brect (tui:rect bview)))
+;;         (decf (stack context))
+;;         (make-instance 'ast-view
+;;                         :loc (make-location :node node)
+;;                         :children (list bindings bview)
+;;                         :rect (tui:copy-rect rect
+;;                                              :rows (+ (tui:rect-y bindrect)
+;;                                                       (tui:rect-y brect))
+;;                                              :cols (max (+ (length prefix)
+;;                                                            (tui:rect-cols bindrect))
+;;                                                         (+ 2 (tui:rect-cols brect)))))))))
 
 ;;
 ;;; main loop
 ;;
 
-(defmethod tui:render-state ((ui ui))
-  (make-instance 'context :ui ui))
-(defmethod tui:render ((ctx context) rect)
-  (render-node (ast (ui ctx)) ctx rect))
-(defmethod tui:render ((o node-with-context) rect)
-  (render-node (node o) (context o) rect))
+(defmethod tui:render-state ((ui ui)) ui)
+(defmethod tui:render ((ui ui) rect)
+  ;; do not allow use of old caches
+  (clrhash (node-views ui))
+  (setf (stack ui) nil)
+  (render-node (ast ui) (list (make-location :node t)) ui rect))
+
+(defmethod tui:render ((o context-wrapper) rect)
+  (render-node (context-wrapper-thing o) (context-wrapper-stack o)
+               (context-wrapper-context o)
+               rect))
 
 (defmethod tui:redisplay :after ((ui ui))
-  (slog (make-string 100 :initial-element #\-))
-  (when (null (stack ui))
-    (let ((views (build-atom-array (tui:root-view ui) (tui:rows ui))))
-      (setf (stack ui)
-            (reconstruct-stack (node-below views 0 1) (tui:root-view ui))))))
+  (slog "------------------------------------------------------------------------------"))
 
 (defmethod tui:dispatch-event :around ((ui ui) event)
   (with-simple-restart (nil "ignore event-handling error")
@@ -372,31 +440,26 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
         (tui:stop ui)
         (call-next-method))))
 
+(defvar *log-stop* (gensym))
 (defun tui-main ()
-  (let* ((ast ;; (parse:parse '(let* ((a (parse::*literal-magic* 3))
-              ;;                      (b (1+ a)))
-              ;;                (1- b))
-              ;;              (parse:make-env))
-
-           (parse:parse '(foo (bar (bazaar (parse::*literal-magic* 5)
-                                    (parse::*literal-magic* #\9))
-                               (parse::*literal-magic* #\9))
-                          (parse::*literal-magic* 3)
-                          b)
-                        (parse:make-env)))
-         (tui (make-instance 'ui :ast ast)))
+  (let* ((ast (parse:parse ';; (let* ((aaa (parse::*literal-magic* "3"))
+                            ;;        (bbb (1+ aaa)))
+                            ;;  (1- b))
+               (- (+ a (parse::*literal-magic* "3")) b)
+               (parse:make-env)))
+         (root-loc (make-location :node t))
+         (tui (make-instance 'ui :ast ast
+                                 :focus root-loc
+                                 :stack (list root-loc))))
     (setf *tui* tui)
-    (tui:run tui :redisplay-on-input t)
-    #+sbcl
-    (sb-concurrency:send-message *log* :stop)))
+    (unwind-protect (tui:run tui :redisplay-on-input t)
+      (slog *log-stop*))))
 
 (defun main ()
   (if (member :slynk *features*)
       (progn
         (bt:make-thread (lambda () (tui-main)))
-        #+sbcl
-        (loop :initially (setf *log* (sb-concurrency:make-mailbox :name "log"))
-              :for m = (sb-concurrency:receive-message *log*)
-              :until (eq m :stop)
-              :do (print m) (force-output)))
+        (loop :for (form . value) = (sb-concurrency:receive-message *log*)
+              :until (eq value *log-stop*)
+              :do (format t "~a~%|> ~s~%" form value) (force-output)))
       (tui-main)))
