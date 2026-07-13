@@ -225,8 +225,11 @@ These are specific to the `node' type."
   (node (error "must provide parent node"))
   (id nil))
 
-(defgeneric getloc (node location)
+(defgeneric get-location (node location)
   (:documentation "Returns the current value at `location'."))
+(defun getloc (location)
+  (get-location (location-node location) location))
+
 (defgeneric is-body (node id)
   (:documentation "A body form is suitable for structural editing operations.")
   (:method (node id) nil)
@@ -240,13 +243,18 @@ List structure may share conses with the old node."))
   (and (eq (location-node n1) (location-node n2))
        (equal (location-id n1) (location-id n2))))
 
+(defmethod get-location ((node function-call) location)
+  (trivia:cmatch (location-id location)
+    ((eql 'name) (name node))
+    ((eql 'body) (body node))
+    ((type integer) (nth (location-id location) (body node)))))
+
 (defmethod update ((node function-call) id new-value)
   (trivia:cmatch id
     ((eql 'name)
      (make-instance 'function-call :name new-value :body (body node)))
     ((eql 'body)
      (make-instance 'function-call :name (name node) :body new-value))
-    ;; maybe add body
     ((type integer)
      (let ((old-body (body node)))
        (make-instance 'function-call :name (name node)

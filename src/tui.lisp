@@ -52,13 +52,11 @@ If this returns NIL, propagate up the cursor stack.")
 (defclass completion-state ()
   ((anchor :initarg :anchor
            :reader anchor
-           :documentation "the hole associated with this completion")
+           :documentation "the node associated with this completion")
    (candidates :initarg :candidates
                :accessor candidates)
-   (selected :initform nil
-             :accessor selected)
-   (top-line :initform 0
-             :accessor top-line)))
+   (selection :initform 0
+              :accessor selection)))
 
 (defclass ui (tui:elemental)
   ((ast :initarg :ast
@@ -79,11 +77,8 @@ If this returns NIL, propagate up the cursor stack.")
    (node-views :initform (make-hash-table)
                :accessor node-views)))
 
-(defun ast-replace (newnode stack ui)
-  (loop for new = newnode then (update (location-node old-loc) (location-id old-loc) new)
-        for old-loc in stack
-        until (eq t (location-node old-loc))
-        finally (setf (ast ui) new)))
+(defun ui-rect (ui)
+  (tui:make-rect :x 0 :y 0 :rows (tui:rows ui) :cols (tui:cols ui)))
 
 ;;
 ;;; ast classes
@@ -108,7 +103,43 @@ If this returns NIL, propagate up the cursor stack.")
       (funcall handler view context)
       (loop for thisnode = (slog node) then (slog (location-node location))
             for location in (slog (stack context))
-            thereis (handle-key thisnode view location context event)))))
+            thereis (handle-key thisnode view location context event)))
+    ;; state updates here
+    (when-let (completion (completion-state context))
+      (with-accessors ((candidates candidates)
+                       (anchor anchor))
+          completion
+        (if (not (eq (getloc (focus context)) anchor))
+            (setf (completion-state context) nil)
+            (setf candidates
+                  (remove-if-not (lambda (s)
+                                   (alexandria:starts-with-subseq (parse::name anchor) s))
+                                 candidates)))))
+    ))
+
+(setf (gethash (uncursed-sys::make-event :kind #\i :controlp t) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when-let (state (completion-state ui))
+          (setf (selection state) (mod (1+ (selection state))
+                                       (length (candidates state)))))))
+
+(setf (gethash (uncursed-sys::make-event :kind #\tab :shiftp t) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when-let (state (completion-state ui))
+          (setf (selection state) (mod (1- (selection state))
+                                       (length (candidates state)))))))
+
+(setf (gethash (uncursed-sys::make-event :kind #\newline) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when-let (state (completion-state ui))
+          ;; only 'full' edits should be updated persistently
+          ;; avoid too much overhead
+          (setf (slot-value (anchor state) 'parse::name)
+                (nth (selection state) (candidates state)))
+          (setf (completion-state ui) nil))))
 
 ;; ASSUME leaf nodes are non-overlapping
 ;; we index them into an array of blocks sorted by line then column
@@ -226,8 +257,9 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (defmethod parse::is-atom ((node hole)) t)
 (defmethod render-node ((node hole) stack context rect)
   (with-accessors ((text text)) node
-    (let* ((text (if (string= text "") "hole" text))
-           (focused (eq (car stack) (focus context))))
+    (let* ((location (car stack))
+           (text (if (string= text "") "hole" text))
+           (focused (location= location (focus context))))
       (tui:puts text 1 1 rect (if focused
                                   (tui:make-style :fg #x0
                                                   :bg (when focused #xb58900)
@@ -236,17 +268,12 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                                   :underlinep t)))
       (make-instance 'ast-view
                       :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
-                      :loc (car stack)
+                      :loc location
                       :hoverable t
                       ;; leaf handler never called unless focused
                       :key-handler (when focused
-                                     (global-key-handler node (car stack) context))
+                                     (global-key-handler node location context))
                       :focused focused))))
-
-(defun narrow-completions (candidates prefix)
-  (loop for s in candidates
-        when (alexandria:starts-with-subseq prefix s)
-          collect it))
 
 (defmethod handle-key ((node hole) view location context event)
   (let ((c (tui:event-kind event)))
@@ -255,33 +282,34 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
             (not (or (tui:event-controlp event)
                      (tui:event-altp event) (tui:event-metap event))))
        ;;
-       (let ((newnode (make-instance 'parse::symbol-ref :name "")))
-         (ast-replace newnode
-                      (position-if (lambda (l) (location= location l)) (stack context))
-                      context)
+       (let ((newnode (make-instance 'parse::symbol-ref :name (string c))))
          ;; begin completion
-         (setf (focus context) newnode)
+         (multiple-value-bind (ast newloc)
+             (ast-replace location
+                          (lambda (hole) hole newnode)
+                          (findcdr-if (lambda (l) (location= location l)) (stack context)))
+           (setf (ast context) ast
+                 (focus context) newloc))
          (setf (completion-state context)
                (make-instance
                 'completion-state
-                :anchor node
-                :candidates (narrow-completions
-                             (loop for s being the symbols of (find-package "CL")
-                                   collect (string s))
-                             (string c)))))
+                :anchor newnode
+                :candidates (loop for s being the symbols of (find-package "CL")
+                                  collect (string-downcase s)))))
        t)
       ((and (digit-char-p c)
             (not (or (tui:event-controlp event)
                      (tui:event-altp event) (tui:event-metap event))))
        ;; TODO edit - swap with literal number node
        (slog 'digit)
-       (let ((newnode (make-instance 'parse::literal :str (string c))))
-         (setf (focus context) newnode)
-         (ast-replace newnode
-                      (position-if (lambda (l) (location= location l)) (stack context))
-                      context))
+       ;; (let ((newnode (make-instance 'parse::literal :str (string c))))
+       ;;   (setf (focus context)
+       ;;         (ast-replace newnode
+       ;;                      (findcdr-if (lambda (l) (location= location l)) (stack context))
+       ;;                      context)))
        t)
-      (t (slog `(unhandled ,c))))))
+      ;; unhandled
+      (t nil))))
 
 ;;; literals - no cursor state needed
 (defmethod render-node ((node parse::literal) stack context rect)
@@ -334,23 +362,43 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     ;; dispatch is based on dynamic properties, not just class
     (funcall handler node location ui)))
 
+;; XXX many things bake in an assumption of a single stack. Is this reasonable?
+;; XXX nonstandard loop
+(defun ast-replace (loc updater stack)
+  "Requires that (location-node `loc') = (location-node (car `stack'))
+for loop invariant node ~ (location-node old-loc).
+Returns the new ast and location relative to the updated node."
+  (loop with old = (getloc loc)
+        with id = (location-id loc)
+        with newnode = (update (location-node loc) id (funcall updater old))
+        for old-loc in stack
+        until (eq t (location-node old-loc))
+        for node = newnode then (update (location-node old-loc) (location-id old-loc) node)
+        finally (return (values node (make-location :node newnode :id id)))))
+
 (defun insert-hole (node call-loc ui)
+  "Assumes body is an identifier (unique).
+Inserts after current node if currently in the body"
   (slog `("insert hole" ,node))
   ;; inserts a hole after the current item and focuses it
   (let ((i (position-if (lambda (l) (location= call-loc l)) (stack ui))))
     (when (zerop i)
+      ;; may handle further up
       (return-from insert-hole nil))
     ;; non-toplevel, child (1- i) >= 0
-    ;; assume: singular body, idx: location index of child to insert after
-    (let* ((id (location-id (nth (1- i) (stack ui))))
-           (idx (if (integerp id) (1+ id) 0))
-           (new-call (update node 'parse::body (list-insert (parse::body node)
-                                                            (make-instance 'hole)
-                                                            idx))))
-      (setf (focus ui) (make-location :node new-call :id idx))
-      (ast-replace new-call (nthcdr i (stack ui)) ui)
+    (let* ((stack (nthcdr (1- i) (stack ui)))
+           (id (location-id (car stack)))
+           (id (if (integerp id) (1+ id) 0)))
+      (multiple-value-bind (ast child-loc)
+          (ast-replace (make-location :node node :id 'parse::body)
+                       (lambda (body) (list-insert body (make-instance 'hole) id))
+                       stack)
+        (slog ast)
+        (slog child-loc)
+        (setf (focus ui) (make-location :node (location-node child-loc) :id id)
+              (ast ui) ast))
       t)))
-(setf (gethash (uncursed-sys::make-event :kind #\newline) *fun-key-handlers*)
+(setf (gethash (uncursed-sys::make-event :kind #\newline :altp t) *fun-key-handlers*)
       #'insert-hole)
 
 (defmethod render-node ((node parse::function-call) stack context rect)
@@ -413,24 +461,85 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 ;;                                                            (tui:rect-cols bindrect))
 ;;                                                         (+ 2 (tui:rect-cols brect)))))))))
 
+;;; completions
+(defclass completion ()
+  ((name :initarg :name
+         :reader name
+         :initform (error "name not provided")
+         :type string)
+   (index :initarg :index
+          :reader index
+          :initform (error "index not provided")
+          :type integer)
+   (state :initarg :state
+          :reader state
+          :initform (error "state not provided")
+          :type completion-state)))
+
+(defmethod tui:render ((c completion) rect)
+  (if (plusp (tui:rect-rows rect))
+      (let* ((state (state c))
+             (prefix (parse::name (anchor state))))
+        (flet ((style (bold)
+                 (tui:make-style :fg #xeeeeee
+                                 :bg (when (eql (index c) (selection state)) #x2aa198)
+                                 :boldp bold)))
+          (tui:puts prefix 1 1 rect (style t))
+          (tui:puts (nth-value 1 (alexandria:starts-with-subseq prefix (name c)
+                                                                :return-suffix t))
+                    1 2 rect (style nil)))
+        (make-instance 'tui:view
+                       :rect (tui:copy-rect rect :rows 1
+                                                 :cols (tui:display-width (name c)))))
+      (make-instance 'tui:view :rect (tui:copy-rect rect :rows 0))))
+
+(defun render-completion (ui)
+  (when-let (state (completion-state ui))
+    (let* ((anchor (anchor state))
+           (anchor-rect (tui:rect (gethash anchor (node-views ui))))
+           (maxlen (loop for c in (candidates state) maximize (tui:display-width c))))
+      (tui:vertical-container
+       (tui:clamp-rect (tui:make-rect :x (tui:rect-x anchor-rect)
+                                      :y (tui:rect-y2 anchor-rect)
+                                      :rows (tui:rows ui)
+                                      :cols (max maxlen (tui:cols ui)))
+                       (ui-rect ui))
+       (enumerate (lambda (s i)
+                    (make-instance 'completion :name s
+                                               :index i
+                                               :state state))
+                  (candidates state))))))
+
 ;;
 ;;; main loop
 ;;
 
-(defmethod tui:render-state ((ui ui)) ui)
 (defmethod tui:render ((ui ui) rect)
   ;; do not allow use of old caches
   (clrhash (node-views ui))
   (setf (stack ui) nil)
-  (render-node (ast ui) (list (make-location :node t)) ui rect))
+  ;; note: order of this list matters
+  (let ((toplevel-views
+          (list (render-node (ast ui) (list (make-location :node t)) ui rect)
+                (render-completion ui))))
+    (make-instance
+     'tui:view
+     :rect (ui-rect ui)
+     :children (delete nil toplevel-views))))
 
 (defmethod tui:render ((o context-wrapper) rect)
   (render-node (context-wrapper-thing o) (context-wrapper-stack o)
                (context-wrapper-context o)
                rect))
 
-(defmethod tui:redisplay :after ((ui ui))
-  (slog "------------------------------------------------------------------------------"))
+(defmethod tui:redisplay :around ((ui ui))
+  (restart-case
+      (progn
+        (call-next-method)
+        (sb-concurrency:send-message *log* (cons nil 'redisplay-done)))
+    (stop ()
+      :report "exit"
+      (tui:stop ui))))
 
 (defmethod tui:dispatch-event :around ((ui ui) event)
   (with-simple-restart (nil "ignore event-handling error")
@@ -438,7 +547,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
              (equal (tui:event-kind event) #\c)
              (tui:event-controlp event))
         (tui:stop ui)
-        (call-next-method))))
+        (call-next-method))
+    (sb-concurrency:send-message *log* (cons nil 'event-handled))))
 
 (defvar *log-stop* (gensym))
 (defun tui-main ()
@@ -450,8 +560,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
          (root-loc (make-location :node t))
          (tui (make-instance 'ui :ast ast
                                  :focus root-loc
-                                 :stack (list root-loc))))
-    (setf *tui* tui)
+                                 :stack (list root-loc)))
+         (*tui* tui))
     (unwind-protect (tui:run tui :redisplay-on-input t)
       (slog *log-stop*))))
 
@@ -461,5 +571,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
         (bt:make-thread (lambda () (tui-main)))
         (loop :for (form . value) = (sb-concurrency:receive-message *log*)
               :until (eq value *log-stop*)
-              :do (format t "~a~%|> ~s~%" form value) (force-output)))
+              :do (if form
+                      (format t "~a~%|> ~s~%" form value)
+                      (format t "~a~a~%" (make-string 70 :initial-element #\-) value))
+                  (force-output)))
       (tui-main)))

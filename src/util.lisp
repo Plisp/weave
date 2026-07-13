@@ -6,7 +6,7 @@
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
            #:enumerate
-           #:lfind #:list-insert
+           #:lfind #:list-insert #:findcdr-if
            #:with-lookup #:or-f #:+fail+
            #:flex-vector))
 (in-package #:weave-utils)
@@ -44,6 +44,11 @@
 (defun list-insert (list item i)
   "functional insertion, may share structure"
   `(,@(subseq list 0 i) ,item ,@(nthcdr i list)))
+
+(defun findcdr-if (pred list)
+  (loop for c on list
+        do (when (funcall pred (car c))
+             (return c))))
 
 (defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
   (with-gensyms (blockname present-p)
