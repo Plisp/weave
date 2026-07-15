@@ -136,7 +136,9 @@ If this returns NIL, propagate up the cursor stack.")
         (declare (ignore view))
         (when-let (state (completion-state ui))
           ;; only 'full' edits should be updated persistently
-          ;; avoid too much overhead
+          ;; XXX this still requires making a record due to shared state
+          ;;     consider (edit 1)-move-(record 1)-edit
+          ;;     also consider interning symbols
           (setf (slot-value (anchor state) 'parse::name)
                 (nth (selection state) (candidates state)))
           (setf (completion-state ui) nil))))
@@ -275,43 +277,73 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                      (global-key-handler node location context))
                       :focused focused))))
 
+(defun is-regular-char-event (event)
+  (and (characterp (tui:event-kind event))
+       (not (or (tui:event-controlp event)
+                (tui:event-altp event) (tui:event-metap event)))))
+
+(defun completion-candidates (context)
+  context
+  (loop for s being the symbols of (find-package "CL")
+        collect (string-downcase s)))
+
 (defmethod handle-key ((node hole) view location context event)
   (let ((c (tui:event-kind event)))
     (cond
-      ((and (alpha-char-p c)
-            (not (or (tui:event-controlp event)
-                     (tui:event-altp event) (tui:event-metap event))))
-       ;;
+      ((and (is-regular-char-event event) (alpha-char-p c))
+       ;; begin completion
        (let ((newnode (make-instance 'parse::symbol-ref :name (string c))))
-         ;; begin completion
          (multiple-value-bind (ast newloc)
-             (ast-replace location
-                          (lambda (hole) hole newnode)
+             (ast-replace location (constantly newnode)
                           (findcdr-if (lambda (l) (location= location l)) (stack context)))
            (setf (ast context) ast
                  (focus context) newloc))
          (setf (completion-state context)
-               (make-instance
-                'completion-state
-                :anchor newnode
-                :candidates (loop for s being the symbols of (find-package "CL")
-                                  collect (string-downcase s)))))
+               (make-instance 'completion-state
+                              :anchor newnode
+                              :candidates (completion-candidates context))))
        t)
-      ((and (digit-char-p c)
-            (not (or (tui:event-controlp event)
-                     (tui:event-altp event) (tui:event-metap event))))
-       ;; TODO edit - swap with literal number node
-       (slog 'digit)
-       ;; (let ((newnode (make-instance 'parse::literal :str (string c))))
-       ;;   (setf (focus context)
-       ;;         (ast-replace newnode
-       ;;                      (findcdr-if (lambda (l) (location= location l)) (stack context))
-       ;;                      context)))
+      ((and (is-regular-char-event event) (digit-char-p c))
+       ;; number node TODO consider other bases
+       (let ((newnode (make-instance 'parse::literal :str (string c))))
+         (multiple-value-bind (ast newloc)
+             (ast-replace location (constantly newnode)
+                          (findcdr-if (lambda (l) (location= location l)) (stack context)))
+           (setf (ast context) ast
+                 (focus context) newloc)))
        t)
       ;; unhandled
       (t nil))))
 
+(defun ensure-string (s)
+  (if (symbolp s) (copy-array (string s)) s))
+
 ;;; literals - no cursor state needed
+(defmethod handle-key ((node parse::literal) view location ui event)
+  (when (is-regular-char-event event)
+    (with-slots ((s parse::str)) node
+      (let ((c (tui:event-kind event)))
+        (cond ((digit-char-p c)
+               (setf s (ensure-string s))
+               (let ((oldlen (length s)))
+                 (setf s (adjust-array s (1+ oldlen)))
+                 (setf (schar s oldlen) c))
+               t)
+              ((char= c #\Rubout)
+               (setf s (ensure-string s))
+               (let ((oldlen (length s)))
+                 (if (< 1 oldlen)
+                     (progn (setf s (adjust-array s (1- oldlen)))
+                            t)
+                     (let ((newnode (make-instance 'hole :text "")))
+                       (multiple-value-bind (ast newloc)
+                           (ast-replace location (constantly newnode)
+                                        (findcdr-if (lambda (l) (location= location l))
+                                                    (stack ui)))
+                         (setf (ast ui) ast
+                               (focus ui) newloc))
+                       t)))))))))
+
 (defmethod render-node ((node parse::literal) stack context rect)
   (let* ((location (car stack))
          (str (format nil "~a" (parse::str node)))
@@ -328,6 +360,35 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    :focused focused)))
 
 ;;; symbol-references
+(defmethod handle-key ((node parse::symbol-ref) view location ui event)
+  (when (is-regular-char-event event)
+    (with-slots ((s parse::name)) node
+      (let ((c (tui:event-kind event)))
+        (cond ((alpha-char-p c)
+               (setf s (ensure-string s))
+               (let ((oldlen (length s)))
+                 (setf s (adjust-array s (1+ oldlen)))
+                 (setf (schar s oldlen) c))
+               (setf (completion-state ui)
+                     (make-instance 'completion-state
+                                    :anchor node
+                                    :candidates (completion-candidates ui)))
+               t)
+              ((char= c #\Rubout)
+               (setf s (ensure-string s))
+               (let ((oldlen (length s)))
+                 (if (< 1 oldlen)
+                     (progn (setf s (adjust-array s (1- oldlen)))
+                            t)
+                     (let ((newnode (make-instance 'hole :text "")))
+                       (multiple-value-bind (ast newloc)
+                           (ast-replace location (constantly newnode)
+                                        (findcdr-if (lambda (l) (location= location l))
+                                                    (stack ui)))
+                         (setf (ast ui) ast
+                               (focus ui) newloc))
+                       t)))))))))
+
 (defmethod render-node ((node parse::symbol-ref) stack context rect)
   (let* ((location (car stack))
          (str (format nil "~a" (parse::name node)))
@@ -359,10 +420,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (defvar *fun-key-handlers* (make-hash-table :test 'equalp))
 (defmethod handle-key ((node parse::function-call) view location ui event)
   (when-let ((handler (gethash event *fun-key-handlers*)))
-    ;; dispatch is based on dynamic properties, not just class
     (funcall handler node location ui)))
 
-;; XXX many things bake in an assumption of a single stack. Is this reasonable?
 ;; XXX nonstandard loop
 (defun ast-replace (loc updater stack)
   "Requires that (location-node `loc') = (location-node (car `stack'))
@@ -487,7 +546,7 @@ Inserts after current node if currently in the body"
           (tui:puts prefix 1 1 rect (style t))
           (tui:puts (nth-value 1 (alexandria:starts-with-subseq prefix (name c)
                                                                 :return-suffix t))
-                    1 2 rect (style nil)))
+                    1 (+ 1 (length prefix)) rect (style nil)))
         (make-instance 'tui:view
                        :rect (tui:copy-rect rect :rows 1
                                                  :cols (tui:display-width (name c)))))
