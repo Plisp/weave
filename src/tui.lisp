@@ -22,7 +22,6 @@
 
 ;; dynamic vars for debugging, should not be used
 (defvar *log* (sb-concurrency:make-mailbox :name "log"))
-(defvar *tui*)
 (defmacro slog (form)
   (once-only ((res form))
     `(progn
@@ -34,7 +33,7 @@
   (make-context-wrapper :thing thing :stack stack :context context))
 
 (defclass ast-view (tui:view)
-  ((location :initarg :loc
+  ((location :initarg :location
              :initform (error "ast view must correspond to a location")
              :accessor location
              :type location)
@@ -57,8 +56,25 @@ If this returns NIL, propagate up the cursor stack.")
    (selection :initform 0
               :accessor selection)))
 
+(defclass state ()
+  ((ast :initarg :ast
+        :initform (error "must provide ast")
+        :reader ast)
+   (focus :initarg :focus
+          :initform (error "must provide insertion focus")
+          :reader focus)))
+
 (defclass ui (tui:elemental)
-  ((goal-col :initform 1
+  ((ast :initarg :ast
+        :initform (error "no ast")
+        :accessor ast)
+   (focus :initarg :focus
+          :initform (error "no focus")
+          :accessor focus)
+   (edit-loc :initarg :edit-loc
+             :initform nil
+             :accessor edit-loc)
+   (goal-col :initform 1
              :accessor goal-col
              :type positive-fixnum)
    (completion-state :initform nil
@@ -67,7 +83,7 @@ If this returns NIL, propagate up the cursor stack.")
    (history :initform (list)
             :accessor history
             :type list)
-   (future :initform (list) ; backwards part of zipper
+   (future :initform (list)
            :accessor future
            :type list)
    ;; these are caches computed on every redisplay
@@ -77,11 +93,6 @@ If this returns NIL, propagate up the cursor stack.")
    (node-views :initform (make-hash-table)
                :accessor node-views)))
 
-(defmethod ast ((ui ui)) (ast (first (history ui))))
-(defmethod focus ((ui ui)) (focus (first (history ui))))
-(defmethod (setf ast) (new-value (ui ui)) (setf (ast (first (history ui))) new-value))
-(defmethod (setf focus) (new-value (ui ui)) (setf (focus (first (history ui))) new-value))
-
 (defun ui-rect (ui)
   (tui:make-rect :x 0 :y 0 :rows (tui:rows ui) :cols (tui:cols ui)))
 
@@ -89,12 +100,31 @@ If this returns NIL, propagate up the cursor stack.")
   (when (stack context)
     (location= location (focus context))))
 
-(defun swap-node (location newnode context)
+;; XXX nonstandard loop
+(defun ast-replace (loc updater stack)
+  "Requires that (location-node `loc') = (location-node (car `stack'))
+for loop invariant node ~ (location-node old-loc).
+Returns the new ast and location relative to the updated node."
+  (loop with old = (getloc loc)
+        with id = (location-id loc)
+        with newnode = (update (location-node loc) id (funcall updater old))
+        for old-loc in stack
+        until (eq t (location-node old-loc))
+        for node = newnode then (update (location-node old-loc) (location-id old-loc) node)
+        finally (return (values node (make-location :node newnode :id id)))))
+
+(defun swap-node (location newnode ui)
+  (when (or (null (edit-loc ui)) (not (location= location (edit-loc ui))))
+    (push (make-instance 'state :focus (focus ui) :ast (ast ui))
+          (history ui)))
+  ;; perform the insertion
   (multiple-value-bind (ast newloc)
       (ast-replace location (constantly newnode)
-                   (findcdr-if (lambda (l) (location= location l)) (stack context)))
-    (setf (ast context) ast
-          (focus context) newloc)))
+                   (findcdr-if (lambda (l) (location= location l)) (stack ui)))
+    (setf (future ui) nil
+          (ast ui) ast
+          (focus ui) newloc
+          (edit-loc ui) newloc)))
 
 ;;
 ;;; ast classes
@@ -259,24 +289,25 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
          view ui)))
 
 ;;; undo
-(defclass undo-record ()
-  ((ast :initarg :ast
-        :initform (error "must provide ast")
-        :accessor ast)
-   (focus :initarg :focus
-          :initform (error "must provide insertion focus")
-          :accessor focus)
-   (location :initarg :loc
-             :initform (error "no current location")
-             :accessor location)))
 
+;; can't pop the one remaining thing
 (defun undo (ui)
   (unless (null (history ui))
-    (push (pop (history ui)) (future ui))))
+    (let ((prev (pop (history ui))))
+      (slog 'undo)
+      (push (make-instance 'state :ast (ast ui) :focus (focus ui))
+            (future ui))
+      (setf (ast ui) (ast prev)
+            (focus ui) (focus prev)))))
 
 (defun redo (ui)
   (unless (null (future ui))
-    (push (pop (future ui)) (history ui))))
+    (let ((next (pop (future ui))))
+      (slog 'redo)
+      (push (make-instance 'state :ast (ast ui) :focus (focus ui))
+            (history ui))
+      (setf (ast ui) (ast next)
+            (focus ui) (focus next)))))
 
 (setf (gethash (uncursed-sys::make-event :kind #\u :controlp t) *global-key-handlers*)
       (lambda (view ui) view (undo ui)))
@@ -303,14 +334,14 @@ Inserts after current node if currently in the body"
     (let* ((stack (nthcdr (1- i) (stack ui)))
            (id (location-id (car stack)))
            (id (if (integerp id) (1+ id) 0)))
+      ;; this should unconditionally be saved
+      (push (make-instance 'state :ast (ast ui) :focus (focus ui))
+            (history ui))
       (multiple-value-bind (ast child-loc)
           (ast-replace (make-location :node node :id 'parse::body)
                        (lambda (body) (list-insert body (make-instance 'hole) id))
                        stack)
-        (slog ast)
-        (slog child-loc)
-        (push (make-instance 'undo-record :focus (car stack) :ast (ast ui) :loc nil)
-              (history ui))
+        (slog (list ast child-loc))
         (setf (focus ui) (make-location :node (location-node child-loc) :id id)
               (ast ui) ast))
       t)))
@@ -329,7 +360,7 @@ Inserts after current node if currently in the body"
                                                   :underlinep t)))
       (make-instance 'ast-view
                       :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
-                      :loc location
+                      :location location
                       :hoverable t
                       ;; leaf handler never called unless focused
                       :key-handler (when focused
@@ -351,12 +382,8 @@ Inserts after current node if currently in the body"
     (cond
       ((and (is-regular-char-event event) (alpha-char-p c))
        ;; begin completion
-       (let ((newnode (make-instance 'parse::symbol-ref :name (string c)))
-             (oldast (ast ui)))
+       (let ((newnode (make-instance 'parse::symbol-ref :name (string c))))
          (swap-node location newnode ui)
-         (push (make-instance 'undo-record :focus location :ast oldast :loc (focus ui))
-               (history ui))
-
          (setf (completion-state ui)
                (make-instance 'completion-state
                               :anchor newnode
@@ -364,23 +391,11 @@ Inserts after current node if currently in the body"
        t)
       ((and (is-regular-char-event event) (digit-char-p c))
        ;; number node
-       (let ((newnode (make-instance 'parse::literal :str (string c)))
-             (oldast (ast ui)))
-         (swap-node location newnode ui)
-         (push (make-instance 'undo-record :focus location :ast oldast :loc (focus ui))
-               (history ui)))
+       (let ((newnode (make-instance 'parse::literal :str (string c))))
+         (swap-node location newnode ui))
        t)
       ;; unhandled
       (t nil))))
-
-(defun maybe-save (ui focus newloc)
-  "consecutive edits shouldn't be recorded"
-  (when (null (history ui))
-    (when-let (last-loc (location (first (history ui))))
-      (when (location= newloc last-loc)
-        (setf (future ui) nil)
-        (push (make-instance 'undo-record :focus focus :ast (ast ui) :location newloc)
-              (history ui))))))
 
 ;;; literals - no cursor state needed
 (defmethod handle-key ((node parse::literal) view location ui event)
@@ -391,7 +406,6 @@ Inserts after current node if currently in the body"
                (swap-node location
                           (make-instance 'parse::literal :str (format nil "~a~a" s c))
                           ui)
-               (maybe-save ui location (focus ui))
                t)
               ((char= c #\Rubout)
                (let ((s (if (symbolp s) (string-downcase s) s)))
@@ -401,7 +415,6 @@ Inserts after current node if currently in the body"
                                                :str (subseq s 0 (1- (length s))))
                                 ui)
                      (swap-node location (make-instance 'hole :text "") ui)))
-               (maybe-save ui location (focus ui))
                t))))))
 
 (defmethod render-node ((node parse::literal) stack context rect)
@@ -413,7 +426,7 @@ Inserts after current node if currently in the body"
                                (tui:make-style :fg #x2aa198)))
     (make-instance 'ast-view
                    :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
-                   :loc location
+                   :location location
                    :hoverable t
                    :key-handler (when focused
                                   (global-key-handler node location context))
@@ -435,7 +448,6 @@ Inserts after current node if currently in the body"
                          (make-instance 'completion-state
                                         :anchor newnode
                                         :candidates (completion-candidates ui)))))
-               (maybe-save ui location (focus ui))
                t)
               ((char= c #\Rubout)
                (let ((s (string s)))
@@ -448,7 +460,6 @@ Inserts after current node if currently in the body"
                                             :anchor newnode
                                             :candidates (completion-candidates ui))))
                      (swap-node location (make-instance 'hole :text "") ui)))
-               (maybe-save ui location (focus ui))
                t))))))
 
 (defmethod render-node ((node parse::symbol-ref) stack context rect)
@@ -458,7 +469,7 @@ Inserts after current node if currently in the body"
     (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900)))
     (make-instance 'ast-view
                    :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
-                   :loc location
+                   :location location
                    :hoverable t
                    :key-handler (when focused
                                   (global-key-handler node location context))
@@ -472,7 +483,7 @@ Inserts after current node if currently in the body"
     (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900) :italicp t))
     (make-instance 'ast-view
                    :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
-                   :loc location
+                   :location location
                    :hoverable t
                    :key-handler (when focused
                                   (global-key-handler node location context))
@@ -483,19 +494,6 @@ Inserts after current node if currently in the body"
 (defmethod handle-key ((node parse::function-call) view location ui event)
   (when-let ((handler (gethash event *fun-key-handlers*)))
     (funcall handler node location ui)))
-
-;; XXX nonstandard loop
-(defun ast-replace (loc updater stack)
-  "Requires that (location-node `loc') = (location-node (car `stack'))
-for loop invariant node ~ (location-node old-loc).
-Returns the new ast and location relative to the updated node."
-  (loop with old = (getloc loc)
-        with id = (location-id loc)
-        with newnode = (update (location-node loc) id (funcall updater old))
-        for old-loc in stack
-        until (eq t (location-node old-loc))
-        for node = newnode then (update (location-node old-loc) (location-id old-loc) node)
-        finally (return (values node (make-location :node newnode :id id)))))
 
 (setf (gethash (uncursed-sys::make-event :kind #\newline :altp t) *fun-key-handlers*)
       #'insert-hole)
@@ -517,7 +515,7 @@ Returns the new ast and location relative to the updated node."
                       (parse::body node))))
          (args-rect (tui:rect args-view)))
     (make-instance 'ast-view
-                    :loc location
+                    :location location
                     :rect (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
                                               :cols (+ 1
                                                        (tui:rect-cols name-rect)
@@ -551,7 +549,7 @@ Returns the new ast and location relative to the updated node."
 ;;              (brect (tui:rect bview)))
 ;;         (decf (stack context))
 ;;         (make-instance 'ast-view
-;;                         :loc (make-location :node node)
+;;                         :location (make-location :node node)
 ;;                         :children (list bindings bview)
 ;;                         :rect (tui:copy-rect rect
 ;;                                              :rows (+ (tui:rect-y bindrect)
@@ -657,10 +655,7 @@ Returns the new ast and location relative to the updated node."
                (- (+ a (parse::*literal-magic* "3")) b)
                (parse:make-env)))
          (root-loc (make-location :node t))
-         (tui (make-instance 'ui))
-         (*tui* tui))
-    (push (make-instance 'undo-record :ast ast :focus root-loc :loc root-loc)
-          (history tui))
+         (tui (make-instance 'ui :ast ast :focus root-loc)))
     (unwind-protect (tui:run tui :redisplay-on-input t)
       (slog *log-stop*))))
 
