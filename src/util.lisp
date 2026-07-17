@@ -8,7 +8,8 @@
            #:enumerate
            #:lfind #:list-insert #:findcdr-if
            #:with-lookup #:or-f #:+fail+
-           #:flex-vector))
+           #:flex-vector
+           ))
 (in-package #:weave-utils)
 
 (defmacro disp (form &optional (stream t))
