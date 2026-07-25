@@ -6,7 +6,7 @@
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
            #:enumerate
-           #:lfind #:list-insert #:findcdr-if
+           #:lfind #:list-insert #:list-update #:findcdr-if
            #:with-lookup #:or-f #:+fail+
            #:flex-vector
            ))
@@ -45,6 +45,10 @@
 (defun list-insert (list item i)
   "functional insertion, may share structure"
   `(,@(subseq list 0 i) ,item ,@(nthcdr i list)))
+
+(defun list-update (list item i)
+  "functional replace, may share structure"
+  `(,@(subseq list 0 i) ,item ,@(nthcdr (1+ i) list)))
 
 (defun findcdr-if (pred list)
   (loop for c on list
