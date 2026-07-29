@@ -5,9 +5,9 @@
 (uiop:define-package #:weave-utils
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
-           #:enumerate
            #:lfind #:list-insert #:list-update #:findcdr-if
            #:with-lookup #:or-f #:+fail+
+           #:string-drop
            #:flex-vector
            ))
 (in-package #:weave-utils)
@@ -26,11 +26,6 @@
     (if (>= length 3)
         (subseq str (- length 3))
         str)))
-
-(defun enumerate (f list)
-  (loop for i from 0
-        for x in list
-        collect (funcall f x i)))
 
 (defun lfind (item list &key (key 'identity) (test 'eql) (start 0) (end (length list)))
   "NIL-detecting version of find for lists, only searches forwards"
@@ -68,6 +63,9 @@
 (define-modify-macro or-f (&rest forms) or)
 
 (define-constant +fail+ (list t) :test 'equal)
+
+(defun string-drop (s n)
+  (subseq s 0 (- (length s) n)))
 
 (defun flex-vector ()
   (make-array 0 :fill-pointer t :adjustable t))

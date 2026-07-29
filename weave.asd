@@ -5,6 +5,7 @@
   :depends-on (#:alexandria
                :bordeaux-threads
 			   :cl-environments
+               #:closer-mop
 			   #:eclector
 			   :slynk
                #:trivial-features
