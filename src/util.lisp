@@ -6,6 +6,7 @@
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
            #:lfind #:list-insert #:list-update #:findcdr-if
+           #:extract-singleton
            #:with-lookup #:or-f #:+fail+
            #:string-drop
            #:flex-vector
@@ -49,6 +50,9 @@
   (loop for c on list
         do (when (funcall pred (car c))
              (return c))))
+
+(defun extract-singleton (id)
+  (if (= (length id) 1) (car id) id))
 
 (defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
   (with-gensyms (blockname present-p)

@@ -132,7 +132,7 @@
 ;;; - close enough to s-expressions for macroexpansion and evaluation
 ;;; - gives identity to semantic units which may need identity under editing
 ;;;   since we should avoid sequence cursors
-;;;   - binders need identity under renaming, type info is associated with
+;;;   - let binders need identity through insertion, type info is associated with
 ;;;     binders rather than the references
 ;;;   - variable refs in all evaluation contexts have identity like other
 ;;;     evaluated forms for uniformity
@@ -140,6 +140,7 @@
 ;;;   completion and basic analysis) so macroexpansions can be lexically
 ;;;   limited during interactive editing
 ;;;   - make sure editing an AST node does not affect lexical bindings outside
+;;; - structural operations should not be allowed on named nodes anyways
 ;;; note: a form's 'parent' isn't meaningful in a macroexpansion, and prevents
 ;;; using the datatype immutably e.g. for slow analysis on a different thread
 ;;
@@ -187,12 +188,13 @@
   (:documentation "body is a list of eval-forms"))
 
 (defclass irregular-form (eval-form)
-  ((op :initarg :op
-       :reader op))
+  ()
   (:documentation "macro invocation or special operator"))
 
 (defclass macro-call (irregular-form)
-  ((body :initarg :body
+  ((op :initarg :op
+       :reader op)
+   (body :initarg :body
          :initform (error "must provide unknown call body")
          :reader body)
    (gensym-names :initarg :gensym-names
@@ -218,6 +220,7 @@
   (:method (node) nil))
 (defmethod is-atom ((node binder)) t)
 (defmethod is-atom ((node literal)) t)
+(defmethod is-atom ((node symbol-ref)) t)
 
 (defstruct location
   "`id's usually contain a symbol (slot), possibly list index and should respect `cl:equal'.
@@ -658,8 +661,7 @@ Any binding forces a symbol match."
     ;; code
     `(progn
        (defclass ,(symbolicate name "-FORM") (irregular-form)
-         ((op :initform ',name)
-          ,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
+         (,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
                   collect `(,name :initarg ,(make-keyword name)
                                   ;; XXX could generate initargs instead
                                   :accessor ,name))))

@@ -112,10 +112,13 @@ Returns the new ast and location relative to the updated node."
         for node = newnode then (update (location-node old-loc) (location-id old-loc) node)
         finally (return (make-location :node newnode :id id))))
 
+(defun save-history (ui)
+  (push (make-instance 'state :focus (focus ui) :ast (ast ui))
+        (history ui)))
+
 (defun swap-node (location newnode ui)
   (when (or (null (edit-loc ui)) (not (location= location (edit-loc ui))))
-    (push (make-instance 'state :focus (focus ui) :ast (ast ui))
-          (history ui)))
+    (save-history ui))
   ;; perform the insertion
   (let ((newloc (ast-replace location (constantly newnode)
                              (findcdr-if (lambda (l) (location= location l)) (stack ui)))))
@@ -127,18 +130,26 @@ Returns the new ast and location relative to the updated node."
 ;;; ast classes
 ;;
 
+(defgeneric unwrap (node)
+  (:method (node) node))
 (defgeneric render-node (node stack context rect))
 
 (defmethod render-node :around (node stack context rect)
-  ;; contract: do NOT overwrite child render
-  (let ((i (* 15 (1- (length stack))))) ; stack is always nonempty
-    (tui:fill-rect (tui:make-style :bg (tui:color i i i))
-                   (tui:copy-rect rect :x 0 :y 0)
-                   rect))
-  ;;
-  (let ((vals (multiple-value-list (call-next-method))))
+  (let* ((vals (multiple-value-list (call-next-method)))
+         (view (first vals))
+         (rect (tui:rect view)))
+    ;;
+    (let ((i (* 15 (1- (length stack))))) ; stack is always nonempty
+      (unless (parse::is-atom node)
+        (tui:fill-rect (tui:make-style :bg (tui:color i i i))
+                       (tui:copy-rect rect :x 0 :y 0) rect
+                       :blend 1/10)))
     ;; save window
-    (setf (gethash node (node-views context)) (first vals))
+    (setf (gethash node (node-views context)) view)
+    (when (eq (unwrap node) (getloc (focus context)))
+      (tui:fill-rect (tui:make-style :bg #xb58900)
+                     (tui:copy-rect rect :x 0 :y 0) rect
+                     :blend t))
     ;; cache stack
     (when (location= (car stack) (focus context))
       (setf (stack context) stack))
@@ -323,9 +334,14 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (setf (gethash (tui-sys:make-event :kind #\p :altp t) *default-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
-        (let ((loc (car (stack ui))))
+        (let* ((loc (car (stack ui)))
+               (id (location-id loc)))
           (unless (eq ui (location-node loc))
-            (pop (stack ui))
+            (if (and (listp id) (integerp (lastcar id)))
+                (setf (car (stack ui))
+                      (make-location :node (location-node loc)
+                                     :id (extract-singleton (butlast id))))
+                (pop (stack ui)))
             (setf (focus ui) (slog (car (stack ui))))))))
 
 ;;; undo
@@ -361,28 +377,17 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
          :accessor text
          :type simple-string)))
 
-(defun ast-insert (entry list-id id-stepper id-indexer loc ui)
-  "Assumes `list-id' is a location identifier (unique) for some list location in the node
-at `loc'. Inserts `entry' after current node in the given location and focuses it."
-  (let ((i (position-if (lambda (l) (location= loc l)) (stack ui))))
-    (when (zerop i)
-      ;; may handle further up
-      (return-from ast-insert nil))
-    ;; non-toplevel, child (1- i) >= 0
-    (slog `("ast insert at" ,(getloc loc)))
-    (let* ((stack (nthcdr (1- i) (stack ui)))
-           (id (location-id (car stack)))
-           (id (slog (funcall id-stepper id))))
-      ;; this should unconditionally be saved
-      (push (make-instance 'state :ast (ast ui) :focus (focus ui))
-            (history ui))
-      (let ((child-loc
-              (ast-replace (make-location :node (getloc loc) :id list-id)
-                           (lambda (body) (list-insert body entry (funcall id-indexer id)))
-                           stack)))
-        (slog child-loc)
-        (setf (focus ui) (make-location :node (location-node child-loc) :id id)))
-      t)))
+(defun append-id (id i)
+  (cond ((eq id 'parse::body) i)
+        ((symbolp id) (list id i))
+        (t `(,@id ,i))))
+
+(defun ast-insert (item loc index stack)
+  (let ((child-loc (ast-replace loc
+                                (lambda (body) (list-insert body item index))
+                                stack)))
+    (make-location :node (location-node child-loc)
+                   :id (append-id (location-id loc) index))))
 
 (defmethod parse::is-atom ((node hole)) t)
 (defmethod render-node ((node hole) stack context rect)
@@ -417,7 +422,7 @@ at `loc'. Inserts `entry' after current node in the given location and focuses i
 (defgeneric upgrade-hole (parent char location ui))
 (defmethod handle-key ((node hole) view location ui event)
   (let ((c (tui:event-kind event)))
-    (cond ; XXX excludes 1+, 1-
+    (cond
       ((and (is-regular-char-event event)
             (graphic-char-p c) (not (digit-char-p c)))
        (upgrade-hole (location-node location) c location ui)
@@ -569,12 +574,7 @@ at `loc'. Inserts `entry' after current node in the given location and focuses i
                                 (lambda (index)
                                   (make-location :node (location-node location)
                                                  :id `(,@(location-id location) ,index)))
-                                (cdr stack) context)))
-         (rect (tui:rect view)))
-    (when (eq l (getloc (focus context)))
-      (tui:fill-rect (tui:make-style :bg #xb58900)
-                     (tui:copy-rect rect :x 0 :y 0) rect
-                     :blend 1/3))
+                                (cdr stack) context))))
     ;;
     (setf (tui:key-handler view) (global-key-handler l location context)
           (tui:focused view) (location= location (focus context)))
@@ -598,9 +598,18 @@ at `loc'. Inserts `entry' after current node in the given location and focuses i
 
 (setf (gethash (tui-sys:make-event :kind #\newline) *fun-key-handlers*)
       (lambda (location ui)
-        (ast-insert (make-instance 'hole) 'parse::body
-                    (lambda (id) (if (integerp id) (1+ id) 0)) #'identity
-                    location ui)))
+        (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
+          ;; whole node selected, handle further up
+          (unless (zerop i)
+            (let* ((stack (nthcdr (1- i) (slog (stack ui))))
+                   (id (location-id (car stack))))
+              (save-history ui)
+              (setf (focus ui)
+                    (ast-insert (make-instance 'hole)
+                                (make-location :node (location-node (car stack))
+                                               :id 'parse::body)
+                                (if (integerp id) (1+ id) 0)
+                                (stack ui))))))))
 
 (defun list-renderer (list loc-mapper stack context)
   (let ((index 0))
@@ -630,9 +639,6 @@ at `loc'. Inserts `entry' after current node in the given location and focuses i
                                        :cols (+ 1
                                                 (tui:rect-cols name-rect)
                                                 (tui:rect-cols args-rect)))))
-    (when (eq node (getloc (focus context)))
-      (tui:fill-rect (tui:make-style :bg #xb58900) (tui:copy-rect fun-rect :x 0 :y 0) rect
-                     :blend 1/3))
     ;;
     (make-instance 'ast-view
                    :location location
@@ -664,38 +670,67 @@ at `loc'. Inserts `entry' after current node in the given location and focuses i
   (when-let ((handler (gethash event *let-key-handlers*)))
     (funcall handler location ui)))
 
-;; TODO
-;; (setf (gethash (tui-sys:make-event :kind #\newline) *let-key-handlers*)
-;;       (lambda (location ui)
-;;         (ast-insert
-;;          (list (make-instance 'hole) (make-instance 'hole)) 'parse::vars
-;;          (lambda (id)
-;;            (trivia:cmatch id
-;;              ((type integer) (1+ id))
-;;              ((eql 'parse::op) (slog (list 'parse::vars 0 'parse::binder)))
-;;              ((list (eql 'parse::vars) (and (type integer) i) (eql 'parse::init))
-;;               (list 'parse::vars (1+ i) 'parse::init))
-;;              ((list (eql 'parse::vars) (and (type integer) i) (eql 'parse::binder))
-;;               (list 'parse::vars (1+ i) 'parse::binder))))
-;;          (lambda (id)
-;;            (trivia:cmatch id
-;;              ((type integer) id)
-;;              ((list (eql 'parse::vars) (and (type integer) i) (eql 'parse::init)) i)
-;;              ((list (eql 'parse::vars) (and (type integer) i) (eql 'parse::binder)) i)))
-;;          location ui)))
+(setf
+ (gethash (tui-sys:make-event :kind #\newline) *let-key-handlers*)
+ (lambda (location ui)
+   (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
+     (unless (zerop i)
+       (let* ((stack (nthcdr (1- i) (slog (stack ui))))
+              (letloc (car stack))
+              (letnode (location-node letloc)))
+         (save-history ui)
+         (trivia:cmatch (slog (location-id letloc))
+           ((and (type integer) body-i)
+            (setf (focus ui)
+                  (ast-insert (make-instance 'hole)
+                              (make-location :node letnode :id 'parse::body)
+                              (1+ body-i) (stack ui))))
+           ((eql 'parse::vars)
+            (setf (focus ui)
+                  (ast-insert (make-instance 'hole)
+                              (make-location :node letnode :id 'parse::body)
+                              0 (stack ui))))
+           ((eql 'parse::op)
+            (let ((bindloc (ast-insert (list (make-instance 'hole) (make-instance 'hole))
+                                       (make-location :node letnode :id 'parse::vars)
+                                       0 (stack ui))))
+              (setf (focus ui) (make-location :node (location-node bindloc)
+                                              :id `(,@(location-id bindloc) ,0)))))
+           ((list* (eql 'parse::vars) (and (type integer) bi) _)
+            (let ((bindloc (ast-insert (list (make-instance 'hole) (make-instance 'hole))
+                                       (make-location :node letnode :id 'parse::vars)
+                                       (1+ bi) (stack ui))))
+              (setf (focus ui) (make-location :node (location-node bindloc)
+                                              :id `(,@(location-id bindloc) ,0)))))))))))
+
+(defstruct bindings (list))
+(defmethod unwrap ((node bindings)) (bindings-list node))
+(defmethod render-node ((l bindings) stack context rect)
+  (let* ((location (car stack))
+         (view
+           (tui:vertical-container
+            rect
+            (list-renderer (bindings-list l)
+                           (lambda (index)
+                             (make-location :node (location-node location)
+                                            :id `(,(location-id location) ,index)))
+                           (cdr stack) context))))
+    ;;
+    (setf (tui:key-handler view) (global-key-handler l location context)
+          (tui:focused view) (location= location (focus context)))
+    view))
 
 (defparameter *let-indent* 2)
 (defmethod render-node ((letnode parse:let*-form) stack context rect)
   (let* ((op "let*")
          (location (car stack))
          (bindings
-           (tui:vertical-container
+           (render-node
+            (make-bindings :list (parse::vars letnode))
+            (cons (make-location :node letnode :id 'parse::vars) stack)
+            context
             (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length op) 1))
-                            rect)
-            (list-renderer (parse::vars letnode)
-                           (lambda (id) (make-location :node letnode :id `(parse::vars ,id)))
-                           stack
-                           context)))
+                            rect)))
          (bind-rect (tui:rect bindings))
          (body-view
            (tui:vertical-container
@@ -724,9 +759,10 @@ at `loc'. Inserts `entry' after current node in the given location and focuses i
                    :location location
                    :children (list let-view bindings body-view)
                    :rect (tui:copy-rect rect
-                                        :rows (+ (tui:rect-y bind-rect)
-                                                 (tui:rect-y body-rect))
-                                        :cols (max (+ (length op) (tui:rect-cols bind-rect))
+                                        :rows (+ (tui:rect-rows bind-rect)
+                                                 (tui:rect-rows body-rect))
+                                        :cols (max (+ (length op)
+                                                      1 (tui:rect-cols bind-rect))
                                                    (+ 2 (tui:rect-cols body-rect))))
                    :key-handler (global-key-handler letnode location context)
                    :focused (location= location (focus context)))))
