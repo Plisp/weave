@@ -2,11 +2,8 @@
 ;;;; terminal frontend
 ;;;;
 ;;
+;; anchored selection of subtrees
 ;; highlight lexical occurrences of the symbol under cursor using envmaps
-;; need a generic method for inserting and deleting nodes
-;; add a window for list serialization
-;; more efficient navigation to obviate the need for a goal column
-;; comments, and deal with more reader macros
 ;; need to convert method applications
 
 (defpackage #:weave-tui
@@ -93,13 +90,14 @@ If this returns NIL, propagate up the cursor stack.")
 (defun ui-rect (ui)
   (tui:make-rect :x 0 :y 0 :rows (tui:rows ui) :cols (tui:cols ui)))
 
-(defmethod parse::get-location ((node ui) loc)
-  (declare (ignore loc))
+(defmethod parse::get-location ((node ui) id)
+  (declare (ignore id))
   (ast node))
 
-(defmethod parse::update ((node ui) id new-value)
+(defmethod parse::update ((ui ui) id new-value)
   (declare (ignore id))
-  (setf (ast node) new-value))
+  (setf (ast ui) new-value)
+  ui)
 
 (defun ast-replace (loc updater stack)
   "Requires that (location-node `loc') = (location-node (car `stack'))
@@ -112,6 +110,20 @@ Returns the new ast and location relative to the updated node."
         for node = newnode then (update (location-node old-loc) (location-id old-loc) node)
         finally (return (make-location :node newnode :id id))))
 
+(defun ast-insert (item loc index stack)
+  (let ((child-loc (ast-replace loc
+                                (lambda (body) (list-insert body item index))
+                                stack)))
+    (make-location :node (location-node child-loc)
+                   :id (append-id (location-id loc) index))))
+
+(defun ast-delete (loc index stack)
+  "assumes that list has length > 1"
+  (let ((child-loc (ast-replace loc (lambda (body) (list-remove body index))
+                                stack)))
+    (make-location :node (location-node child-loc)
+                   :id (append-id (location-id loc) (max 0 (1- index))))))
+
 (defun save-history (ui)
   (push (make-instance 'state :focus (focus ui) :ast (ast ui))
         (history ui)))
@@ -121,10 +133,28 @@ Returns the new ast and location relative to the updated node."
     (save-history ui))
   ;; perform the insertion
   (let ((newloc (ast-replace location (constantly newnode)
-                             (findcdr-if (lambda (l) (location= location l)) (stack ui)))))
+                             (findcdr-if (lambda (l) (eq (location-node location)
+                                                    (location-node l)))
+                                         (stack ui)))))
     (setf (future ui) nil
           (focus ui) newloc
           (edit-loc ui) newloc)))
+
+(defun upgrade-hole-for-eval (char location ui)
+  (cond ((and (graphic-char-p char) (not (digit-char-p char)))
+         (let ((newnode (make-instance 'parse::symbol-ref :name (string-upcase char))))
+           (swap-node location newnode ui)
+           ;; begin completion
+           (setf (completion-state ui)
+                 (make-instance 'completion-state
+                                :anchor newnode
+                                :candidates (completion-candidates ui)))))
+        ((digit-char-p char)
+         (let ((newnode (make-instance 'parse::literal :str (string char))))
+           (swap-node location newnode ui)))))
+
+(defmethod upgrade-hole ((parent ui) char location ui)
+  (upgrade-hole-for-eval char location ui))
 
 ;;
 ;;; ast classes
@@ -155,8 +185,8 @@ Returns the new ast and location relative to the updated node."
       (setf (stack context) stack))
     (values-list vals)))
 
-(defvar *default-key-handlers* (make-hash-table :test 'equalp))
-(defvar *global-key-handlers* (make-hash-table :test 'equalp))
+(defvar *default-key-handlers* (make-hash-table :test 'equal))
+(defvar *global-key-handlers* (make-hash-table :test 'equal))
 (defun global-key-handler (node location ui)
   " handler may return t to stop propagation up the stack"
   (lambda (view event)
@@ -181,14 +211,9 @@ Returns the new ast and location relative to the updated node."
             (setf (completion-state ui) nil)
             (setf candidates
                   (delete-if-not (lambda (s)
-                                   (alexandria:starts-with-subseq (parse::name anchor) s))
+                                   (starts-with-subseq (parse::name anchor) s))
                                  candidates)))))
     ))
-
-(setf (gethash (tui-sys:make-event :kind #\h :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (swap-node (focus ui) (make-instance 'hole) ui)))
 
 (setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
       (lambda (view ui)
@@ -204,39 +229,6 @@ Returns the new ast and location relative to the updated node."
           (setf (selection state) (mod (1- (selection state))
                                        (length (candidates state)))))))
 
-(setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (when-let* ((state (completion-state ui))
-                    (selection (nth (selection state) (candidates state))))
-          (let ((s (find-symbol selection)))
-            (cond ((eq :function (cl-environments:function-information s))
-                   (let* ((args (loop for a in (slynk-backend:arglist s)
-                                      while (not (find a lambda-list-keywords))
-                                      count a))
-                          (name-node (make-instance 'parse::symbol-ref :name s))
-                          (function-node
-                            (make-instance 'parse::function-call
-                                            :name name-node
-                                            :body (loop repeat args
-                                                        collect (make-instance 'hole)))))
-                     (swap-node (focus ui) function-node ui)
-                     (setf (focus ui) (make-location :node function-node
-                                                     :id (if (plusp args) 0 'parse::name)))))
-                  ((eq s 'cl:let*)
-                   (swap-node (focus ui)
-                              (make-instance 'parse::let*-form
-                                              :body (list (make-instance 'hole))
-                                              :decls ()
-                                              :vars `((,(make-instance 'hole)
-                                                       ,(make-instance 'hole))))
-                              ui))
-                  (t
-                   (swap-node (focus ui)
-                              (make-instance 'parse::symbol-ref :name s)
-                              ui))))
-          (setf (completion-state ui) nil)
-          t)))
 
 ;; ASSUME leaf nodes are non-overlapping
 ;; we index them into an array of blocks sorted by line then column
@@ -331,18 +323,36 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
              (values view (when view (tui:rect-x2 (tui:rect view))))))
          view ui)))
 
+(defun move-parent (ui)
+  (let* ((loc (car (stack ui)))
+         (id (location-id loc)))
+    (unless (eq ui (location-node loc))
+      (if (and (listp id) (integerp (lastcar id)))
+          (setf (car (stack ui))
+                (make-location :node (location-node loc)
+                               :id (extract-singleton (butlast id))))
+          (pop (stack ui)))
+      (setf (focus ui) (car (stack ui))))))
+
 (setf (gethash (tui-sys:make-event :kind #\p :altp t) *default-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
-        (let* ((loc (car (stack ui)))
-               (id (location-id loc)))
-          (unless (eq ui (location-node loc))
-            (if (and (listp id) (integerp (lastcar id)))
-                (setf (car (stack ui))
-                      (make-location :node (location-node loc)
-                                     :id (extract-singleton (butlast id))))
-                (pop (stack ui)))
-            (setf (focus ui) (slog (car (stack ui))))))))
+        (move-parent ui)))
+
+(setf (gethash (tui-sys:make-event :kind #\P :altp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        ;; this is really a do-while idiom
+        (move-parent ui)
+        (loop for last-focus = nil then loc
+              for loc = (slog (car (stack ui)))
+              for node = (getloc loc)
+              while (typep node 'parse::eval-form)
+              until (eq (location-node loc) ui)
+              do (move-parent ui)
+              finally (when (slog last-focus)
+                        (setf (focus ui) last-focus)))
+        t))
 
 ;;; undo
 
@@ -371,23 +381,19 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
       (lambda (view ui) view (redo ui)))
 
 ;;; hole
+;; holes substitute editable structure: atoms and eval-forms
+
 (defclass hole ()
   ((text :initarg :text
-         :initform ""
+         :initform (error "hole text not provided")
          :accessor text
          :type simple-string)))
+(defun hole (&optional (text "")) (make-instance 'hole :text text))
 
 (defun append-id (id i)
   (cond ((eq id 'parse::body) i)
         ((symbolp id) (list id i))
         (t `(,@id ,i))))
-
-(defun ast-insert (item loc index stack)
-  (let ((child-loc (ast-replace loc
-                                (lambda (body) (list-insert body item index))
-                                stack)))
-    (make-location :node (location-node child-loc)
-                   :id (append-id (location-id loc) index))))
 
 (defmethod parse::is-atom ((node hole)) t)
 (defmethod render-node ((node hole) stack context rect)
@@ -422,17 +428,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (defgeneric upgrade-hole (parent char location ui))
 (defmethod handle-key ((node hole) view location ui event)
   (let ((c (tui:event-kind event)))
-    (cond
-      ((and (is-regular-char-event event)
-            (graphic-char-p c) (not (digit-char-p c)))
-       (upgrade-hole (location-node location) c location ui)
-       t)
-      ((and (is-regular-char-event event) (digit-char-p c))
-       (let ((newnode (make-instance 'parse::literal :str (string c))))
-         (swap-node location newnode ui))
-       t)
-      ;; unhandled
-      (t nil))))
+    (when (is-regular-char-event event)
+      (upgrade-hole (location-node location) c location ui))))
 
 ;;; literals - no cursor state needed
 (defmethod handle-key ((node parse::literal) view location ui event)
@@ -451,7 +448,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                               (make-instance 'parse::literal
                                               :str (string-drop s 1))
                               ui)
-                   (swap-node location (make-instance 'hole) ui)))
+                   (swap-node location (hole) ui)))
              t)))))
 
 (defmethod render-node ((node parse::literal) stack context rect)
@@ -497,7 +494,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                              (make-instance 'completion-state
                                             :anchor newnode
                                             :candidates (completion-candidates ui)))))
-                   (swap-node location (make-instance 'hole) ui)))
+                   (swap-node location (hole) ui)))
              t)))))
 
 (defmethod render-node ((node parse::symbol-ref) stack context rect)
@@ -530,7 +527,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                               (make-instance 'parse::binder
                                               :name (string-drop s 1))
                               ui)
-                   (swap-node location (make-instance 'hole) ui)))
+                   (swap-node location (hole) ui)))
              t)))))
 
 (defmethod render-node ((node parse::binder) stack context rect)
@@ -581,16 +578,10 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     view))
 
 ;;; function call
-(defvar *fun-key-handlers* (make-hash-table :test 'equalp))
+(defvar *fun-key-handlers* (make-hash-table :test 'equal))
 
 (defmethod upgrade-hole ((parent parse::function-call) char location ui)
-  (let ((newnode (make-instance 'parse::symbol-ref :name (string-upcase char))))
-    (swap-node location newnode ui)
-    ;; begin completion
-    (setf (completion-state ui)
-          (make-instance 'completion-state
-                         :anchor newnode
-                         :candidates (completion-candidates ui)))))
+  (upgrade-hole-for-eval char location ui))
 
 (defmethod handle-key ((node parse::function-call) view location ui event)
   (when-let ((handler (gethash event *fun-key-handlers*)))
@@ -605,7 +596,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    (id (location-id (car stack))))
               (save-history ui)
               (setf (focus ui)
-                    (ast-insert (make-instance 'hole)
+                    (ast-insert (hole)
                                 (make-location :node (location-node (car stack))
                                                :id 'parse::body)
                                 (if (integerp id) (1+ id) 0)
@@ -665,43 +656,62 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                             :anchor newnode
                             :candidates (completion-candidates ui)))))))
 
-(defvar *let-key-handlers* (make-hash-table :test 'equalp))
+(defvar *let-key-handlers* (make-hash-table :test 'equal))
 (defmethod handle-key ((node parse::let*-form) view location ui event)
   (when-let ((handler (gethash event *let-key-handlers*)))
-    (funcall handler location ui)))
+    (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
+      (unless (zerop i)
+        (funcall handler (nthcdr (1- i) (slog (stack ui))) ui)))))
+
+(setf
+ (gethash (tui-sys:make-event :kind #\rubout) *let-key-handlers*)
+ (lambda (stack ui)
+   (let* ((letloc (car stack))
+          (letnode (location-node letloc))
+          (vars-loc (make-location :node letnode :id 'parse::vars)))
+     (trivia:match (slog (location-id letloc))
+       ((list (eql 'parse::vars) (and (type integer) bi))
+        (if (= 1 (length (get-location letnode 'parse::vars)))
+            (swap-node vars-loc (list `(,(hole) ,(hole))) ui)
+            (setf (focus ui) (ast-delete vars-loc bi stack))))
+       ((eql 'parse::vars)
+        (swap-node vars-loc (list `(,(hole) ,(hole))) ui))))))
 
 (setf
  (gethash (tui-sys:make-event :kind #\newline) *let-key-handlers*)
- (lambda (location ui)
-   (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
-     (unless (zerop i)
-       (let* ((stack (nthcdr (1- i) (slog (stack ui))))
-              (letloc (car stack))
-              (letnode (location-node letloc)))
-         (save-history ui)
-         (trivia:cmatch (slog (location-id letloc))
-           ((and (type integer) body-i)
-            (setf (focus ui)
-                  (ast-insert (make-instance 'hole)
-                              (make-location :node letnode :id 'parse::body)
-                              (1+ body-i) (stack ui))))
-           ((eql 'parse::vars)
-            (setf (focus ui)
-                  (ast-insert (make-instance 'hole)
-                              (make-location :node letnode :id 'parse::body)
-                              0 (stack ui))))
-           ((eql 'parse::op)
-            (let ((bindloc (ast-insert (list (make-instance 'hole) (make-instance 'hole))
-                                       (make-location :node letnode :id 'parse::vars)
-                                       0 (stack ui))))
-              (setf (focus ui) (make-location :node (location-node bindloc)
-                                              :id `(,@(location-id bindloc) ,0)))))
-           ((list* (eql 'parse::vars) (and (type integer) bi) _)
-            (let ((bindloc (ast-insert (list (make-instance 'hole) (make-instance 'hole))
-                                       (make-location :node letnode :id 'parse::vars)
-                                       (1+ bi) (stack ui))))
-              (setf (focus ui) (make-location :node (location-node bindloc)
-                                              :id `(,@(location-id bindloc) ,0)))))))))))
+ (lambda (stack ui)
+   (let* ((letloc (car stack))
+          (letnode (location-node letloc)))
+     (save-history ui)
+     (setf (focus ui)
+           (trivia:cmatch (slog (location-id letloc))
+             ((and (type integer) body-i)
+              (ast-insert (hole)
+                          (make-location :node letnode :id 'parse::body)
+                          (1+ body-i) (stack ui)))
+             ((eql 'parse::vars)
+              (ast-insert (hole)
+                          (make-location :node letnode :id 'parse::body)
+                          0 (stack ui)))
+             ((eql 'parse::op)
+              (let ((bindloc
+                      (ast-insert `(,(hole) ,(hole))
+                                  (make-location :node letnode :id 'parse::vars)
+                                  0 (stack ui))))
+                (make-location :node (location-node bindloc)
+                               :id `(,@(location-id bindloc) 0))))
+             ((list (eql 'parse::vars) (and (type integer) bi))
+              (let ((bindloc
+                      (ast-insert `(,(hole) ,(hole))
+                                  (make-location :node letnode :id 'parse::vars)
+                                  (1+ bi) (stack ui))))
+                (make-location :node (location-node bindloc)
+                               :id `(,@(location-id bindloc) 0))))
+             ;; structural editing within binding
+             ((list (eql 'parse::vars) (and (type integer) bi) (and (type integer) i))
+              (ast-insert (hole)
+                          (make-location :node letnode :id `(parse::vars ,bi))
+                          (1+ i) (stack ui))))))))
 
 (defstruct bindings (list))
 (defmethod unwrap ((node bindings)) (bindings-list node))
@@ -778,7 +788,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                  :boldp bold)))
           (tui:puts (string-downcase prefix) 1 1 rect (style t))
           (tui:puts (string-downcase
-                     (nth-value 1 (alexandria:starts-with-subseq prefix name :return-suffix t)))
+                     (nth-value 1 (starts-with-subseq prefix name :return-suffix t)))
                     1 (+ 1 (length prefix)) rect (style nil)))
         (make-instance 'tui:view
                        :rect (tui:copy-rect rect :rows 1
@@ -868,3 +878,43 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 ;;  (if (integerp x)
 ;;      (princ-to-string s) ; !a. a -> string
 ;;      (string s))) ; string \/ symbol \/ character -> string
+
+(setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when-let* ((state (completion-state ui))
+                    (selection (nth (selection state) (candidates state))))
+          (let ((s (find-symbol selection)))
+            (cond ((eq :function (cl-environments:function-information s))
+                   (let* ((args (loop for a in (slynk-backend:arglist s)
+                                      while (not (find a lambda-list-keywords))
+                                      count a))
+                          (name-node (make-instance 'parse::symbol-ref :name s))
+                          (function-node
+                            (make-instance 'parse::function-call
+                                            :name name-node
+                                            :body (make-list args :initial-element (hole)))))
+
+                     (swap-node (focus ui) function-node ui)
+                     (setf (focus ui) (make-location :node function-node
+                                                     :id (if (plusp args) 0 'parse::name)))))
+                  ((eq s 'cl:let*)
+                   (swap-node (focus ui)
+                              (make-instance 'parse::let*-form
+                                              :body (list (hole))
+                                              :decls ()
+                                              :vars (list `(,(hole) ,(hole))))
+                              ui))
+                  (t
+                   (swap-node (focus ui)
+                              (make-instance 'parse::symbol-ref :name s)
+                              ui))))
+          (setf (completion-state ui) nil)
+          t)))
+
+;; convert back to hole
+(setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when (typep (getloc (focus ui)) 'parse::eval-form)
+          (swap-node (focus ui) (hole) ui))))

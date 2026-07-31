@@ -228,10 +228,10 @@ These are specific to the `node' type."
   (node (error "must provide parent node"))
   (id nil))
 
-(defgeneric get-location (node location)
-  (:documentation "Returns the current value at `location'."))
+(defgeneric get-location (node id)
+  (:documentation "Returns the current value at `id'."))
 (defun getloc (location)
-  (get-location (location-node location) location))
+  (get-location (location-node location) (location-id location)))
 
 (defgeneric is-body (node id)
   (:documentation "A body form is suitable for structural editing operations.")
@@ -246,11 +246,11 @@ List structure may share conses with the old node."))
   (and (eq (location-node n1) (location-node n2))
        (equal (location-id n1) (location-id n2))))
 
-(defmethod get-location ((node function-call) location)
-  (trivia:cmatch (location-id location)
+(defmethod get-location ((node function-call) id)
+  (trivia:cmatch id
     ((eql 'name) (name node))
     ((eql 'body) (body node))
-    ((type integer) (nth (location-id location) (body node)))))
+    ((type integer) (nth id (body node)))))
 
 (defmethod update ((node function-call) id new-value)
   (trivia:cmatch id
@@ -1081,8 +1081,8 @@ Any binding forces a symbol match."
   :binds ((init :variable (< name))
           (body :variable name)))
 
-(defmethod get-location ((node let*-form) location)
-  (trivia:cmatch (location-id location)
+(defmethod get-location ((node let*-form) id)
+  (trivia:cmatch id
     ((eql 'op) 'let*)
     ((eql 'body) (body node))
     ((eql 'vars) (vars node))

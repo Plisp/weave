@@ -5,7 +5,8 @@
 (uiop:define-package #:weave-utils
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
-           #:lfind #:list-insert #:list-update #:findcdr-if
+           #:lfind #:findcdr-if
+           #:list-insert #:list-update #:list-remove
            #:extract-singleton
            #:with-lookup #:or-f #:+fail+
            #:string-drop
@@ -45,6 +46,9 @@
 (defun list-update (list item i)
   "functional replace, may share structure"
   `(,@(subseq list 0 i) ,item ,@(nthcdr (1+ i) list)))
+
+(defun list-remove (list i)
+  `(,@(subseq list 0 i) ,@(nthcdr (1+ i) list)))
 
 (defun findcdr-if (pred list)
   (loop for c on list
