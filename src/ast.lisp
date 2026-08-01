@@ -9,7 +9,11 @@
   (:use :cl #:alexandria-2 #:weave-utils)
   (:export #:make-env
            #:parse
-           #:is-atom))
+           #:is-atom #:has-body
+           #:get-location #:update
+           #:eval-form #:symbol-ref #:binder #:function-call #:literal
+           #:body #:name #:str #:vars #:op
+           ))
 (in-package #:weave-parser)
 
 ;;
@@ -221,6 +225,9 @@
 (defmethod is-atom ((node binder)) t)
 (defmethod is-atom ((node literal)) t)
 (defmethod is-atom ((node symbol-ref)) t)
+
+(defgeneric has-body (node)
+  (:method (node) nil))
 
 (defstruct location
   "`id's usually contain a symbol (slot), possibly list index and should respect `cl:equal'.
@@ -1411,3 +1418,7 @@ Walks subforms of the call using WALKER during analysis."
                     ;; local
                     ((null local-expansion) (parse-function form))
                     (t (parse-macro form)))))))))
+
+;; TODO autogenerate
+(defmethod has-body ((node function-call)) t)
+(defmethod has-body ((node let*-form)) t)
