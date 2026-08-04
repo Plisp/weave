@@ -10,7 +10,12 @@
   (:export #:make-env
            #:parse
            #:is-atom #:has-body
-           #:get-location #:update
+
+           #:update
+           #:get-location #:getloc
+
+           #:location-kind #:lockind
+
            #:eval-form #:symbol-ref #:binder #:function-call #:literal
            #:body #:name #:str #:vars #:op
            ))
@@ -235,10 +240,13 @@ These are specific to the `node' type."
   (node (error "must provide parent node"))
   (id nil))
 
+(defgeneric location-kind (node id))
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'."))
 (defun getloc (location)
   (get-location (location-node location) (location-id location)))
+(defun lockind (location)
+  (location-kind (location-node location) (location-id location)))
 
 (defgeneric is-body (node id)
   (:documentation "A body form is suitable for structural editing operations.")
@@ -1189,14 +1197,14 @@ Any binding forces a symbol match."
 
 (defform (quote thing))
 
-(defform (if test then &body else) ; optional, but need structural editing
-  :binds ((test) (then) (else)))
-
 (defform (setq &body forms)
   :binds ((forms)))
 
 (defform (return-from name value)
   :binds ((value)))
+;; note: structural editing needed
+(defform (if test &body then-else)
+  :binds ((test) (then-else)))
 
 (defform (catch tag &body body)
   :binds ((tag) (body)))
@@ -1223,9 +1231,9 @@ Any binding forces a symbol match."
 
 (defform (multiple-value-call fun arg &body body)
   :binds ((fun) (arg) (body)))
-
-(defform (multiple-value-prog1 value-form &body body)
-  :binds ((value-form) (body)))
+;; note: structural editing needed
+(defform (multiple-value-prog1 &body body)
+  :binds ((body)))
 
 (defform (progn &body forms)
   :binds ((forms)))
@@ -1422,3 +1430,13 @@ Walks subforms of the call using WALKER during analysis."
 ;; TODO autogenerate
 (defmethod has-body ((node function-call)) t)
 (defmethod has-body ((node let*-form)) t)
+(defmethod location-kind ((node function-call) id)
+  (trivia:cmatch id
+    ;; XXX can be lambda, but does anyone use this?
+    ((eql 'name) 'symbol-ref)
+    ((type integer) 'eval-form)))
+(defmethod location-kind ((node let*-form) id)
+  (trivia:cmatch id
+    ((list (eql 'vars) (type integer) (eql 0)) 'binder)
+    ((list (eql 'vars) (type integer) (type integer)) 'eval-form)
+    ((type integer) 'eval-form)))
