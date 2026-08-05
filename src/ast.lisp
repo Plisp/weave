@@ -9,7 +9,7 @@
   (:use :cl #:alexandria-2 #:weave-utils)
   (:export #:make-env
            #:parse
-           #:is-atom #:has-body
+           #:is-atom #:get-body
 
            #:update
            #:get-location #:getloc
@@ -231,8 +231,8 @@
 (defmethod is-atom ((node literal)) t)
 (defmethod is-atom ((node symbol-ref)) t)
 
-(defgeneric has-body (node)
-  (:method (node) nil))
+(defgeneric get-body (node)
+  (:method (node) (values nil nil)))
 
 (defstruct location
   "`id's usually contain a symbol (slot), possibly list index and should respect `cl:equal'.
@@ -1427,9 +1427,9 @@ Walks subforms of the call using WALKER during analysis."
                     ((null local-expansion) (parse-function form))
                     (t (parse-macro form)))))))))
 
-;; TODO autogenerate
-(defmethod has-body ((node function-call)) t)
-(defmethod has-body ((node let*-form)) t)
+;; TODO autogenerate, consider multiple bodies
+(defmethod get-body ((node function-call)) (values (body node) t))
+(defmethod get-body ((node let*-form)) (values (body node) t))
 (defmethod location-kind ((node function-call) id)
   (trivia:cmatch id
     ;; XXX can be lambda, but does anyone use this?
