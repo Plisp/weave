@@ -280,8 +280,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
           finally (return view))))
 
 (defun view-left (atom-array y x)
-  (if-let (res (find-if (lambda (view) (< (tui:rect-x2 (tui:rect view)) x))
-                        (aref atom-array y)
+  (if-let (res (find-if (lambda (view) (<= (tui:rect-x2 (tui:rect view)) x))
+                        (slog (aref atom-array y))
                         :from-end t))
     res ; most-positive-fixnum = very last
     (view-above atom-array y most-positive-fixnum)))
@@ -520,9 +520,14 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    (swap-node location (hole) ui)))
              t)))))
 
+(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥)))
+
 (defmethod render-node ((node parse:symbol-ref) stack context rect)
   (let* ((location (car stack))
-         (str (string-downcase (parse:name node)))
+         (name (parse:name node))
+         (str (if-let (exp (assoc-value *symbol-mappings* name :test #'string-equal))
+                (string exp)
+                (string-downcase name)))
          (focused (location= location (focus context))))
     (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900)))
     (make-instance 'ast-view
@@ -633,45 +638,97 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
           (setf list (cdr list)
                 index (+ 1 index)))))))
 
-;; note: (dis)equality means pairwise
-;; note: only specialize for 2+ arguments, unary is different
+;; note: assumes length 1 symbol mapping for <= and >=
 (defparameter *arb-arity-binops* #("*" "+" "-" "<" ">" "<=" ">="))
-
+(define-constant +top-left+ (name-char "U1CE16") :test #'equal)
+(define-constant +bot-left+ (name-char "U1CE17") :test #'equal)
+(define-constant +top-right+ (name-char "U1CE18") :test #'equal)
+(define-constant +bot-right+ (name-char "U1CE19") :test #'equal)
+;; - unary operators have space removed
+;; - for 2+ arguments, draw *arb-arity-binops*
+;; - for 2 arg division/floor/ceiling/truncate, draw horizontally
+;; - 2 arg equality and disequality
 (defmethod render-node ((node parse:function-call) stack context rect)
   (cond
-    ;; ((and (typep (parse:name node) 'parse:symbol-ref)
-    ;;       (equal (parse:name (parse:name node)) "/")
-    ;;       (= 2 (length (parse:body node))))
-    ;;  (let* ((location (car stack))
-    ;;         (arg1-view (render-node (first (parse:body node))
-    ;;                                 (cons (make-location :node node :id 0) stack)
-    ;;                                 context
-    ;;                                 rect))
-    ;;         (arg1-rect (tui:rect arg1-view))
-    ;;         (arg2-view (render-node
-    ;;                     (second (parse:body node))
-    ;;                     (cons (make-location :node node :id 1) stack)
-    ;;                     context
-    ;;                     (tui:clamp-rect (tui:copy-rect rect :y (1+ (tui:rect-y2 arg1-rect)))
-    ;;                                     rect)))
-    ;;         (arg2-rect (tui:rect arg2-view))
-    ;;         (width (1+ (max (tui:rect-cols arg1-rect) (tui:rect-cols arg2-rect)))))
-    ;;    (tui:puts (make-string width :initial-element #\─) (1+ (tui:rect-rows arg1-rect)) 1
-    ;;              rect)
-    ;;    ;;
-    ;;    (make-instance 'ast-view
-    ;;                   :location location
-    ;;                   :rect (tui:copy-rect rect :cols width
-    ;;                                             :rows (+ (tui:rect-rows arg1-rect)
-    ;;                                                      1 (tui:rect-rows arg2-rect)))
-    ;;                   :children (list arg1-view arg2-view)
-    ;;                   :key-handler (global-key-handler node location context)
-    ;;                   :focused (location= location (focus context)))))
+    ((and (typep (parse:name node) 'parse:symbol-ref)
+          (string= (parse:name (parse:name node)) "/")
+          (= 2 (length (parse:body node))))
+     (let* ((location (car stack))
+            (arg1-view (render-node (first (parse:body node))
+                                    (cons (make-location :node node :id 0) stack)
+                                    context
+                                    rect))
+            (arg1-rect (tui:rect arg1-view))
+            (arg2-view (render-node
+                        (second (parse:body node))
+                        (cons (make-location :node node :id 1) stack)
+                        context
+                        (tui:clamp-rect (tui:copy-rect rect :y (1+ (tui:rect-y2 arg1-rect)))
+                                        rect)))
+            (arg2-rect (tui:rect arg2-view))
+            (width (1+ (max (tui:rect-cols arg1-rect) (tui:rect-cols arg2-rect))))
+            (div-loc (make-location :node node :id 'parse:name))
+            (line-view
+              (make-instance 'ast-view
+                             :location div-loc
+                             :hoverable t
+                             :rect (tui:copy-rect rect :rows 1 :cols width
+                                                       :y (tui:rect-y2 arg1-rect))
+                             :key-handler (global-key-handler (parse:name node)
+                                                              div-loc context)
+                             :focused (location= div-loc (focus context)))))
+       (setf (gethash (parse:name node) (node-views context)) line-view)
+       (when (location= div-loc (focus context))
+         (setf (stack context) (cons div-loc stack))
+         (setf (focus-rect context) (tui:rect line-view)))
+       (tui:puts (make-string width :initial-element #\─)
+                 (1+ (tui:rect-rows arg1-rect)) 1 rect)
+       ;;
+       (make-instance 'ast-view
+                      :location location
+                      :rect (tui:copy-rect rect :cols width
+                                                :rows (+ (tui:rect-rows arg1-rect)
+                                                         1 (tui:rect-rows arg2-rect)))
+                      :children (list arg1-view arg2-view line-view)
+                      :key-handler (global-key-handler node location context)
+                      :focused (location= location (focus context)))))
+    ;; need wrapper for args
+    ((and (typep (parse:name node) 'parse:symbol-ref)
+          (find (parse:name (parse:name node)) *arb-arity-binops* :test #'string=)
+          (= 2 (length (parse:body node))))
+     (let* ((location (car stack))
+            (body-view
+              (tui:horizontal-container
+               rect
+               (flat-list-renderer (parse:body node)
+                                   (lambda (index) (make-location :node node :id index))
+                                   stack context)))
+            (body-rect (tui:rect body-view))
+            (op-views (list)))
+       ;;
+       (loop for i below (* 2 (1- (length (parse:body node))))
+             for c in (reverse (tui:children body-view))
+             for crect = (tui:rect c)
+             do (when (typep c 'ast-view)
+                  (push
+                   (render-node (parse:name node)
+                                (cons (make-location :node node :id 'parse:name) stack)
+                                context
+                                (tui:make-rect :x (tui:rect-x2 crect) :y (tui:rect-y crect)
+                                               :rows 1 :cols 1))
+                   op-views)))
+       ;;
+       (make-instance 'ast-view
+                      :location location
+                      :rect body-rect
+                      :children (nconc op-views (list body-view))
+                      :key-handler (global-key-handler node location context)
+                      :focused (location= location (focus context)))))
     (t
      (let* ((location (car stack))
-            (name-loc (make-location :node node :id 'parse:name))
             (name-view (render-node (parse:name node)
-                                    (cons name-loc stack) context rect))
+                                    (cons (make-location :node node :id 'parse:name) stack)
+                                    context rect))
             (name-rect (tui:rect name-view))
             (args-view (tui:vertical-container
                         (tui:clamp-rect (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
@@ -897,14 +954,16 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     (sb-concurrency:send-message *log* (cons nil 'event-handled))))
 
 (defvar *log-stop* (gensym))
+(defvar *state*)
 (defun tui-main ()
   (let* ((ast (parse:parse
                '(let* ((aaa (parse::*literal-magic* "3"))
-                       (bbb (< aaa)))
+                       (bbb (/ aaa aaa)))
                  (1- b))
                (parse:make-env)))
          (root-loc (make-location :node 'undefined))
          (tui (make-instance 'ui :ast ast :focus root-loc)))
+    (setf *state* tui)
     (setf (location-node root-loc) tui)
     ;; set default background to black (xterm extension)
     (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))
@@ -996,11 +1055,11 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                       (typep focused 'hole))
                  (let* ((location (focus ui))
                         (id (location-id location))
-                        (parent (location-node (slog location))))
-                   ;; by default only delete children in *the* body of a form
-                   (when (and (nth-value 1 (parse:get-body parent)))
+                        (parent (location-node location)))
+                   ;; by default only delete children in some body of a form
+                   (when (or (integerp id) (and (listp id) (integerp (lastcar id))))
                      (let ((body-loc (make-location :node parent :id (parent-id id))))
-                       (if (< 1 (length (slog (getloc body-loc))))
+                       (if (< 1 (length (getloc body-loc)))
                            (setf (focus ui)
                                  (ast-delete body-loc (id-index id) (stack ui)))
                            (let ((child-loc
