@@ -7,6 +7,7 @@
 			   :cl-environments
                #:closer-mop
 			   #:eclector
+               :mk-string-metrics
 			   :slynk
                #:trivial-features
                #:trivia

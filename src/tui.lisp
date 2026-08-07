@@ -219,10 +219,17 @@ Returns the new ast and location relative to the updated node."
           completion
         (if (not (eq (getloc (focus ui)) anchor))
             (setf (completion-state ui) nil)
-            (setf candidates
-                  (delete-if-not (lambda (s)
-                                   (starts-with-subseq (parse:name anchor) s))
-                                 candidates)))))
+            (progn ;; note: if we're typing then we've already converted symbol->string
+              (let* ((name (parse:name anchor))
+                     (valid (delete-if-not (lambda (s) (starts-with-subseq name s))
+                                           candidates))
+                     (exact-match (find name valid :test #'string=)))
+                (if exact-match
+                    (setf candidates
+                          (sort valid #'<
+                                :key (lambda (s)
+                                       (mk-string-metrics:damerau-levenshtein s name))))
+                    (setf candidates valid)))))))
     ))
 
 (setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
@@ -520,7 +527,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    (swap-node location (hole) ui)))
              t)))))
 
-(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥)))
+(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (* . #\⋅) (/= . #\≠)))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect)
   (let* ((location (car stack))
@@ -639,15 +646,14 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                 index (+ 1 index)))))))
 
 ;; note: assumes length 1 symbol mapping for <= and >=
-(defparameter *arb-arity-binops* #("*" "+" "-" "<" ">" "<=" ">="))
+(defparameter *arb-arity-binops* #("*" "+" "-" "<" ">" "<=" ">=" "=" "/="))
 (define-constant +top-left+ (name-char "U1CE16") :test #'equal)
 (define-constant +bot-left+ (name-char "U1CE17") :test #'equal)
 (define-constant +top-right+ (name-char "U1CE18") :test #'equal)
 (define-constant +bot-right+ (name-char "U1CE19") :test #'equal)
 ;; - unary operators have space removed
-;; - for 2+ arguments, draw *arb-arity-binops*
-;; - for 2 arg division/floor/ceiling/truncate, draw horizontally
-;; - 2 arg equality and disequality
+;; - for 2 arguments, draw *arb-arity-binops* (idk about higher arity args duping ops)
+;; - for 2 arg division and TODO (f)floor/ceiling/truncate, draw horizontally
 (defmethod render-node ((node parse:function-call) stack context rect)
   (cond
     ((and (typep (parse:name node) 'parse:symbol-ref)
@@ -696,34 +702,89 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     ((and (typep (parse:name node) 'parse:symbol-ref)
           (find (parse:name (parse:name node)) *arb-arity-binops* :test #'string=)
           (= 2 (length (parse:body node))))
-     (let* ((location (car stack))
-            (body-view
-              (tui:horizontal-container
-               rect
-               (flat-list-renderer (parse:body node)
-                                   (lambda (index) (make-location :node node :id index))
-                                   stack context)))
-            (body-rect (tui:rect body-view))
-            (op-views (list)))
-       ;;
-       (loop for i below (* 2 (1- (length (parse:body node))))
-             for c in (reverse (tui:children body-view))
-             for crect = (tui:rect c)
-             do (when (typep c 'ast-view)
-                  (push
-                   (render-node (parse:name node)
-                                (cons (make-location :node node :id 'parse:name) stack)
-                                context
-                                (tui:make-rect :x (tui:rect-x2 crect) :y (tui:rect-y crect)
-                                               :rows 1 :cols 1))
-                   op-views)))
-       ;;
-       (make-instance 'ast-view
-                      :location location
-                      :rect body-rect
-                      :children (nconc op-views (list body-view))
-                      :key-handler (global-key-handler node location context)
-                      :focused (location= location (focus context)))))
+     (labels ((is-call-to (node f)
+                (and (typep node 'parse:function-call)
+                     (typep (parse:name node) 'parse:symbol-ref)
+                     (string= f (parse:name (parse:name node)))))
+              (is-bracketed (arg)
+                (and (is-call-to node "*")
+                     (or (is-call-to arg "+") (is-call-to arg "-")))))
+       (let* ((location (car stack))
+              (arg1 (first (parse:body node)))
+              (arg1-bracketed (is-bracketed arg1))
+              (arg1-view
+                (if arg1-bracketed
+                    (render-node arg1 (cons (make-location :node node :id 0) stack)
+                                 context (tui:clamp-rect
+                                          (tui:copy-rect rect :x (1+ (tui:rect-x rect)))
+                                          rect))
+                    (render-node arg1 (cons (make-location :node node :id 0) stack)
+                                 context rect)))
+              (arg1-rect (tui:rect arg1-view))
+              (op-view
+                (render-node (parse:name node)
+                             (cons (make-location :node node :id 'parse:name) stack)
+                             context (tui:clamp-rect
+                                      (tui:copy-rect rect :x (1+ (tui:rect-x2 arg1-rect)))
+                                      rect)))
+              (op-rect (tui:rect op-view))
+              (arg2 (second (parse:body node)))
+              (arg2-bracketed (is-bracketed arg2))
+              (arg2-view
+                (render-node arg2 (cons (make-location :node node :id 1) stack)
+                             context (tui:clamp-rect
+                                      (tui:copy-rect rect :x (1+ (tui:rect-x2 op-rect)))
+                                      rect)))
+              (arg2-rect (tui:rect arg2-view)))
+         ;; draw parens
+         (when arg1-bracketed
+           (let ((rcol (+ 2 (tui:rect-cols arg1-rect))))
+             (if (= 1 (tui:rect-rows arg1-rect))
+                 (progn
+                   (tui:put #\( 1 1 rect)
+                   (tui:put #\) 1 rcol rect))
+                 (progn
+                   (tui:put #\⎛ 1 1 rect)
+                   (tui:put #\⎝ (tui:rect-rows arg1-rect) 1 rect)
+                   (loop for y from 2 below (tui:rect-rows arg1-rect)
+                         do (tui:put #\⎜ y 1 rect))
+                   (tui:put #\⎞ 1 rcol rect)
+                   (tui:put #\⎠ (tui:rect-rows arg1-rect) rcol rect)
+                   (loop for y from 2 below (tui:rect-rows arg1-rect)
+                         do (tui:put #\⎟ y rcol rect))))))
+         (when arg2-bracketed
+           (let ((lcol (- (tui:rect-x arg2-rect) (tui:rect-x rect)))
+                 (rcol (+ (- (tui:rect-x arg2-rect) (tui:rect-x rect))
+                          (1+ (tui:rect-cols arg2-rect)))))
+             (if (= 1 (tui:rect-rows arg2-rect))
+                 (progn
+                   (tui:put #\( 1 lcol rect)
+                   (tui:put #\) 1 (+ (- (tui:rect-x arg2-rect) (tui:rect-x rect))
+                                     (1+ (tui:rect-cols arg2-rect)))
+                            rect))
+                 (progn
+                   (tui:put #\⎛ 1 lcol rect)
+                   (loop for y from 2 below (tui:rect-rows arg2-rect)
+                         do (tui:put #\⎜ y (- (tui:rect-x arg2-rect) (tui:rect-x rect))
+                                     rect))
+                   (tui:put #\⎝ (tui:rect-rows arg2-rect) lcol rect)
+                   (tui:put #\⎞ 1 rcol rect)
+                   (loop for y from 2 below (tui:rect-rows arg2-rect)
+                         do (tui:put #\⎟ y rcol rect))
+                   (tui:put #\⎠ (tui:rect-rows arg2-rect) rcol rect)))))
+         (make-instance 'ast-view
+                        :location location
+                        :rect (tui:copy-rect rect
+                                             :rows (max (tui:rect-rows arg1-rect)
+                                                        (tui:rect-rows arg2-rect))
+                                             :cols (+ (tui:rect-cols arg1-rect)
+                                                      (if arg1-bracketed 1 0)
+                                                      2 (tui:rect-cols op-rect)
+                                                      (tui:rect-cols arg2-rect)
+                                                      (if arg2-bracketed 1 0)))
+                        :children (list arg1-view arg2-view op-view)
+                        :key-handler (global-key-handler node location context)
+                        :focused (location= location (focus context))))))
     (t
      (let* ((location (car stack))
             (name-view (render-node (parse:name node)
@@ -737,11 +798,11 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                        (lambda (i) (make-location :node node :id i))
                                        stack context)))
             (args-rect (tui:rect args-view))
-            (fun-rect (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
-                                          :cols (+ 1
-                                                   (tui:rect-cols name-rect)
-                                                   (tui:rect-cols args-rect)))))
-       ;;
+            (fun-rect (tui:clamp-rect
+                       (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
+                                           :cols (+ (tui:rect-cols name-rect)
+                                                    1 (tui:rect-cols args-rect)))
+                       rect)))
        (make-instance 'ast-view
                       :location location
                       :rect fun-rect
