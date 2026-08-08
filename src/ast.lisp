@@ -1431,12 +1431,12 @@ Walks subforms of the call using WALKER during analysis."
 (defmethod get-body ((node function-call)) (values (body node) t))
 (defmethod get-body ((node let*-form)) (values (body node) t))
 (defmethod location-kind ((node function-call) id)
-  (trivia:cmatch id
+  (trivia:match id
     ;; XXX can be lambda, but does anyone use this?
     ((eql 'name) 'symbol-ref)
     ((type integer) 'eval-form)))
 (defmethod location-kind ((node let*-form) id)
-  (trivia:cmatch id
+  (trivia:match id
     ((list (eql 'vars) (type integer) (eql 0)) 'binder)
     ((list (eql 'vars) (type integer) (type integer)) 'eval-form)
     ((type integer) 'eval-form)))

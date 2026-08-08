@@ -18,11 +18,18 @@
 (in-package #:weave-tui)
 
 ;; dynamic vars for debugging, should not be used
+(defvar *state*)
 (defvar *log* (sb-concurrency:make-mailbox :name "log"))
+(defvar *log-stop* (gensym))
 (defmacro slog (form)
   (once-only ((res form))
     `(progn
        (sb-concurrency:send-message *log* (cons ',form ,res))
+       ,res)))
+(defmacro slog* (form)
+  (once-only ((res form))
+    `(progn
+       (sb-concurrency:send-message *log* (cons nil ,res))
        ,res)))
 
 (defclass ast-view (tui:view)
@@ -115,6 +122,9 @@ If this returns NIL, propagate up the cursor stack.")
                l)))
         (t (cerror "continue" "what parent id ~a" id))))
 
+(defun bodylike-id (id)
+  (or (integerp id) (and (listp id) (integerp (lastcar id)))))
+
 (defun id-index (id)
   (if (listp id) (lastcar id) id))
 
@@ -205,12 +215,14 @@ Returns the new ast and location relative to the updated node."
     (or (when-let (handler (gethash event *global-key-handlers*))
           (funcall handler view ui))
         ;; propagate
-        (loop for thisnode = (slog node) then (slog (location-node location))
+        (loop for thisnode = node then (location-node location)
               for location in (slog (stack ui))
-              thereis (handle-key thisnode view location ui event))
+              thereis (when (handle-key thisnode view location ui event)
+                        (slog `(handled-at ,node))
+                        t))
         ;; contextual handlers
         (when-let (handler (gethash event *default-key-handlers*))
-          (slog "default handler called")
+          (slog* "default handler called")
           (funcall handler view ui)))
     ;; state updates here
     (when-let (completion (completion-state ui))
@@ -307,7 +319,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
       (when new-view ; assumes atoms are all ast-views
         (setf (focus ui) (slog (location new-view)))
         (when new-goal
-          (slog (format nil "goal col is ~d" new-goal))
+          (slog* (format nil "goal col is ~d" new-goal))
           (setf (goal-col ui) new-goal))))))
 
 (setf (gethash (tui-sys:make-event :kind #\n :controlp t) *default-key-handlers*)
@@ -935,6 +947,154 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    :key-handler (global-key-handler letnode location context)
                    :focused (location= location (focus context)))))
 
+;;; global key handlers
+(setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when-let* ((state (completion-state ui))
+                    (selection (nth (selection state) (candidates state))))
+          (let ((s (find-symbol selection)))
+            (cond
+              ((eq :function (cl-environments:function-information s))
+               (let* ((args (loop for a in (slynk-backend:arglist s)
+                                  while (not (find a lambda-list-keywords))
+                                  count a))
+                      (name-node (make-instance 'parse:symbol-ref :name s)))
+                 (cond
+                   ((and (eq 'parse:eval-form (lockind (focus ui)))
+                         (bodylike-id (location-id (focus ui))))
+                    (let ((function-node
+                            (make-instance 'parse:function-call
+                                            :name name-node
+                                            :body (or (loop repeat args collect (hole))
+                                                      (list (hole))))))
+                      (swap-node (focus ui) function-node ui)
+                      (setf (focus ui)
+                            (make-location :node function-node
+                                           :id (if (plusp args) 0 'parse:name)))))
+                   ((eq (parse:lockind (focus ui)) 'parse:symbol-ref)
+                    (let* ((oldbody (parse:body (location-node (focus ui))))
+                           (function-node
+                             (make-instance
+                              'parse:function-call
+                              :name name-node
+                              :body (append oldbody
+                                            (loop for i below (- args (length oldbody))
+                                                  collect (hole))))))
+                      (swap-node (second (stack ui)) function-node ui))))))
+              ((eq s 'cl:let*)
+               (swap-node (focus ui)
+                          (make-instance 'parse:let*-form
+                                          :body (list (hole))
+                                          :decls ()
+                                          :vars (list `(,(hole) ,(hole))))
+                          ui))
+              (t
+               (swap-node (focus ui)
+                          (make-instance 'parse:symbol-ref :name s)
+                          ui))))
+          (setf (completion-state ui) nil)
+          t)))
+
+(defmethod move-back ((node parse:function-call) id)
+  (trivia:cmatch id
+    ((and (type integer) i) (if (< 0 i)
+                                (1- i)
+                                'parse:name))
+    ((eql 'parse:name) 'parse:name)))
+
+(defmethod move-back ((node parse:let*-form) id)
+  (trivia:cmatch id
+    ((eql 'parse:op) 'parse:op)
+    ((eql 'parse:vars) 'parse:op)
+    ((and (type integer) i) (if (< 0 i)
+                                (1- i)
+                                'parse:vars))
+    ((list (eql 'parse:vars) (and (type integer) bi))
+     (if (< 0 bi)
+         (list 'parse:vars (1- bi))
+         'parse:op))
+    ((list (eql 'parse:vars) (and (type integer) bi) (and (type integer) n))
+     (list 'parse:vars bi (max 0 (1- n))))))
+
+;; convert back to hole
+(setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (let ((focused (getloc (focus ui))))
+          (cond ((typep focused 'parse:eval-form)
+                 (swap-node (focus ui) (hole) ui))
+                ;; note: this is not precise
+                ((and (eq 'parse:eval-form (lockind (focus ui)))
+                      (typep focused 'hole))
+                 (let* ((location (focus ui))
+                        (id (location-id location))
+                        (parent (location-node location)))
+                   ;; by default only delete children in some body of a form, not named locs
+                   (when (bodylike-id id)
+                     (let ((body-loc (make-location :node parent :id (parent-id id))))
+                       (if (< 1 (length (getloc body-loc)))
+                           (setf (focus ui)
+                                 (ast-delete body-loc (id-index id) (stack ui)))
+                           (let ((child-loc
+                                   (ast-replace body-loc
+                                                (lambda (body) (list-remove body (id-index id)))
+                                                (stack ui))))
+                             (setf (focus ui)
+                                   (make-location :node (location-node child-loc)
+                                                  :id (move-back (location-node child-loc)
+                                                                 id)))))
+                       t))))))))
+
+;; slurp
+(setf (gethash (tui-sys:make-event :kind #\) :altp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (when-let (parent-stack (parent-stack (stack ui)))
+          (let* ((loc (focus ui))
+                 (node (getloc loc))
+                 (id (location-id loc))
+                 (i (id-index id))
+                 (parent (getloc (car parent-stack)))
+                 (pbody (with-lookup (body (parse:get-body parent) parent)
+                          body)))
+            ;; i *think* these are sufficient
+            (when (and (nth-value 1 (parse:get-body node))
+                       (listp pbody) (< (1+ i) (length pbody))
+                       (typep (nth (1+ i) pbody) 'parse:eval-form))
+              (swap-node
+               (make-location :node (location-node loc) :id (parent-id id))
+               (list-update (list-remove pbody (1+ i))
+                            (update node 'parse:body
+                                    `(,@(getloc (make-location :node node :id 'parse:body))
+                                      ,(nth (1+ i) pbody)))
+                            i)
+               ui)
+              (setf (focus ui)
+                    (make-location :node (location-node (focus ui))
+                                   :id (append-id (location-id (focus ui)) i))))))))
+
+;; raise
+(setf (gethash (tui-sys:make-event :kind #\} :controlp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (let ((focus-node (getloc (focus ui))))
+          (when (and (< 1 (length (stack ui)))
+                     (typep focus-node 'parse:eval-form))
+            (loop for stack = (cdr (stack ui)) then (cdr stack)
+                  while stack
+                  for loc = (car stack)
+                  for node = (getloc loc)
+                  until (typep node 'parse:eval-form)
+                  finally (swap-node loc focus-node ui))))))
+
+;; ;; barf
+;; (setf (gethash (tui-sys:make-event :kind #\} :altp t) *default-key-handlers*)
+;;       (lambda (view ui)
+;;         (declare (ignore view))
+;;         (when (typep (getloc (focus ui)) 'parse:eval-form)
+;;           (swap-node (focus ui) (hole) ui))))
+
 ;;; completions
 
 (defun render-completion (name index state rect)
@@ -1000,7 +1160,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   (restart-case
       (progn
         (call-next-method)
-        (sb-concurrency:send-message *log* (cons nil 'redisplay-done)))
+        (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'redisplay-done)))
     (stop ()
       :report "exit"
       (tui:stop ui))))
@@ -1012,10 +1172,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
              (tui:event-controlp event))
         (tui:stop ui)
         (call-next-method))
-    (sb-concurrency:send-message *log* (cons nil 'event-handled))))
+    (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled))))
 
-(defvar *log-stop* (gensym))
-(defvar *state*)
 (defun tui-main ()
   (let* ((ast (parse:parse
                '(let* ((aaa (parse::*literal-magic* "3"))
@@ -1040,144 +1198,6 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
               :until (eq value *log-stop*)
               :do (if form
                       (format t "~a~%|> ~s~%" form value)
-                      (format t "~a~a~%" (make-string 70 :initial-element #\-) value))
+                      (format t "~a~%" value))
                   (force-output)))
       (tui-main)))
-
-(setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (when-let* ((state (completion-state ui))
-                    (selection (nth (selection state) (candidates state))))
-          (let ((s (find-symbol selection)))
-            (cond ((eq :function (cl-environments:function-information s))
-                   (let* ((args (loop for a in (slynk-backend:arglist s)
-                                      while (not (find a lambda-list-keywords))
-                                      count a))
-                          (name-node (make-instance 'parse:symbol-ref :name s)))
-                     ;; only do this in the body
-                     (cond ((integerp (location-id (focus ui)))
-                            (let ((function-node
-                                    (make-instance 'parse:function-call
-                                                   :name name-node
-                                                   :body (or (loop repeat args
-                                                                   collect (hole))
-                                                             (list (hole))))))
-                              (swap-node (focus ui) function-node ui)
-                              (setf (focus ui)
-                                    (make-location :node function-node
-                                                   :id (if (plusp args) 0 'parse:name)))))
-                           ((eq (parse:lockind (focus ui)) 'parse:symbol-ref)
-                            (swap-node (focus ui) name-node ui)))))
-                  ((eq s 'cl:let*)
-                   (swap-node (focus ui)
-                              (make-instance 'parse:let*-form
-                                             :body (list (hole))
-                                             :decls ()
-                                             :vars (list `(,(hole) ,(hole))))
-                              ui))
-                  (t
-                   (swap-node (focus ui)
-                              (make-instance 'parse:symbol-ref :name s)
-                              ui))))
-          (setf (completion-state ui) nil)
-          t)))
-
-(defmethod move-back ((node parse:function-call) id)
-  (trivia:cmatch id
-    ((and (type integer) i) (if (< 0 i)
-                                (1- i)
-                                'parse:name))
-    ((eql 'parse:name) 'parse:name)))
-
-(defmethod move-back ((node parse:let*-form) id)
-  (trivia:cmatch id
-    ((eql 'parse:op) 'parse:op)
-    ((eql 'parse:vars) 'parse:op)
-    ((and (type integer) i) (if (< 0 i)
-                                (1- i)
-                                'parse:vars))
-    ((list (eql 'parse:vars) (and (type integer) bi))
-     (if (< 0 bi)
-         (list 'parse:vars (1- bi))
-         'parse:op))
-    ((list (eql 'parse:vars) (and (type integer) bi) (and (type integer) n))
-     (list 'parse:vars bi (max 0 (1- n))))))
-
-;; convert back to hole
-(setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (let ((focused (getloc (focus ui))))
-          (cond ((typep focused 'parse:eval-form)
-                 (swap-node (focus ui) (hole) ui))
-                ;; note: this is not precise
-                ((and (eq 'parse:eval-form (lockind (focus ui)))
-                      (typep focused 'hole))
-                 (let* ((location (focus ui))
-                        (id (location-id location))
-                        (parent (location-node location)))
-                   ;; by default only delete children in some body of a form
-                   (when (or (integerp id) (and (listp id) (integerp (lastcar id))))
-                     (let ((body-loc (make-location :node parent :id (parent-id id))))
-                       (if (< 1 (length (getloc body-loc)))
-                           (setf (focus ui)
-                                 (ast-delete body-loc (id-index id) (stack ui)))
-                           (let ((child-loc
-                                   (ast-replace body-loc
-                                                (lambda (body) (list-remove body (id-index id)))
-                                                (stack ui))))
-                             (setf (focus ui)
-                                   (make-location :node (location-node child-loc)
-                                                  :id (move-back (location-node child-loc)
-                                                                 id)))))
-                       t))))))))
-
-;; slurp
-(setf (gethash (tui-sys:make-event :kind #\) :altp t) *default-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (when-let (parent-stack (parent-stack (stack ui)))
-          (let* ((loc (focus ui))
-                 (node (getloc loc))
-                 (id (location-id loc))
-                 (i (id-index id))
-                 (parent (getloc (car parent-stack)))
-                 (pbody (with-lookup (body (parse:get-body parent) parent)
-                          body)))
-            ;; i *think* these are sufficient
-            (when (and (nth-value 1 (parse:get-body node))
-                       (listp pbody) (< (1+ i) (length pbody))
-                       (typep (nth (1+ i) pbody) 'parse:eval-form))
-              (swap-node
-               (make-location :node (location-node loc) :id (parent-id id))
-               (list-update (list-remove pbody (1+ i))
-                            (update node 'parse:body
-                                    `(,@(getloc (make-location :node node :id 'parse:body))
-                                      ,(nth (1+ i) pbody)))
-                            i)
-               ui)
-              (setf (focus ui)
-                    (make-location :node (location-node (focus ui))
-                                   :id (append-id (location-id (focus ui)) i))))))))
-
-;; raise
-(setf (gethash (tui-sys:make-event :kind #\} :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (let ((focus-node (getloc (focus ui))))
-          (when (and (< 1 (length (stack ui)))
-                     (typep focus-node 'parse:eval-form))
-            (loop for stack = (cdr (stack ui)) then (cdr stack)
-                  while stack
-                  for loc = (car stack)
-                  for node = (getloc loc)
-                  until (typep node 'parse:eval-form)
-                  finally (swap-node loc focus-node ui))))))
-
-;; ;; barf
-;; (setf (gethash (tui-sys:make-event :kind #\} :altp t) *default-key-handlers*)
-;;       (lambda (view ui)
-;;         (declare (ignore view))
-;;         (when (typep (getloc (focus ui)) 'parse:eval-form)
-;;           (swap-node (focus ui) (hole) ui))))
