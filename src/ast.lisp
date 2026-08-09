@@ -10,6 +10,7 @@
   (:export #:make-env
            #:parse
            #:is-atom #:get-body
+           #:copy-node
 
            #:update
            #:get-location #:getloc
@@ -139,6 +140,7 @@
 ;;
 ;;; class defs: mainly we want a structure that's
 ;;; - close enough to s-expressions for macroexpansion and evaluation
+;;; - has tags for tree-structured dispatch (minimal passing of context through wrappers)
 ;;; - gives identity to semantic units which may need identity under editing
 ;;;   since we should avoid sequence cursors
 ;;;   - let binders need identity through insertion, type info is associated with
@@ -225,6 +227,74 @@
          :reader body))
   (:documentation "(macro) lambda list and body list of eval-forms"))
 
+(defstruct location
+  "`id's usually contain a symbol (slot), possibly list index and should respect `cl:equal'.
+These are specific to the `node' type."
+  (node (error "must provide parent node"))
+  (id nil))
+
+(defmethod print-object ((object literal) stream)
+  (format stream "<lit: ~a>" (str object)))
+
+(defmethod print-object ((object symbol-ref) stream)
+  (pprint-logical-block (stream (list))
+    (format stream "<~a@~a>" (name object) (addr-str object))))
+
+(defmethod print-object ((object binder) stream)
+  (pprint-logical-block (stream (list))
+    (format stream "<~a@~a>" (name object) (addr-str object))))
+
+(defmethod print-object ((object function-call) stream)
+  (pprint-logical-block (stream (body object) :suffix ")")
+    (write-char #\( stream)
+    (write (name object) :stream stream)
+    (loop
+      (pprint-exit-if-list-exhausted)
+      (write-char #\Space stream)
+      (print-object (pprint-pop) stream))))
+
+(defmethod print-object ((object function-call) stream)
+  (pprint-logical-block (stream (body object))
+    (write-char #\( stream)
+    (write (name object) :stream stream)
+    (loop
+      (pprint-exit-if-list-exhausted)
+      (write-char #\Space stream)
+      (print-object (pprint-pop) stream)))
+  (write-string ")" stream))
+
+;;
+;;; interface
+;;
+
+;; performs a deep copy of node, only needed for actual node classes,
+;; - semantic uniqueness of binders, used for attaching information
+;; - uniqueness of locations used for the user interface
+(defgeneric copy-node (node)
+  (:method ((o comment)) (make-instance 'comment :kind (kind o) :str (str o)))
+  (:method ((o literal)) (make-instance 'literal :str (str o)))
+  (:method ((o symbol-ref)) (make-instance 'symbol-ref :name (name o)))
+  (:method ((o binder)) (make-instance 'binder :name (name o)))
+  (:method ((o function-call)) (make-instance 'function-call
+                                              :name (copy-node (name o))
+                                              :body (mapcar #'copy-node (body o))))
+  (:method ((o macro-call))
+    (make-instance 'macro-call
+                   :subform-asts (let ((new (make-hash-table :test 'eq)))
+                                   (maphash (lambda (k v) (setf (gethash k new) (copy-node v)))
+                                            (subform-asts o))
+                                   new)
+                   :eval-binders (eval-binders o)
+                   :gensym-names (gensym-names o)
+                   :body (body o) :op (op o)))
+  ;; TODO lambda list
+  (:method ((o function-code))
+    (make-instance 'function-code
+                   :lambda-list (copy-node (lambda-list o))
+                   :docstring (docstring o)
+                   :declarations (declarations o)
+                   :body (mapcar #'copy-node (body o)))))
+
 (defgeneric is-atom (node)
   (:method (node) nil))
 (defmethod is-atom ((node binder)) t)
@@ -232,13 +302,14 @@
 (defmethod is-atom ((node symbol-ref)) t)
 
 (defgeneric get-body (node)
-  (:method (node) (values nil nil)))
+  (:method (node) (values nil nil))
+  (:method ((node function-call)) (values (body node) t))
+  (:method ((node macro-call)) (values (body node) t))
+  (:method ((node function-code)) (values (body node) t)))
 
-(defstruct location
-  "`id's usually contain a symbol (slot), possibly list index and should respect `cl:equal'.
-These are specific to the `node' type."
-  (node (error "must provide parent node"))
-  (id nil))
+(defgeneric to-text (ast) (:documentation "Serialize ast to text"))
+(defgeneric to-sexp (ast) (:documentation "convert to sexp for macroexpansion")
+  (:method ((ast t)) nil))
 
 (defgeneric location-kind (node id))
 (defgeneric get-location (node id)
@@ -279,44 +350,6 @@ List structure may share conses with the old node."))
                                      :body `(,@(subseq old-body 0 id)
                                              ,new-value
                                              ,@(nthcdr (1+ id) old-body)))))))
-
-(defmethod print-object ((object literal) stream)
-  (format stream "<lit: ~a>" (str object)))
-
-(defmethod print-object ((object symbol-ref) stream)
-  (pprint-logical-block (stream (list))
-    (format stream "<~a@~a>" (name object) (addr-str object))))
-
-(defmethod print-object ((object binder) stream)
-  (pprint-logical-block (stream (list))
-    (format stream "<~a@~a>" (name object) (addr-str object))))
-
-(defmethod print-object ((object function-call) stream)
-  (pprint-logical-block (stream (body object) :suffix ")")
-    (write-char #\( stream)
-    (write (name object) :stream stream)
-    (loop
-      (pprint-exit-if-list-exhausted)
-      (write-char #\Space stream)
-      (print-object (pprint-pop) stream))))
-
-(defmethod print-object ((object function-call) stream)
-  (pprint-logical-block (stream (body object))
-    (write-char #\( stream)
-    (write (name object) :stream stream)
-    (loop
-      (pprint-exit-if-list-exhausted)
-      (write-char #\Space stream)
-      (print-object (pprint-pop) stream)))
-  (write-string ")" stream))
-
-;;
-;;; interface
-;;
-
-(defgeneric to-text (ast) (:documentation "Serialize ast to text"))
-(defgeneric to-sexp (ast) (:documentation "convert to sexp for macroexpansion")
-  (:method ((ast t)) nil))
 
 ;;
 ;;; code walking
@@ -621,6 +654,7 @@ Binding tag names **must not** be (member NIL < =). For each ctx, may have eithe
 `=` to indicate a rest entry in which parallel block bindings occur
 Any binding forces a symbol match."
   (let ((parser-name (symbolicate name "-SPEC-PARSER"))
+        (classname (symbolicate name "-FORM"))
         (custom-bind-rest-labels nil)
         (tag-kinds (nconc (spec-names spec)
                           (mapcan (lambda (pair) (spec-names (cdr pair)))
@@ -675,12 +709,17 @@ Any binding forces a symbol match."
                     ((list (type symbol) (type symbol))))))
     ;; code
     `(progn
-       (defclass ,(symbolicate name "-FORM") (irregular-form)
+       (defclass ,classname (irregular-form)
          (,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
                   collect `(,name :initarg ,(make-keyword name)
-                                  ;; XXX could generate initargs instead
                                   :accessor ,name))))
-       (export ',(symbolicate name "-FORM"))
+       ,(when (find 'body toplevel-parts)
+          `(defmethod get-body ((node ,classname)) (values (body node) t)))
+       (defmethod copy-node ((old ,classname))
+         (let ((new (make-instance ',classname)))
+           ,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
+                   collect `(setf (,name new) (copy-node (,name old))))))
+       (export ',classname)
        ,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
                collect `(export ',name))
        ;; spec validated above by spec-names ^
@@ -919,7 +958,7 @@ Any binding forces a symbol match."
              (defun ,(symbolicate name "-PARSER") (form env walker)
                (declare (ignorable env walker))
                (let ((tagmap (,(symbolicate name "-TAGGER") form))
-                     (ast (make-instance ',(symbolicate name "-FORM"))))
+                     (ast (make-instance ',classname)))
                  (declare (ignorable tagmap))
                  ,@
                  (loop
@@ -1427,9 +1466,7 @@ Walks subforms of the call using WALKER during analysis."
                     ((null local-expansion) (parse-function form))
                     (t (parse-macro form)))))))))
 
-;; TODO autogenerate, consider multiple bodies
-(defmethod get-body ((node function-call)) (values (body node) t))
-(defmethod get-body ((node let*-form)) (values (body node) t))
+;; TODO autogenerate?
 (defmethod location-kind ((node function-call) id)
   (trivia:match id
     ;; XXX can be lambda, but does anyone use this?

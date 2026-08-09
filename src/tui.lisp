@@ -64,6 +64,14 @@ If this returns NIL, propagate up the cursor stack.")
           :initform (error "must provide insertion focus")
           :reader focus)))
 
+(defclass cutbuffer ()
+  ((content :initarg :content
+            :initform (error "no content")
+            :reader content)
+   (location :initarg :location
+             :initform (error "no location")
+             :reader location)))
+
 (defclass ui (tui:elemental)
   ((ast :initarg :ast
         :initform (error "no ast")
@@ -74,6 +82,8 @@ If this returns NIL, propagate up the cursor stack.")
    (edit-loc :initarg :edit-loc
              :initform nil
              :accessor edit-loc)
+   (cutbuffer :initform nil
+              :accessor cutbuffer)
    (goal-col :initform 1
              :accessor goal-col
              :type positive-fixnum)
@@ -107,6 +117,10 @@ If this returns NIL, propagate up the cursor stack.")
   (declare (ignore id))
   (setf (ast ui) new-value)
   ui)
+
+(defmethod parse:location-kind ((ui ui) id)
+  (declare (ignore id))
+  'parse:eval-form)
 
 (defun append-id (id i)
   (cond ((eq id 'parse:body) i)
@@ -196,12 +210,10 @@ Returns the new ast and location relative to the updated node."
         (tui:fill-rect (tui:make-style :bg (tui:color i i i))
                        (tui:copy-rect rect :x 0 :y 0) rect
                        :blend 0.1)))
-    ;; save window
-    (setf (gethash (unwrap node) (node-views context)) view)
-    (when (eq (unwrap node) (getloc (focus context)))
-      (setf (focus-rect context) rect))
-    ;; cache stack
+    ;; save window and cache stack (don't need to unwrap node for now)
+    (setf (gethash node (node-views context)) view)
     (when (location= (car stack) (focus context))
+      (setf (focus-rect context) rect)
       (setf (stack context) stack))
     (values-list vals)))
 
@@ -218,7 +230,7 @@ Returns the new ast and location relative to the updated node."
         (loop for thisnode = node then (location-node location)
               for location in (slog (stack ui))
               thereis (when (handle-key thisnode view location ui event)
-                        (slog `(handled-at ,node))
+                        (slog* `(handled-at ,node))
                         t))
         ;; contextual handlers
         (when-let (handler (gethash event *default-key-handlers*))
@@ -354,7 +366,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 
 (defun move-parent (ui)
   (when-let (new-stack (parent-stack (stack ui)))
-    (slog `(moving to ,new-stack))
+    (slog* `(moving to ,new-stack))
     (setf (focus ui) (car new-stack)
           (stack ui) new-stack)))
 
@@ -420,11 +432,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
            (text (if (string= text "") "hole" text))
            (focused (location= location (focus context))))
       (tui:puts text 1 1 rect (if focused
-                                  (tui:make-style :fg #x0
-                                                  :bg (when focused #xb58900)
-                                                  :underlinep t)
-                                  (tui:make-style :fg (tui:color 30 200 0)
-                                                  :underlinep t)))
+                                  (tui:make-style :fg #x0 :underlinep t)
+                                  (tui:make-style :fg (tui:color 30 200 0) :underlinep t)))
       (make-instance 'ast-view
                      :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
                      :location location
@@ -443,16 +452,19 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   (declare (ignore context))
   (loop for s being the symbols of (find-package "CL") collect (string s)))
 
+(defun symbol-char-p (c)
+  (and (graphic-char-p c) (not (char= c #\space))))
+
 (defmethod handle-key ((node hole) view location ui event)
   (let ((c (tui:event-kind event)))
     (when (is-regular-char-event event)
       (trivia:match (parse:lockind location)
         ((eql 'parse:binder)
-         (when (and (graphic-char-p c) (not (digit-char-p c)))
+         (when (and (symbol-char-p c) (not (digit-char-p c)))
            (swap-node location (make-instance 'parse:binder :name (string-upcase c)) ui)))
         ((eql 'parse:eval-form)
          (cond
-           ((and (graphic-char-p c) (not (digit-char-p c)))
+           ((and (symbol-char-p c) (not (digit-char-p c)))
             (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
               (swap-node location newnode ui)
               ;; begin completion
@@ -464,7 +476,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
             (let ((newnode (make-instance 'parse:literal :str (string c))))
               (swap-node location newnode ui)))))
         ((eql 'parse:symbol-ref)
-         (when (and (graphic-char-p c) (not (digit-char-p c)))
+         (when (and (symbol-char-p c) (not (digit-char-p c)))
            (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
              (swap-node location newnode ui)
              ;; begin completion
@@ -498,7 +510,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
          (str (format nil "~a" (parse:str node)))
          (focused (location= location (focus context))))
     (tui:puts str 1 1 rect (if focused
-                               (tui:make-style :fg #x0 :bg (when focused #xb58900))
+                               (tui:make-style :fg #x0)
                                (tui:make-style :fg #x2aa198)))
     (make-instance 'ast-view
                    :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
@@ -513,7 +525,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   (when (is-regular-char-event event)
     (let ((s (parse:name node))
           (c (tui:event-kind event)))
-      (cond ((graphic-char-p c)
+      (cond ((symbol-char-p c)
              (let ((newnode
                      (make-instance 'parse:symbol-ref
                                     :name (format nil "~a~a" s (string-upcase c)))))
@@ -548,7 +560,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                 (string exp)
                 (string-downcase name)))
          (focused (location= location (focus context))))
-    (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900)))
+    (tui:puts str 1 1 rect)
     (make-instance 'ast-view
                    :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
                    :location location
@@ -562,7 +574,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   (when (is-regular-char-event event)
     (let ((s (parse:name node))
           (c (tui:event-kind event)))
-      (cond ((graphic-char-p c)
+      (cond ((symbol-char-p c)
              (swap-node location
                         (make-instance 'parse:binder :name (format nil "~a~a" s c))
                         ui)
@@ -581,7 +593,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
   (let* ((location (car stack))
          (str (string-downcase (parse:name node)))
          (focused (location= location (focus context))))
-    (tui:puts str 1 1 rect (tui:make-style :bg (when focused #xb58900) :italicp t))
+    (tui:puts str 1 1 rect (tui:make-style :italicp t))
     (make-instance 'ast-view
                    :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
                    :location location
@@ -628,23 +640,36 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (defvar *fun-key-handlers* (make-hash-table :test 'equal))
 
 (defmethod handle-key ((node parse:function-call) view location ui event)
+  ;; I don't expect function calls to have any special binds percolated up the tree
   (when-let ((handler (gethash event *fun-key-handlers*)))
-    (funcall handler location ui)))
+    (when (and (< 1 (length (stack ui)))
+               (location= location (second (stack ui)))) ; we need to be a direct child
+      (funcall handler ui))))
+
+(setf (gethash (tui-sys:make-event :kind #\space) *fun-key-handlers*)
+      (lambda (ui)
+        (let* ((fun-loc (car (stack ui)))
+               (fun-node (location-node fun-loc))
+               (id (location-id fun-loc))
+               (id (if (integerp id) (1+ id) 0)))
+          (if (= id (length (parse:body fun-node)))
+              (progn
+                (save-history ui)
+                (setf (focus ui)
+                      (ast-insert (hole) (make-location :node fun-node :id 'parse:body)
+                                  id (stack ui))))
+              (setf (focus ui) (make-location :node fun-node :id id))))))
 
 (setf (gethash (tui-sys:make-event :kind #\newline) *fun-key-handlers*)
-      (lambda (location ui)
-        (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
-          ;; whole node selected, handle further up
-          (unless (zerop i)
-            (let* ((stack (nthcdr (1- i) (slog (stack ui))))
-                   (id (location-id (car stack))))
-              (save-history ui)
-              (setf (focus ui)
-                    (ast-insert (hole)
-                                (make-location :node (location-node (car stack))
-                                               :id 'parse:body)
-                                (if (integerp id) (1+ id) 0)
-                                (stack ui))))))))
+      (lambda (ui)
+        (let* ((fun-loc (car (stack ui)))
+               (id (location-id fun-loc)))
+          (save-history ui)
+          (setf (focus ui)
+                (ast-insert (hole) ; function-call is at top of the stack vvv
+                            (make-location :node (location-node fun-loc) :id 'parse:body)
+                            (if (integerp id) (1+ id) 0)
+                            (stack ui))))))
 
 (defun list-renderer (list loc-mapper stack context)
   (let ((index 0))
@@ -664,8 +689,9 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (define-constant +top-right+ (name-char "U1CE18") :test #'equal)
 (define-constant +bot-right+ (name-char "U1CE19") :test #'equal)
 ;; - unary operators have space removed
-;; - for 2 arguments, draw *arb-arity-binops* (idk about higher arity args duping ops)
-;; - for 2 arg division and TODO (f)floor/ceiling/truncate, draw horizontally
+;; - for 2 arguments, draw *arb-arity-binops* infix
+;;   - higher arity duplicated op views break invariant: always a single focused view
+;; - for 2 arg division, draw horizontally. maybe future: (f)floor/ceiling/truncate
 (defmethod render-node ((node parse:function-call) stack context rect)
   (cond
     ((and (typep (parse:name node) 'parse:symbol-ref)
@@ -883,6 +909,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                           (make-location :node letnode :id `(parse:vars ,bi))
                           (1+ i) (stack ui))))))))
 
+;; exception to not having wrappers, used for code sharing the :around method
 (defstruct bindings (list))
 (defmethod unwrap ((node bindings)) (bindings-list node))
 (defmethod render-node ((l bindings) stack context rect)
@@ -1033,6 +1060,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    ;; by default only delete children in some body of a form, not named locs
                    (when (bodylike-id id)
                      (let ((body-loc (make-location :node parent :id (parent-id id))))
+                       (save-history ui)
                        (if (< 1 (length (getloc body-loc)))
                            (setf (focus ui)
                                  (ast-delete body-loc (id-index id) (stack ui)))
@@ -1080,7 +1108,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
         (declare (ignore view))
         (let ((focus-node (getloc (focus ui))))
           (when (and (< 1 (length (stack ui)))
-                     (typep focus-node 'parse:eval-form))
+                     (or (typep focus-node 'parse:eval-form)
+                         (typep focus-node 'hole)))
             (loop for stack = (cdr (stack ui)) then (cdr stack)
                   while stack
                   for loc = (car stack)
@@ -1094,6 +1123,29 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 ;;         (declare (ignore view))
 ;;         (when (typep (getloc (focus ui)) 'parse:eval-form)
 ;;           (swap-node (focus ui) (hole) ui))))
+
+;; these two are sufficient for easily wrapping forms
+(setf (gethash (tui-sys:make-event :kind #\x :controlp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (let* ((loc (focus ui))
+               (node (getloc loc)))
+          (slog* `(cut ,node))
+          (when (lockind loc)
+            (setf (cutbuffer ui)
+                  (make-instance 'cutbuffer :location loc :content node))
+            (swap-node loc (hole) ui))
+          t)))
+
+(setf (gethash (tui-sys:make-event :kind #\v :controlp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        ;; XXX more generic compatibility check for e.g. copying let bindings
+        (let ((focus (focus ui))
+              (cutbuffer (cutbuffer ui)))
+          (when (and (eq (lockind focus) (lockind (location cutbuffer))))
+            (swap-node focus (parse:copy-node (content cutbuffer)) ui))
+          t)))
 
 ;;; completions
 
@@ -1168,7 +1220,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (defmethod tui:dispatch-event :around ((ui ui) event)
   (with-simple-restart (nil "ignore event-handling error")
     (if (and (not (tui:mouse-event-p event))
-             (equal (tui:event-kind event) #\c)
+             (equal (tui:event-kind event) #\q)
              (tui:event-controlp event))
         (tui:stop ui)
         (call-next-method))
