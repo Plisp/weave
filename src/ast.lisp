@@ -23,121 +23,6 @@
 (in-package #:weave-parser)
 
 ;;
-;;; eclector reader
-;;
-
-(defvar *literal-magic* (gensym)) ; unique
-
-(defclass my-client (eclector.parse-result:parse-result-client)
-  ((source :initarg :source
-           :initform (error "no source"))))
-
-(defmethod eclector.parse-result:make-expression-result
-    ((client my-client) (result t) (children t) (source t))
-  (cond ((and (atom result) (constantp result))
-         (list *literal-magic* (subseq (slot-value client 'source)
-                                       (car source) (cdr source))))
-        ((null children) result)
-        (t
-         (if (consp result)
-             (case (car result)
-               ;; readtable should stop read-macro representations from being used?
-               ;; otherwise I could use gensyms like *literal-magic*
-               (function (if (eq 'function (first children))
-                             children
-                             `(read-function ,@children)))
-               (quote
-                (if (eq 'quote (first children))
-                    children
-                    `(read-quote ,@children)))
-               (read-eval `(read-eval ,@children))
-               ((eclector.reader:quasiquote
-                 eclector.reader:unquote eclector.reader:unquote-splicing)
-                `(,(car result) ,@children))
-               (t children))
-             children))))
-
-;; TODO handle comments (including formatting) and reader conditionals properly
-(defmethod eclector.parse-result:make-skipped-input-result
-    ((client my-client) (stream t) (reason t) (children t) (source t))
-  (list :reason reason :source source :children children))
-
-(defmethod eclector.reader:evaluate-expression ((client my-client) (expression t))
-  (list 'read-eval expression))
-
-(defmethod eclector.reader:fixup ((client my-client) obj state)
-  (declare (ignore obj state))
-  (error "TODO handle circular lists, ask how eclector does it"))
-
-;; TODO reimplement this but with structure sharing to handle quasiquote
-;; (defun transform (form &optional (wrap-in-list t))
-;;   (flet ((maybe-wrap (thing)
-;;            (if wrap-in-list
-;;                `(list ,thing)
-;;                thing)))
-;;     (typecase form
-;;       ((cons (eql unquote))
-;;        (maybe-wrap (second form)))
-;;       ((cons (eql unquote-splicing))
-;;        (second form))
-;;       (t
-;;        (maybe-wrap (transform-quasiquote-argument form))))))
-
-;; (defun transform-compound (compound)
-;;   (labels ((rec (object)
-;;              (typecase object
-;;                ((cons t (or (not cons) (cons (eql unquote))))
-;;                 (list (transform (car object)) (transform (cdr object) nil)))
-;;                ((cons t (cons (eql unquote-splicing)))
-;;                 (error 'unquote-splicing-in-dotted-list
-;;                        :argument (second object)))
-;;                (t
-;;                 (list* (transform (car object)) (rec (cdr object)))))))
-;;     (rec compound)))
-
-;; (defun transform-quasiquote-argument (argument)
-;;   (typecase argument
-;;     ((cons (eql unquote))
-;;      (second argument))
-;;     ((cons (eql unquote-splicing))
-;;      (error "unquote splice at top"))
-;;     (cons
-;;      `(append ,@(transform-compound argument)))
-;;     ((and vector (not string))
-;;      `(apply #'vector
-;;              ,(transform-quasiquote-argument
-;;                (coerce argument 'list))))
-;;     (t
-;;      `(quote ,argument))))
-
-;; (defun expand (form)
-;;   (if (atom form)
-;;       form
-;;       (let ((expanded (cons (expand (car form)) (expand (cdr form)))))
-;;         (if (eq (first expanded) 'quasiquote)
-;;             (transform-quasiquote-argument (second expanded))
-;;             expanded))))
-
-;; (defmacro quasiquote (&whole form argument)
-;;   (declare (ignore argument))
-;;   (expand form))
-
-;; (defmacro unquote ()
-;;   (error "comma outside backquote"))
-;; (defmacro unquote-splicing ()
-;;   (error "comma-at outside backquote"))
-
-;; (defun read-translate (form)
-;;   (labels ((translate-no-quasiquote (form)
-;;              (if (atom form)
-;;                  form
-;;                  (case (car form)
-;;                    (read-function `(function ,(translate-no-quasiquote (second form))))
-;;                    (read-quote `(quote ,(translate-no-quasiquote (second form))))
-;;                    (t (mapcar #'translate-no-quasiquote form))))))
-;;     (translate-no-quasiquote (eclector.reader::expand form))))
-
-;;
 ;;; class defs: mainly we want a structure that's
 ;;; - close enough to s-expressions for macroexpansion and evaluation
 ;;; - has tags for tree-structured dispatch (minimal passing of context through wrappers)
@@ -160,7 +45,7 @@
   ((str :initarg :str
         :accessor str)
    (kind :initarg :kind
-         :initform :line :type (or :line :block)
+         :initform :line :type (or (eql :line) (eql :block))
          :accessor kind))
   (:documentation ""))
 
@@ -168,7 +53,8 @@
   ())
 
 (defclass eval-form ()
-  ()
+  ((typ :initform nil
+        :accessor typ))
   (:documentation "Form in an evaluation context, perhaps quoted."))
 
 (defclass literal (eval-form atom-form)
@@ -232,6 +118,9 @@
 These are specific to the `node' type."
   (node (error "must provide parent node"))
   (id nil))
+
+(defmethod print-object ((object comment) stream)
+  (format stream "<~a>" (str object)))
 
 (defmethod print-object ((object literal) stream)
   (format stream "<lit: ~a>" (str object)))
@@ -469,7 +358,7 @@ copy-env can exploit structure sharing, remember to PUSH!"
                        (wrap-tag-env (tags env)))))
 
 (declaim (type simple-vector *hardwired-operators*))
-(defparameter *hardwired-operators* #(*literal-magic* lambda defun defmethod defmacro)
+(defparameter *hardwired-operators* #(lambda defun defmethod defmacro)
   "The list of nonportable hardwired macros, not macroexpanded")
 
 (defun hardwired-p (macro-name)
@@ -562,7 +451,7 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
                            (list (list call-name (funcall on-binder x)) value
                                  (funcall on-binder supplied-p))))
                         (_ (funcall value-mapper elt)))))
-             (if (find elt lambda-list-keywords)
+             (if (member elt lambda-list-keywords)
                  (push elt res)
                  (push (map-param elt) res))) ; invalid
         finally (return (nreverse res))))
@@ -573,7 +462,7 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
         for this = (car rest)
         do (cond ((member this '(&body &rest &key &optional &aux) :test 'eq)
                   (return (nreconc res (map-lambda-list rest on-binder value-mapper nil))))
-                 ((find this lambda-list-keywords) (push this res))
+                 ((member this lambda-list-keywords) (push this res))
                  ((consp this) (push (map-macro-lambda this on-binder value-mapper) res))
                  ((null this) (push nil res))
                  ((symbolp this) (push (funcall on-binder this) res))
@@ -713,7 +602,7 @@ Any binding forces a symbol match."
          (,@(loop for name in (remove-duplicates toplevel-parts :test 'equal)
                   collect `(,name :initarg ,(make-keyword name)
                                   :accessor ,name))))
-       ,(when (find 'body toplevel-parts)
+       ,(when (member 'body toplevel-parts)
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
        (defmethod copy-node ((old ,classname))
          (let ((new (make-instance ',classname)))
@@ -1113,12 +1002,6 @@ Any binding forces a symbol match."
            (lambda (form env) (disp (list form env)))
            (lambda (binder kind) (disp (list binder kind)))))
 
-(defun literal-parser (form env walker)
-  (declare (ignore walker env))
-  (make-instance 'literal :str (second form)))
-(setf (gethash '*literal-magic* *special-parsers*) 'literal-parser)
-(setf (gethash '*literal-magic* *special-walkers*) (constantly nil))
-
 (defform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
   :binds ((fun-code :function name :block name)))
 
@@ -1309,7 +1192,6 @@ Any binding forces a symbol match."
 ;;
 ;;; macro analysis via perturbation
 ;;
-;; TODO detect non-parametric, effectful macros
 (defun macro-call-envmap (form env &optional (walker (constantly nil)))
   "Identifies body forms and binding scopes to return a map of {sexp -> binding env}.
 Walks subforms of the call using WALKER during analysis."
@@ -1477,3 +1359,155 @@ Walks subforms of the call using WALKER during analysis."
     ((list (eql 'vars) (type integer) (eql 0)) 'binder)
     ((list (eql 'vars) (type integer) (type integer)) 'eval-form)
     ((type integer) 'eval-form)))
+
+;;
+;;; eclector reader
+;;
+(defclass my-client (eclector.parse-result:parse-result-client)
+  ((source :initarg :source
+           :initform (error "no source")
+           :reader source)
+   (uneval-data :initform (make-hash-table)
+                :reader uneval-data)
+   (trailing-data :initform (make-hash-table)
+                  :reader trailing-data)))
+
+;; and or not
+(defclass read-cond ()
+  ((stuff :initarg :stuff
+          :initform (error "no stuff")
+          :reader stuff
+          :documentation "may include comments between the conditional and object")
+   (flags :initarg :flags
+          :initform (error "no flags")
+          :reader flags)
+   (kind :initarg :kind
+         :initform (error "no kind")
+         :reader kind
+         :type (or (eql #\+) (eql #\-)))))
+
+(defmethod print-object ((object read-cond) stream)
+  (format stream "<~a~a ~a>" (kind object) (flags object) (stuff object)))
+
+(defstruct read-conditional result)
+
+(defmethod eclector.parse-result:make-expression-result
+    ((client my-client) (result t) (children t) (source t))
+  (if (null children)
+      (if (and (atom result) (constantp result)
+               (not (eq nil result)))
+          (let* ((s (subseq (source client) (car source) (cdr source)))
+                 (c (schar s 0)))
+            (cond ((char= c #\:) result)
+                  ((and (keywordp result) (= (- (cdr source) (car source))
+                                             (length (string result))))
+                   (make-read-conditional :result result))
+                  (t
+                   (make-instance 'literal :str s))))
+          (progn
+            (assert (symbolp result))
+            (make-instance 'symbol-ref :name result)))
+      ;; compound form, or some wrapper
+      (flet ((frob-cons ()
+               (let ((conds (count-if #'read-conditional-p children)))
+                 (if (plusp conds)
+                     (if (< 1 conds)
+                         (make-read-conditional
+                          :result (mapcar #'(lambda (c) (if (read-conditional-p c)
+                                                       (read-conditional-result c)
+                                                       c))
+                                          children))
+                         (let ((read-cond-pos
+                                 (position-if #'read-conditional-p children))
+                               (form (lastcar children)))
+                           (loop
+                             for c on children
+                             for i below read-cond-pos
+                             do (push (car c) (gethash form (uneval-data client)))
+                             finally (push (make-instance
+                                            'read-cond
+                                            :kind (schar (source client)
+                                                         (1+ (car source)))
+                                            :flags (car c)
+                                            :stuff (cdr c))
+                                           (gethash form (uneval-data client))))
+                           (lastcar children)))
+                     (loop with comments = nil
+                           with res = (list)
+                           for c in children
+                           do (if (not (typep c 'comment))
+                                  (progn
+                                    (nconcf (gethash c (uneval-data client)) comments)
+                                    (push c res)
+                                    (setf comments nil))
+                                  (push c comments))
+                           finally ()
+                                   (return (nreverse res)))))))
+        (if (consp result)
+            (case (car result)
+              (function (if (eq 'function (first children))
+                            children
+                            `(read-function ,@children)))
+              (quote (if (eq 'quote (first children))
+                         children
+                         `(read-quote ,@children)))
+              ;; XXX technically wrong semantics, but only here in this package.
+              ;; Could use a typed representation instead
+              (%read-eval `(read-eval ,@children))
+              (eclector.reader:quasiquote `(eclector.reader:quasiquote ,@children))
+              (eclector.reader:unquote `(eclector.reader:unquote ,@children))
+              (eclector.reader:unquote-splicing
+               `(eclector.reader:unquote-splicing ,@children))
+              (t (frob-cons)))
+            (frob-cons)))))
+
+(defmethod eclector.parse-result:make-skipped-input-result
+    ((client my-client) (stream t) (reason t) (children t) (source t))
+  (flet ((source-str (start end)
+           (subseq (source client) start end)))
+    (trivia:cmatch reason
+      ((cons (eql :line-comment) (type integer))
+       (assert (null children))
+       (make-instance 'comment :kind :line
+                               :str (source-str (car source) (1- (cdr source)))))
+      ((eql :block-comment)
+       (assert (null children))
+       (make-instance 'comment :kind :block
+                               :str (source-str (car source) (cdr source))))
+      ((cons (eql :sharpsign-plus) res)
+       (print children)
+       (make-instance 'read-cond :kind #\+ :flags res :stuff (rest children)))
+      ((cons (eql :sharpsign-minus) res)
+       (make-instance 'read-cond :kind #\- :flags res :stuff (rest children)))
+      ((eql '*read-suppress*)
+       (assert (null children))
+       (source-str (car source) (cdr source))))))
+
+(defmethod eclector.reader:evaluate-expression ((client my-client) (expression t))
+  (list '%read-eval expression))
+
+(defmethod eclector.reader:fixup ((client my-client) obj state)
+  (declare (ignore obj state))
+  (error "TODO handle circular lists, check eclector parse-result suite"))
+
+(defun read-translate (form)
+  "expand reader macro representations, should be called prior to actual
+macroexpansion."
+  (labels ((expand-read (form)
+             (if (atom form)
+                 form
+                 (case (car form)
+                   (read-function `(function ,(expand-read (second form))))
+                   (read-quote `(quote ,(expand-read (second form))))
+                   (t (mapcar #'expand-read form))))))
+    (expand-read (eclector.reader::expand form))))
+
+(defun parse-from-string (s)
+  (let ((client (make-instance 'my-client :source s)))
+    (multiple-value-bind (form len leading-comments)
+        (eclector.parse-result:read-from-string client s)
+      (declare (ignore len))
+      (let ((res
+              (parse form (make-env :%function-bindings '((read-eval))))))
+        (setf (gethash res (uneval-data client)) leading-comments)
+        (uneval-data client)))))
