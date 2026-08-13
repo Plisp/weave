@@ -5,7 +5,6 @@
 (uiop:define-package #:weave-utils
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
-           #:lfind #:findcdr-if
            #:list-insert #:list-update #:list-remove
            #:with-lookup #:or-f #:+fail+
            #:string-drop
@@ -19,24 +18,14 @@
        (format ,stream "~%~s~%|> ~s~%" ',form ,res)
        ,res)))
 
-(defun addr-str (obj)
+(defun addr-str (obj &optional (len 3))
   (let* ((str (delete-if (lambda (c) (member c '(#\# #\< #\> #\Space #\{ #\})))
                          (with-output-to-string (s)
                            (print-unreadable-object (obj s :identity t)))))
          (length (length str)))
-    (if (>= length 3)
-        (subseq str (- length 3))
+    (if (>= length len)
+        (subseq str (- length len))
         str)))
-
-(defun lfind (item list &key (key 'identity) (test 'eql) (start 0) (end (length list)))
-  "NIL-detecting version of find for lists, only searches forwards"
-  (declare (optimize speed)
-           (type fixnum start end)
-           (type list list))
-  (assert (<= 0 start end (length list)))
-  (loop for elt in (nthcdr start list)
-        do (when (funcall (the function test) item (funcall (the function key) elt))
-             (return (values elt t)))))
 
 (defun list-insert (list item i)
   "functional insertion, may share structure"
@@ -48,11 +37,6 @@
 
 (defun list-remove (list i)
   `(,@(subseq list 0 i) ,@(nthcdr (1+ i) list)))
-
-(defun findcdr-if (pred list)
-  (loop for c on list
-        do (when (funcall pred (car c))
-             (return c))))
 
 (defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
   (with-gensyms (blockname present-p)

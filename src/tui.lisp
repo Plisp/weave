@@ -185,9 +185,9 @@ Returns the new ast and location relative to the updated node."
     (save-history ui))
   ;; perform the insertion
   (let ((newloc (ast-replace location (constantly newnode)
-                             (findcdr-if (lambda (l) (eq (location-node location)
-                                                    (location-node l)))
-                                         (stack ui)))))
+                             (member-if (lambda (l) (eq (location-node location)
+                                                   (location-node l)))
+                                        (stack ui)))))
     (setf (future ui) nil
           (focus ui) newloc
           (edit-loc ui) newloc)))
