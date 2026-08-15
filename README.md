@@ -1,5 +1,6 @@
-# Semantic structural editing for lisp
+# WIP lisp structural editor and gradual typechecker
 
-Currently mainly testing on sbcl and ccl due to non-standard macroexpansions.
-Ask me on discord if you have any questions :D I have a bunch of preliminary notes that
-are too long to be worth typing up.
+Currently mainly testing on sbcl due to non-standard macroexpansions.
+The purpose of structural editing is partially proven ergonomics (see: vim, paredit)
+and to have incremental accurate type analysis and tracking of image state.
+Ask me on discord if you have any questions :D

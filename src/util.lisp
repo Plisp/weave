@@ -38,7 +38,7 @@
 (defun list-remove (list i)
   `(,@(subseq list 0 i) ,@(nthcdr (1+ i) list)))
 
-(defmacro with-lookup ((name (&rest mvcall) &optional default) &body then)
+(defmacro with-lookup ((name (&rest mvcall) &optional otherwise) &body then)
   (with-gensyms (blockname present-p)
     `(block ,blockname
        (multiple-value-bind (,name ,present-p)
@@ -46,7 +46,7 @@
          (when ,present-p
            (return-from ,blockname (progn ,@then))))
        ;; don't leak name to the else branch
-       ,default)))
+       ,otherwise)))
 
 (define-modify-macro or-f (&rest forms) or)
 
