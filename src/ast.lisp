@@ -125,11 +125,11 @@ These are specific to the `node' type."
 
 (defmethod print-object ((object symbol-ref) stream)
   (pprint-logical-block (stream (list))
-    (format stream "~a@~a" (name object) (addr-str object))))
+    (format stream "<var ~a@~a>" (name object) (addr-str object))))
 
 (defmethod print-object ((object binder) stream)
   (pprint-logical-block (stream (list))
-    (format stream "~a@~a" (name object) (addr-str object))))
+    (format stream "<bind ~a@~a>" (name object) (addr-str object))))
 
 (defmethod print-object ((object function-call) stream)
   (pprint-logical-block (stream (body object) :suffix ")>")
@@ -222,7 +222,7 @@ List structure may share conses with the old node."))
   (trivia:cmatch id
     ((eql 'name) (name node))
     ((eql 'body) (body node))
-    ((type integer) (nth id (body node)))))
+    ((list (eql 'body) (and (type integer) i)) (nth i (body node)))))
 
 (defmethod update ((node function-call) id new-value)
   (trivia:cmatch id
@@ -230,12 +230,12 @@ List structure may share conses with the old node."))
      (make-instance 'function-call :name new-value :body (body node)))
     ((eql 'body)
      (make-instance 'function-call :name (name node) :body new-value))
-    ((type integer)
+    ((list (eql 'body) (and (type integer) i))
      (let ((old-body (body node)))
        (make-instance 'function-call :name (name node)
-                                     :body `(,@(subseq old-body 0 id)
+                                     :body `(,@(subseq old-body 0 i)
                                              ,new-value
-                                             ,@(nthcdr (1+ id) old-body)))))))
+                                             ,@(nthcdr (1+ i) old-body)))))))
 
 ;;
 ;;; code walking
@@ -1047,7 +1047,7 @@ Any binding forces a symbol match.
     ((eql 'body) (body node))
     ((eql 'vars) (vars node))
     ((eql 'decls) (decls node))
-    ((and (type integer) i) (nth i (body node)))
+    ((list (eql 'body) (and (type integer) i)) (nth i (body node)))
     ((list (eql 'vars) (and (type integer) i))
      (nth i (vars node)))
     ((list (eql 'vars) (and (type integer) i) (eql 0))
@@ -1065,11 +1065,11 @@ Any binding forces a symbol match.
      (make-instance 'let*-form :vars (vars node) :body (body node) :decls new-value))
     ((eql 'vars)
      (make-instance 'let*-form :vars new-value :body (body node) :decls (decls node)))
-    ((type integer)
+    ((list (eql 'body) (and (type integer) i))
      (let ((old-body (body node)))
        (make-instance 'let*-form :vars (vars node)
                                  :decls (decls node)
-                                 :body (list-update old-body new-value id))))
+                                 :body (list-update old-body new-value i))))
     ((list (eql 'vars) (and (type integer) i))
      (let ((old-body (vars node)))
        (make-instance 'let*-form :vars (list-update old-body new-value i)
@@ -1249,7 +1249,7 @@ Walks subforms of the call using WALKER during analysis."
                                 (push newpath (gethash subform raw-form->loc)))))))
         (walk-call-collecting-forms raw (list)))
       ;; - macroexpand fully up to special (or hardwired macro) forms,
-      ;;   and record all binders and obvious evaluation contexts seen in the output
+      ;;   record *only* binders and obvious evaluation contexts seen in the output
       ;; - call the walker meanwhile
       (walk-form (env-macroexpand raw env) env
                  (lambda (form env)
@@ -1341,8 +1341,7 @@ Walks subforms of the call using WALKER during analysis."
                                (calc-bindings))
                          nil)))))))
           (disp (hash-table-plist eval->binders))
-          (disp call)
-          eval->binders)))))
+          (values call eval->binders))))))
 
 ;; test:
 ;; (loop for it from 1 to 10
@@ -1401,12 +1400,14 @@ Walks subforms of the call using WALKER during analysis."
   (trivia:match id
     ;; XXX can be lambda, but does anyone besides trivia internals use this?
     ((eql 'name) 'symbol-ref)
-    ((type integer) 'eval-form)))
+    ((eql 'body) 'body)
+    ((list (eql 'body) (type integer)) 'eval-form)))
 (defmethod location-kind ((node let*-form) id)
   (trivia:match id
     ((list (eql 'vars) (type integer) (eql 0)) 'binder)
     ((list (eql 'vars) (type integer) (type integer)) 'eval-form)
-    ((type integer) 'eval-form)))
+    ((eql 'body) 'body)
+    ((list (eql 'body) (type integer)) 'eval-form)))
 
 ;;
 ;;; eclector reader
