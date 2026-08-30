@@ -108,20 +108,24 @@ If this returns NIL, propagate up the cursor stack.")
    (node-views :initform (make-hash-table)
                :accessor node-views)))
 
+(defclass hole ()
+  ((text :initarg :text
+         :initform (error "hole text not provided")
+         :accessor text
+         :type simple-string)))
+(defun hole (&optional (text "")) (make-instance 'hole :text text))
+(defmethod parse:name ((o hole)) "hole")
+
 (defun ui-rect (ui)
   (tui:make-rect :x 0 :y 0 :rows (tui:rows ui) :cols (tui:cols ui)))
 
 (defun focus (ui)
   (car (stack ui)))
 
+;; no update
 (defmethod parse:get-location ((node ui) id)
   (declare (ignore id))
   (ast node))
-
-(defmethod parse:update ((ui ui) id new-value)
-  (declare (ignore id))
-  (setf (ast ui) new-value)
-  ui)
 
 (defmethod parse:location-kind ((ui ui) id)
   (declare (ignore id))
@@ -159,17 +163,27 @@ If this returns NIL, propagate up the cursor stack.")
   "Requires that (location-node `loc') = (location-node (car `stack')).
 Functionally rebuilds the path from `loc' out to the root, applying `updater' to
 the value at `loc', but retaining the current focus. Returns the new stack and root."
+  ;; (flet ((rebuild (stack newnode newstack)
+  ;;          (let ((head (car stack)))
+  ;;            (if (typep (location-node head) 'ui)
+  ;;                (nreverse newstack)
+  ;;                (rebuild (cdr stack)
+  ;;                         (update (location-node head) (location-id head) newnode)
+  ;;                         (cons (make-location :node newnode :id (location-id head))
+  ;;                               newstack))))))
+  ;;   (rebuild stack
+  ;;            (update (location-node loc) (location-id loc)
+  ;;                    (funcall updater (getloc loc)))
+  ;;            ()))
   (assert (eq (location-node loc) (location-node (car stack))))
   (let ((newnode (update (location-node loc) (location-id loc)
                          (funcall updater (getloc loc)))))
     (do ((frames stack (cdr frames))
-         ;; node is the rebuilt (location-node (car frames))
          (node newnode (update (location-node (cadr frames))
                                (location-id (cadr frames))
                                node))
          (rebuilt (list) (cons (make-location :node node :id (location-id (car frames)))
                                rebuilt)))
-        ;; stop before the sentinel: it has no parent
         ((typep (location-node (cadr frames)) 'ui)
          (values (nreconc (cons (make-location :node node :id (location-id (car frames)))
                                 rebuilt)
@@ -266,7 +280,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defvar *default-key-handlers* (make-hash-table :test 'equal))
 (defvar *global-key-handlers* (make-hash-table :test 'equal))
 (defun global-key-handler (node location ui)
-  " handler may return t to stop propagation up the stack"
+  "handler may return t to stop propagation up the stack"
   (lambda (view event)
     (slog event)
     (assert (location= location (focus ui)))
@@ -301,6 +315,60 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                                        (mk-string-metrics:damerau-levenshtein s name))))
                     (setf candidates valid)))))))
     ))
+
+(defun fname (node)
+  (parse:name (parse:name node)))
+
+;; note: assumes length 1 symbol mapping for <= and >=
+(defparameter *arb-arity-binops* #("/" "*" "+" "-" "<" ">" "<=" ">=" "=" "/="))
+(defun binop-precedence (op)
+  (trivia:ematch (string op)
+    ((or "*" "/") 3)
+    ((or "+" "-") 2)
+    ((or "<" ">" "<=" ">=" "=" "/=") 1)))
+
+(defun is-binop-call (node)
+  (and (typep node 'parse:function-call)
+       (find (fname node) *arb-arity-binops* :test #'string=)))
+
+(defun wrap-arith (op ui)
+  "take first arithmetic operator with greater precedence than `op'
+if none, surround current atom"
+  (when (eq (lockind (car (stack ui))) 'parse:eval-form)
+    (loop for stack = (stack ui) then (cdr stack)
+          for loc in (stack ui)
+          for node = (location-node loc)
+          while (and (is-binop-call node)
+                     (> (binop-precedence (fname node)) (binop-precedence op)))
+          finally (let ((sym (make-instance 'parse:symbol-ref :name op))
+                        (loc (car stack)))
+                    (swap-node loc
+                               (make-instance 'parse:function-call
+                                              :name sym
+                                              :body (list (getloc loc) (hole)))
+                               ui)
+                    (descend ui '(parse:body 1)))
+                  (return t))))
+
+(setf (gethash (tui-sys:make-event :kind #\+) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (wrap-arith '+ ui)))
+
+(setf (gethash (tui-sys:make-event :kind #\-) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (wrap-arith '- ui)))
+
+(setf (gethash (tui-sys:make-event :kind #\*) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (wrap-arith '* ui)))
+
+(setf (gethash (tui-sys:make-event :kind #\/) *global-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (wrap-arith '/ ui)))
 
 (setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
       (lambda (view ui)
@@ -380,35 +448,51 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
           (slog* (format nil "goal col is ~d" new-goal))
           (setf (goal-col ui) new-goal))))))
 
+(defun move-down (view ui)
+  (atom-move (lambda (atom-array this-rect)
+               (view-below atom-array (1+ (tui:rect-y this-rect)) (goal-col ui)))
+             view ui))
+
 (setf (gethash (tui-sys:make-event :kind #\n :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (atom-move (lambda (atom-array this-rect)
-                     (view-below atom-array (1+ (tui:rect-y this-rect)) (goal-col ui)))
-                   view ui)))
+      #'move-down)
+(setf (gethash (tui-sys:make-event :kind :down-arrow) *default-key-handlers*)
+      #'move-down)
+
+(defun move-up (view ui)
+  (atom-move (lambda (atom-array this-rect)
+               (view-above atom-array (tui:rect-y this-rect) (goal-col ui)))
+             view ui))
 
 (setf (gethash (tui-sys:make-event :kind #\p :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (atom-move (lambda (atom-array this-rect)
-                     (view-above atom-array (tui:rect-y this-rect) (goal-col ui)))
-                   view ui)))
+      #'move-up)
+(setf (gethash (tui-sys:make-event :kind :up-arrow) *default-key-handlers*)
+      #'move-up)
+
+(defun move-left (view ui)
+  (atom-move
+   (lambda (atom-array this-rect)
+     (let ((view (view-left atom-array
+                            (tui:rect-y this-rect) (tui:rect-x this-rect))))
+       (values view (when view (tui:rect-x2 (tui:rect view))))))
+   view ui))
 
 (setf (gethash (tui-sys:make-event :kind #\b :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (atom-move
-         (lambda (atom-array this-rect)
-           (let ((view (view-left atom-array
-                                  (tui:rect-y this-rect) (tui:rect-x this-rect))))
-             (values view (when view (tui:rect-x2 (tui:rect view))))))
-         view ui)))
+      #'move-left)
+(setf (gethash (tui-sys:make-event :kind :left-arrow) *default-key-handlers*)
+      #'move-left)
+
+(defun move-right (view ui)
+  (atom-move
+   (lambda (atom-array this-rect)
+     (let ((view (view-right atom-array
+                             (tui:rect-y this-rect) (tui:rect-x2 this-rect))))
+       (values view (when view (tui:rect-x2 (tui:rect view))))))
+   view ui))
 
 (setf (gethash (tui-sys:make-event :kind #\f :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (atom-move
-         (lambda (atom-array this-rect)
-           (let ((view (view-right atom-array
-                                   (tui:rect-y this-rect) (tui:rect-x2 this-rect))))
-             (values view (when view (tui:rect-x2 (tui:rect view))))))
-         view ui)))
+      #'move-right)
+(setf (gethash (tui-sys:make-event :kind :right-arrow) *default-key-handlers*)
+      #'move-right)
 
 (defun move-parent (ui)
   (when-let (new-stack (parent-stack (stack ui)))
@@ -463,13 +547,6 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 
 ;;; hole
 ;; note: holes only replace symbols or evaluation contexts
-
-(defclass hole ()
-  ((text :initarg :text
-         :initform (error "hole text not provided")
-         :accessor text
-         :type simple-string)))
-(defun hole (&optional (text "")) (make-instance 'hole :text text))
 
 (defmethod parse:is-atom ((node hole)) t)
 (defmethod render-node ((node hole) stack context rect)
@@ -697,13 +774,13 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
         (let* ((fun-loc (car (stack ui)))
                (fun-node (location-node fun-loc))
                (id (location-id fun-loc))
-               (id (if (bodylike-id id) (1+ (id-index id)) 0)))
-          (if (= id (length (parse:body fun-node)))
+               (i (if (bodylike-id id) (1+ (id-index id)) 0)))
+          (if (= i (length (parse:body fun-node)))
               (progn
                 (save-history ui)
                 (ast-insert (hole) (make-location :node fun-node :id 'parse:body)
-                            id ui))
-              (refocus ui id)))))
+                            i ui))
+              (refocus ui (list 'parse:body i))))))
 
 (setf (gethash (tui-sys:make-event :kind #\newline) *fun-key-handlers*)
       (lambda (ui)
@@ -726,8 +803,6 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
           (setf list (cdr list)
                 index (+ 1 index)))))))
 
-;; note: assumes length 1 symbol mapping for <= and >=
-(defparameter *arb-arity-binops* #("*" "+" "-" "<" ">" "<=" ">=" "=" "/="))
 (define-constant +top-left+ (name-char "U1CE16") :test #'equal)
 (define-constant +bot-left+ (name-char "U1CE17") :test #'equal)
 (define-constant +top-right+ (name-char "U1CE18") :test #'equal)
@@ -738,8 +813,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 ;; - for 2 arg division, draw horizontally. maybe future: (f)floor/ceiling/truncate
 (defmethod render-node ((node parse:function-call) stack context rect)
   (cond
-    ((and (typep (parse:name node) 'parse:symbol-ref)
-          (string= (parse:name (parse:name node)) "/")
+    ;; note this case must go first since division is a binop
+    ((and (string= (fname node) "/")
           (= 2 (length (parse:body node))))
      (let* ((location (car stack))
             (arg1-view (render-node (first (parse:body node))
@@ -781,16 +856,14 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                       :key-handler (global-key-handler node location context)
                       :focused (location= location (focus context)))))
     ;; need wrapper for args
-    ((and (typep (parse:name node) 'parse:symbol-ref)
-          (find (parse:name (parse:name node)) *arb-arity-binops* :test #'string=)
+    ((and (find (fname node) *arb-arity-binops* :test #'string=)
           (= 2 (length (parse:body node))))
-     (labels ((is-call-to (node f)
-                (and (typep node 'parse:function-call)
-                     (typep (parse:name node) 'parse:symbol-ref)
-                     (string= f (parse:name (parse:name node)))))
-              (is-bracketed (arg)
-                (and (is-call-to node "*")
-                     (or (is-call-to arg "+") (is-call-to arg "-")))))
+     (flet ((is-bracketed (arg)
+              (and (is-binop-call node) (is-binop-call arg)
+                   (or (> (binop-precedence (fname node)) (binop-precedence (fname arg)))
+                       (and (string= (fname node) "-")
+                            (or (string= (fname arg) "+")
+                                (string= (fname arg) "-")))))))
        (let* ((location (car stack))
               (arg1 (first (parse:body node)))
               (arg1-bracketed (is-bracketed arg1))
@@ -1033,7 +1106,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                             :body (or (loop repeat args collect (hole))
                                                       (list (hole))))))
                       (swap-node (focus ui) function-node ui)
-                      (descend ui (if (plusp args) 0 'parse:name))))
+                      (descend ui (if (plusp args) '(parse:body 0) 'parse:name))))
                    ((eq (parse:lockind (focus ui)) 'parse:symbol-ref)
                     (let* ((oldbody (parse:body (location-node (focus ui))))
                            (function-node
@@ -1103,7 +1176,61 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                              (refocus ui (move-back (location-node child-loc) id))))
                        t))))))))
 
-;; slurp
+(setf (gethash (tui-sys:make-event :kind :right-arrow :controlp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (let* ((stack (stack ui))
+               (loc (car stack))
+               (up (location-node loc))
+               (ploc (cadr stack))
+               (upup (location-node ploc)))
+          (when (and (is-binop-call up) (is-binop-call upup)
+                     (trivia:match (location-id ploc)
+                       ((list (eql 'parse:body) (eql 0)) t))
+                     (trivia:match (location-id loc)
+                       ((list (eql 'parse:body) (eql 1)) t)))
+            (swap-node (caddr stack)
+                       (make-instance
+                        'parse:function-call
+                        :name (parse:name up)
+                        :body (list (first (parse:body up))
+                                    (make-instance
+                                     'parse:function-call
+                                     :name (parse:name upup)
+                                     :body (list (second (parse:body up))
+                                                 (second (parse:body upup))))))
+                       ui)
+            (descend ui '(parse:body 1))
+            (descend ui '(parse:body 0))))))
+
+(setf (gethash (tui-sys:make-event :kind :left-arrow :controlp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (let* ((stack (stack ui))
+               (loc (car stack))
+               (up (location-node loc))
+               (ploc (cadr (stack ui)))
+               (upup (location-node ploc)))
+          (when (and (is-binop-call up) (is-binop-call upup)
+                     (trivia:match (location-id ploc)
+                       ((list (eql 'parse:body) (eql 1)) t))
+                     (trivia:match (location-id loc)
+                       ((list (eql 'parse:body) (eql 0)) t)))
+            (swap-node (caddr stack)
+                       (make-instance
+                        'parse:function-call
+                        :name (parse:name up)
+                        :body (list (make-instance
+                                     'parse:function-call
+                                     :name (parse:name upup)
+                                     :body (list (first (parse:body upup))
+                                                 (first (parse:body up))))
+                                    (second (parse:body up))))
+                       ui)
+            (descend ui '(parse:body 0))
+            (descend ui '(parse:body 1))))))
+
+;; slurp - TODO generalise to inorder successor
 (setf (gethash (tui-sys:make-event :kind #\) :altp t) *default-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
@@ -1144,7 +1271,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                   until (typep node 'parse:eval-form)
                   finally (swap-node loc focus-node ui))))))
 
-;; ;; barf
+;; barf
 ;; (setf (gethash (tui-sys:make-event :kind #\} :altp t) *default-key-handlers*)
 ;;       (lambda (view ui)
 ;;         (declare (ignore view))

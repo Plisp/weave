@@ -18,6 +18,7 @@
            #:location-kind #:lockind
 
            #:eval-form #:symbol-ref #:binder #:function-call #:literal
+           #:unevaluated
            #:body #:name #:str #:vars #:op
            ))
 (in-package #:weave-parser)
@@ -172,7 +173,6 @@ These are specific to the `node' type."
                                             (subform-asts o))
                                    new)
                    :eval-binders (eval-binders o)
-                   :gensym-names (gensym-names o)
                    :body (body o) :op (op o)))
   (:method ((o function-code))
     (make-instance 'function-code
@@ -420,13 +420,13 @@ does not touch hardwired operators."
   "Requires a list but otherwise doesn't force well-formedness and tries to be very
 tolerant. Previous calls to ON-BINDER give exactly the environment of VALUE-MAPPER calls.
 Reconstructs the list structure from the return values of ON-BINDER and VALUE-MAPPER."
-  (loop with seen-opt-key-aux := nil
+  (loop with seen-keyword := nil
         with res := (list)
         for elt in list
-        do (when (member (unwrap-refs elt) '(&optional &rest &key &aux))
-             (setf seen-opt-key-aux t))
+        do (when (member (unwrap-refs elt) lambda-list-keywords)
+             (setf seen-keyword t))
            (labels ((maybe-default (val)
-                      (if (and specializer-list-p (not seen-opt-key-aux))
+                      (if (and specializer-list-p (not seen-keyword))
                           val
                           (funcall value-mapper val)))
                     (map-param (elt)
@@ -437,24 +437,20 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
                          (funcall on-binder x))
                         ;; default value or specializer
                         ((list (and (type symbol-like) x) val)
-                         (let ((value (maybe-default val)))
-                           (list (funcall on-binder x) value)))
+                         `(,(funcall on-binder x) ,(maybe-default val)))
                         ;; supplied-p
                         ((list (and (type symbol-like) x) val
                                (and (type symbol-like) supplied-p))
-                         (let ((value (maybe-default val)))
-                           (list (funcall on-binder x) value
-                                 (funcall on-binder supplied-p))))
+                         `(,(funcall on-binder x) ,(maybe-default val)
+                           ,(funcall on-binder supplied-p)))
                         ;; keyword name
                         ((list (list call-name (and (type symbol-like) x)) val)
-                         (let ((value (maybe-default val)))
-                           (list (list call-name (funcall on-binder x)) value)))
+                         `((,call-name ,(funcall on-binder x)) ,(maybe-default val)))
                         ;; everything
                         ((list (list call-name (and (type symbol-like) x)) val
                                (and (type symbol-like) supplied-p))
-                         (let ((value (maybe-default val)))
-                           (list (list call-name (funcall on-binder x)) value
-                                 (funcall on-binder supplied-p))))
+                         `((,call-name ,(funcall on-binder x)) ,(maybe-default val)
+                           ,(funcall on-binder supplied-p)))
                         (_ (funcall value-mapper elt)))))
              (if (member (unwrap-refs elt) lambda-list-keywords)
                  (push elt res)
@@ -517,6 +513,105 @@ if applicable."
             (t ; lone patterns must be symbols
              (assert (symbolp (car spec)))
              (cons (list (car spec)) (spec-names (cdr spec)))))))
+
+  ;;; location method generation
+  (defun bind-tag-name (bind-tag)
+    "The tag named by a BINDS plist entry: X, (< X), (= X) and (X data) all name X."
+    (if (consp bind-tag)
+        (if (member (car bind-tag) '(< =)) (second bind-tag) (first bind-tag))
+        bind-tag))
+
+  (defun binder-tag-p (tag binds)
+    (loop for (nil . entries) in binds
+          thereis (loop for (nil bind-tag) on entries by #'cddr
+                        thereis (eq tag (bind-tag-name bind-tag)))))
+
+  (defun eval-ctx-p (tag binds)
+    (loop for (ctx) in binds thereis (eq tag ctx)))
+
+  (defun tag-kind (tag binds)
+    "The location-kind of a spec tag. BINDS says only whether a position is
+evaluated or a binder. Anything else is unevaluated."
+    (cond ((eval-ctx-p tag binds) 'eval-form)
+          ((binder-tag-p tag binds) 'binder)
+          (t 'unevaluated)))
+
+  (defun location-methods (name classname parts rest-patterns binds)
+    "Emits the get-location/update/location-kind methods for a defform class.
+PARTS is the SPEC-NAMES alist (tag . arity-1-keyword). Slots are addressable by
+symbol name, elements of a list slot by (name index) and for a &rest slot
+with a REST-PATTERNS entry, locations within an element are (name index i)."
+    (let ((slots (remove-duplicates (mapcar #'car parts) :test #'eq))
+          (get-clauses (list))
+          (update-clauses (list))
+          (kind-clauses (list)))
+      (flet ((rebuild (slot value)
+               `(make-instance ',classname
+                               ,@(loop for s in slots
+                                       append `(,(make-keyword s)
+                                                ,(if (eq s slot) value `(,s node)))))))
+        (push `((eql 'op) ',name) get-clauses)
+        (loop
+          for part in slots
+          for kind = (cdr (assoc part parts))
+          do (push `((eql ',part) (,part node)) get-clauses)
+             (push `((eql ',part) ,(rebuild part 'new-value)) update-clauses)
+             (when (member kind '(&rest &body))
+               (push `((list (eql ',part) (and (type integer) i))
+                       (nth i (,part node)))
+                     get-clauses)
+               (push `((list (eql ',part) (and (type integer) i))
+                       ,(rebuild part `(list-update (,part node) new-value i)))
+                     update-clauses))
+             ;; rest patterns
+             (case kind
+               (&body
+                (push `((list (eql ',part) (type integer)) 'eval-form) kind-clauses))
+               (&rest
+                (when-let (pattern (cdr (assoc part rest-patterns)))
+                  ;; XXX let specific, match before arbitrary j below
+                  (when (trivia:match pattern
+                          ((list* (eql '&or) (type symbol) _) t))
+                    (push `((list (eql ',part) (and (type integer) i) (eql 0))
+                            (ensure-car (nth i (,part node))))
+                          get-clauses)
+                    (push `((list (eql ',part) (and (type integer) i) (eql 0))
+                            (let ((p (nth i (,part node))))
+                              ,(rebuild part `(list-update
+                                               (,part node)
+                                               (if (atom p)
+                                                   new-value
+                                                   (list-update p new-value 0))
+                                               i))))
+                          update-clauses))
+                  ;; list access
+                  (push `((list (eql ',part) (and (type integer) i)
+                                (and (type integer) j))
+                          (nth j (nth i (,part node))))
+                        get-clauses)
+                  (push `((list (eql ',part) (and (type integer) i)
+                                (and (type integer) j))
+                          ,(rebuild part `(list-update
+                                           (,part node)
+                                           (list-update (nth i (,part node)) new-value j)
+                                           i)))
+                        update-clauses)
+                  (loop for tag in (remove-duplicates
+                                    (remove-if (lambda (s) (find s *parser-keywords*))
+                                               (flatten pattern)))
+                        for j from 0
+                        do (push `((list (eql ',part) (type integer) (eql ,j))
+                                   ',(tag-kind tag binds))
+                                 kind-clauses))))
+               ((nil)
+                (push `((eql ',part) ',(tag-kind part binds)) kind-clauses)))))
+
+      `((defmethod get-location ((node ,classname) id)
+          (trivia:cmatch id ,@(nreverse get-clauses)))
+        (defmethod update ((node ,classname) id new-value)
+          (trivia:cmatch id ,@(nreverse update-clauses)))
+        (defmethod location-kind ((node ,classname) id)
+          (trivia:match id ,@(nreverse kind-clauses))))))
 
   (defun search-tree (o tree)
     (declare (optimize speed))
@@ -616,6 +711,7 @@ Any binding forces a symbol match.
          (let ((new (make-instance ',classname)))
            ,@(loop for name in (remove-duplicates toplevel-parts :test #'equal)
                    collect `(setf (,name new) (copy-node (,name old))))))
+       ,@(location-methods name classname (spec-names spec) rest-patterns binds)
        ;; exports
        (export ',classname)
        ,@(loop for name in (remove-duplicates toplevel-parts :test #'equal)
@@ -1031,6 +1127,7 @@ Any binding forces a symbol match.
 (defform (let (&rest vars)
            &declarations decls
            &body body)
+  ;; XXX should be (name &body init)
   :rest-patterns ((vars . (&or name (name init))))
   :binds ((init) (body :variable name)))
 
@@ -1040,57 +1137,6 @@ Any binding forces a symbol match.
   :rest-patterns ((vars . (&or name (name init))))
   :binds ((init :variable (< name))
           (body :variable name)))
-
-(defmethod get-location ((node let*-form) id)
-  (trivia:cmatch id
-    ((eql 'op) 'let*)
-    ((eql 'body) (body node))
-    ((eql 'vars) (vars node))
-    ((eql 'decls) (decls node))
-    ((list (eql 'body) (and (type integer) i)) (nth i (body node)))
-    ((list (eql 'vars) (and (type integer) i))
-     (nth i (vars node)))
-    ((list (eql 'vars) (and (type integer) i) (eql 0))
-     (let ((p (nth i (vars node))))
-       (if (symbolp p) p (car p))))
-    ((list (eql 'vars) (and (type integer) i) (and (type integer) init))
-     (let ((p (nth i (vars node))))
-       (nth init p)))))
-
-(defmethod update ((node let*-form) id new-value)
-  (trivia:cmatch id
-    ((eql 'body)
-     (make-instance 'let*-form :vars (vars node) :body new-value :decls (decls node)))
-    ((eql 'decls)
-     (make-instance 'let*-form :vars (vars node) :body (body node) :decls new-value))
-    ((eql 'vars)
-     (make-instance 'let*-form :vars new-value :body (body node) :decls (decls node)))
-    ((list (eql 'body) (and (type integer) i))
-     (let ((old-body (body node)))
-       (make-instance 'let*-form :vars (vars node)
-                                 :decls (decls node)
-                                 :body (list-update old-body new-value i))))
-    ((list (eql 'vars) (and (type integer) i))
-     (let ((old-body (vars node)))
-       (make-instance 'let*-form :vars (list-update old-body new-value i)
-                                 :decls (decls node)
-                                 :body (body node))))
-    ((list (eql 'vars) (and (type integer) i) (eql 0))
-     (let* ((old-body (vars node))
-            (p (nth i old-body)))
-       (make-instance 'let*-form :vars (list-update old-body (if (symbolp p)
-                                                                 new-value
-                                                                 (cons new-value (cdr p)))
-                                                    i)
-                                 :decls (decls node)
-                                 :body (body node))))
-    ((list (eql 'vars) (and (type integer) i) (and (type integer) p-idx))
-     (let* ((old-body (vars node))
-            (p (nth i old-body)))
-       (make-instance 'let*-form
-                      :vars (list-update old-body (list-update p new-value p-idx) i)
-                      :decls (decls node)
-                      :body (body node))))))
 
 (defform (alexandria:when-let* (&or (name init) (&rest vars))
            &body body)
@@ -1399,14 +1445,8 @@ Walks subforms of the call using WALKER during analysis."
 (defmethod location-kind ((node function-call) id)
   (trivia:match id
     ;; XXX can be lambda, but does anyone besides trivia internals use this?
+    ;; ensure that (name lambda) = "lambda" is defined for totality
     ((eql 'name) 'symbol-ref)
-    ((eql 'body) 'body)
-    ((list (eql 'body) (type integer)) 'eval-form)))
-(defmethod location-kind ((node let*-form) id)
-  (trivia:match id
-    ((list (eql 'vars) (type integer) (eql 0)) 'binder)
-    ((list (eql 'vars) (type integer) (type integer)) 'eval-form)
-    ((eql 'body) 'body)
     ((list (eql 'body) (type integer)) 'eval-form)))
 
 ;;
