@@ -15,7 +15,7 @@
            #:update
            #:get-location #:getloc
 
-           #:location-kind #:lockind
+           #:location-sort #:locsort
 
            #:eval-form #:symbol-ref #:binder #:function-call #:literal
            #:unevaluated
@@ -197,18 +197,14 @@ These are specific to the `node' type."
 (defgeneric to-sexp (ast) (:documentation "convert to sexp for macroexpansion")
   (:method ((ast t)) nil))
 
-(defgeneric location-kind (node id))
+(defgeneric location-sort (node id))
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'."))
 (defun getloc (location)
   (get-location (location-node location) (location-id location)))
-(defun lockind (location)
-  (location-kind (location-node location) (location-id location)))
+(defun locsort (location)
+  (location-sort (location-node location) (location-id location)))
 
-(defgeneric is-body (node id)
-  (:documentation "A body form is suitable for structural editing operations.")
-  (:method (node id) nil)
-  (:method (node (id (eql 'body))) t))
 (defgeneric update (node id new-value)
   (:documentation "Functionally updates the location corresponding to `id',
 returns a new node with all child nodes identical except the hole indicated.
@@ -491,14 +487,13 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
                                     &lambda &method-lambda &macro-lambda))
   (defparameter *arity-1-parser-keywords* '(&rest &body
                                             &lambda &method-lambda &macro-lambda))
-  (defun spec-names (spec)
-    "Validates the spec and returns an alist of tag names and their arity-1 specifier
-if applicable."
+  (defun spec-kinds (spec)
+    "Validates the spec and returns an alist of tag names and their arity-1 keyword."
     (flet ((spec-keyword-p (sym)
              (member sym *parser-keywords* :test #'eq)))
       (cond ((null spec) nil)
             ((consp (car spec)) ; list pattern
-             (append (spec-names (car spec)) (spec-names (cdr spec))))
+             (append (spec-kinds (car spec)) (spec-kinds (cdr spec))))
             ;; spec keyword, expect a non-NIL symbol immediately after, except for &or
             ((spec-keyword-p (car spec))
              (assert (or (not (eq (car spec) '&or))
@@ -507,12 +502,25 @@ if applicable."
                     (assert (= 2 (length spec)))
                     (list (cons (second spec) (car spec))))
                    ((member (car spec) '(&declarations &rest-qualifiers) :test #'eq)
-                    (cons (cons (second spec) (car spec)) (spec-names (cddr spec))))
+                    (cons (cons (second spec) (car spec)) (spec-kinds (cddr spec))))
                    (t
-                    (spec-names (cdr spec)))))
+                    (spec-kinds (cdr spec)))))
             (t ; lone patterns must be symbols
              (assert (symbolp (car spec)))
-             (cons (list (car spec)) (spec-names (cdr spec)))))))
+             (cons (list (car spec)) (spec-kinds (cdr spec)))))))
+
+  (defun search-tree (o tree)
+    (declare (optimize speed))
+    (if (atom tree)
+        (eq o tree)
+        (or (search-tree o (car tree))
+            (some (lambda (m) (search-tree o m)) (cdr tree)))))
+
+  (defstruct function-info
+    (arglist nil)
+    (documentation nil :type (or null string))
+    (decls nil)
+    (body nil))
 
   ;;; location method generation
   (defun bind-tag-name (bind-tag)
@@ -529,22 +537,78 @@ if applicable."
   (defun eval-ctx-p (tag binds)
     (loop for (ctx) in binds thereis (eq tag ctx)))
 
-  (defun tag-kind (tag binds)
-    "The location-kind of a spec tag. BINDS says only whether a position is
-evaluated or a binder. Anything else is unevaluated."
+  (defun tag-sort (tag binds)
+    "The location-sort of a spec tag. TODO update for lambdas"
     (cond ((eval-ctx-p tag binds) 'eval-form)
           ((binder-tag-p tag binds) 'binder)
           (t 'unevaluated)))
 
-  (defun location-methods (name classname parts rest-patterns binds)
-    "Emits the get-location/update/location-kind methods for a defform class.
-PARTS is the SPEC-NAMES alist (tag . arity-1-keyword). Slots are addressable by
-symbol name, elements of a list slot by (name index) and for a &rest slot
-with a REST-PATTERNS entry, locations within an element are (name index i)."
-    (let ((slots (remove-duplicates (mapcar #'car parts) :test #'eq))
+  (defun rest-pattern-tags (pattern)
+    (trivia:ematch pattern
+      ((list (eql '&or) (type symbol) inner) (rest-pattern-tags inner))
+      ((list binder-tag value-kind value-tag)
+       (values binder-tag value-tag value-kind))
+      ((list binder-tag value-tag)
+       (values binder-tag value-tag nil))))
+
+  (defun check-binds (tag-kinds rest-patterns binds)
+    (let ((bind-rest-tags nil))
+      ;; &body must be evaluated
+      (loop for (sym . kind) in tag-kinds
+            do (when (eq kind '&body)
+                 (assert (eval-ctx-p sym binds))))
+      ;; check consistency of binds
+      (loop
+        for (ctx . entries) in binds
+        do (assert (symbolp ctx))
+           ;; rest forms must not be evaluated
+           (assert (not (eq '&rest (cdr (assoc ctx tag-kinds)))))
+           (loop
+             with special-seen := nil
+             for (kind bind-tag) on entries by #'cddr
+             do (trivia:ematch bind-tag
+                  ((type symbol))
+                  ((list (or (eql '<) (eql '=)) (and (type symbol) bind-name))
+                   ;; only one allowed for now, change when pattern matching
+                   (assert (not special-seen))
+                   (setf special-seen t)
+                   ;; for now = only for blocks, seq binding only for variables
+                   (when (eq (car bind-tag) '=) (assert (eq kind :block)))
+                   (when (eq (car bind-tag) '<) (assert (eq kind :variable)))
+                   (loop
+                     for (rest-tag . pattern) in rest-patterns
+                     do (when (search-tree bind-name pattern)
+                          (assert (search-tree ctx pattern))
+                          (assert
+                           (trivia:match pattern
+                             ((list (eql bind-name) (eql ctx))
+                              (push (cons bind-name rest-tag) bind-rest-tags))
+                             ((list (eql bind-name) keyword (eql ctx))
+                              (when (member keyword *arity-1-parser-keywords*)
+                                (push (cons bind-name rest-tag) bind-rest-tags)))
+                             ((list* (eql '&or) rest)
+                              (loop
+                                for pattern in rest
+                                thereis (trivia:match pattern
+                                          ((list (eql bind-name) (eql ctx))
+                                           (push (cons bind-name rest-tag)
+                                                 bind-rest-tags))
+                                          ((list (eql bind-name) keyword (eql ctx))
+                                           (when (member keyword *arity-1-parser-keywords*)
+                                             (push (cons bind-name rest-tag)
+                                                   bind-rest-tags)))))))))))
+                  ;; non < = so macro binding
+                  ((list (type symbol) (type symbol))))))
+      bind-rest-tags))
+
+  (defun location-methods (name classname spec-kinds rest-patterns binds)
+    "Emits the get-location/update/location-sort methods for a defform class.
+PARTS is the SPEC-NAMES alist (tag . arity-1-keyword). Elements of a list slot
+are addressed by (name index) and rest-patterns by (name index i)."
+    (let ((slots (mapcar #'car spec-kinds))
           (get-clauses (list))
           (update-clauses (list))
-          (kind-clauses (list)))
+          (sort-clauses (list)))
       (flet ((rebuild (slot value)
                `(make-instance ',classname
                                ,@(loop for s in slots
@@ -553,7 +617,7 @@ with a REST-PATTERNS entry, locations within an element are (name index i)."
         (push `((eql 'op) ',name) get-clauses)
         (loop
           for part in slots
-          for kind = (cdr (assoc part parts))
+          for kind = (cdr (assoc part spec-kinds))
           do (push `((eql ',part) (,part node)) get-clauses)
              (push `((eql ',part) ,(rebuild part 'new-value)) update-clauses)
              (when (member kind '(&rest &body))
@@ -563,68 +627,49 @@ with a REST-PATTERNS entry, locations within an element are (name index i)."
                (push `((list (eql ',part) (and (type integer) i))
                        ,(rebuild part `(list-update (,part node) new-value i)))
                      update-clauses))
-             ;; rest patterns
+             ;; sorts
              (case kind
                (&body
-                (push `((list (eql ',part) (type integer)) 'eval-form) kind-clauses))
+                (push `((list (eql ',part) (type integer)) 'eval-form) sort-clauses))
                (&rest
                 (when-let (pattern (cdr (assoc part rest-patterns)))
-                  ;; XXX let specific, match before arbitrary j below
-                  (when (trivia:match pattern
-                          ((list* (eql '&or) (type symbol) _) t))
-                    (push `((list (eql ',part) (and (type integer) i) (eql 0))
-                            (ensure-car (nth i (,part node))))
+                  (multiple-value-bind (binder-tag value-tag value-kind)
+                      (rest-pattern-tags pattern)
+                    ;; internally normalize lone binders to a list
+                    (push `((list (eql ',part) (and (type integer) i)
+                                  (and (type integer) j))
+                            (nth j (ensure-list (nth i (,part node)))))
                           get-clauses)
-                    (push `((list (eql ',part) (and (type integer) i) (eql 0))
-                            (let ((p (nth i (,part node))))
-                              ,(rebuild part `(list-update
-                                               (,part node)
-                                               (if (atom p)
-                                                   new-value
-                                                   (list-update p new-value 0))
-                                               i))))
-                          update-clauses))
-                  ;; list access
-                  (push `((list (eql ',part) (and (type integer) i)
-                                (and (type integer) j))
-                          (nth j (nth i (,part node))))
-                        get-clauses)
-                  (push `((list (eql ',part) (and (type integer) i)
-                                (and (type integer) j))
-                          ,(rebuild part `(list-update
-                                           (,part node)
-                                           (list-update (nth i (,part node)) new-value j)
-                                           i)))
-                        update-clauses)
-                  (loop for tag in (remove-duplicates
-                                    (remove-if (lambda (s) (find s *parser-keywords*))
-                                               (flatten pattern)))
-                        for j from 0
-                        do (push `((list (eql ',part) (type integer) (eql ,j))
-                                   ',(tag-kind tag binds))
-                                 kind-clauses))))
+                    (push `((list (eql ',part) (and (type integer) i)
+                                  (and (type integer) j))
+                            ,(rebuild part `(list-update
+                                             (,part node)
+                                             (list-update
+                                              (ensure-list (nth i (,part node)))
+                                              new-value j)
+                                             i)))
+                          update-clauses)
+                    ;; this has to be checked first
+                    (push `((list (eql ',part) (type integer) (eql 0))
+                            ',(tag-sort binder-tag binds))
+                          sort-clauses)
+                    ;; logic for body, or singular value
+                    (when (member value-kind '(nil &body))
+                      (push `((list (eql ',part) (type integer)
+                                    ,(if (eq value-kind '&body)
+                                         '(type integer)
+                                         '(eql 1)))
+                              ',(tag-sort value-tag binds))
+                            sort-clauses)))))
                ((nil)
-                (push `((eql ',part) ',(tag-kind part binds)) kind-clauses)))))
+                (push `((eql ',part) ',(tag-sort part binds)) sort-clauses)))))
 
       `((defmethod get-location ((node ,classname) id)
           (trivia:cmatch id ,@(nreverse get-clauses)))
         (defmethod update ((node ,classname) id new-value)
           (trivia:cmatch id ,@(nreverse update-clauses)))
-        (defmethod location-kind ((node ,classname) id)
-          (trivia:match id ,@(nreverse kind-clauses))))))
-
-  (defun search-tree (o tree)
-    (declare (optimize speed))
-    (if (atom tree)
-        (eq o tree)
-        (or (search-tree o (car tree))
-            (some (lambda (m) (search-tree o m)) (cdr tree)))))
-
-  (defstruct function-info
-    (arglist nil)
-    (documentation nil :type (or null string))
-    (decls nil)
-    (body nil)))
+        (defmethod location-sort ((node ,classname) id)
+          (trivia:match id ,@(nreverse sort-clauses)))))))
 
 (defmacro defform ((name &rest spec) &key binds rest-patterns)
   "Generates an AST type and scope parser associated with a macro or
@@ -643,80 +688,32 @@ Binding tag names **must not** be (member NIL < =). For each ctx, may have eithe
 `=` to indicate a rest entry in which parallel block bindings occur
 Any binding forces a symbol match.
 
-`on-binder' may be called multiple times by the walker, ensure idempotency.
-"
-  (let ((spec-parser-name (symbolicate name "-SPEC-PARSER"))
-        (classname (symbolicate name "-FORM"))
-        (custom-bind-rest-labels nil)
-        (tag-kinds (nconc (spec-names spec)
-                          (mapcan (lambda (pair) (spec-names (cdr pair)))
-                                  rest-patterns)))
-        (toplevel-parts (mapcar 'car (spec-names spec))))
-    ;; &body must be evaluated
-    (loop for (sym . kind) in tag-kinds
-          do (when (eq kind '&body)
-               (assert (loop for (ctx . entries) in binds
-                             thereis (eq ctx sym)))))
-    ;; check consistency of binds
-    (loop for (ctx . entries) in binds
-          do (assert (symbolp ctx))
-             ;; rest forms must not be evaluated
-             (assert (not (eq '&rest (cdr (assoc ctx tag-kinds)))))
-             (loop
-               with special-seen := nil
-               for (kind bind-tag) on entries by #'cddr
-               do (trivia:ematch bind-tag
-                    ((type symbol))
-                    ((list (or (eql '<) (eql '=)) bind-name)
-                     (assert (symbolp bind-name))
-                     ;; only one allowed for now, change when pattern matching
-                     (assert (not special-seen))
-                     (setf special-seen t)
-                     ;; for now = only used for blocks
-                     (when (eq (car bind-tag) '=) (assert (or (eq kind :block))))
-                     (when (eq (car bind-tag) '<) (assert (or (eq kind :variable))))
-                     (loop
-                       for (rest-tag . pattern) in rest-patterns
-                       do (when (search-tree bind-name pattern)
-                            (assert (search-tree ctx pattern))
-                            (assert
-                             (trivia:match pattern
-                               ((list (eql bind-name) (eql ctx))
-                                (push (cons bind-name rest-tag) custom-bind-rest-labels))
-                               ((list (eql bind-name) keyword (eql ctx))
-                                (when (member keyword *arity-1-parser-keywords*)
-                                  (push (cons bind-name rest-tag) custom-bind-rest-labels)))
-                               ((list* (eql '&or) rest)
-                                (loop
-                                  for pattern in rest
-                                  thereis
-                                  (trivia:match pattern
-                                    ((list (eql bind-name) (eql ctx))
-                                     (push (cons bind-name rest-tag)
-                                           custom-bind-rest-labels))
-                                    ((list (eql bind-name) keyword (eql ctx))
-                                     (when (member keyword *arity-1-parser-keywords*)
-                                       (push (cons bind-name rest-tag)
-                                             custom-bind-rest-labels)))))))))))
-                    ((list (type symbol) (type symbol))))))
+`on-binder' may be called multiple times by the walker, ensure idempotency."
+  (let* ((spec-parser-name (symbolicate name "-SPEC-PARSER"))
+         (tag-kinds (nconc (spec-kinds spec)
+                           (mapcan (lambda (pair) (spec-kinds (cdr pair)))
+                                   rest-patterns)))
+         (bind-rest-tags (check-binds tag-kinds rest-patterns binds))
+         (classname (symbolicate name "-FORM"))
+         (slots (mapcar #'car (spec-kinds spec))))
     `(progn
        (defclass ,classname (irregular-form)
-         (,@(loop for name in (remove-duplicates toplevel-parts :test #'equal)
+         (,@(loop for name in (remove-duplicates slots :test #'equal)
                   collect `(,name :initarg ,(make-keyword name)
                                   :accessor ,name))))
        ;; methods
-       ,(when (member 'body toplevel-parts)
+       ,(when (member 'body slots)
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
        (defmethod copy-node ((old ,classname))
          (let ((new (make-instance ',classname)))
-           ,@(loop for name in (remove-duplicates toplevel-parts :test #'equal)
+           ,@(loop for name in (remove-duplicates slots :test #'equal)
                    collect `(setf (,name new) (copy-node (,name old))))))
-       ,@(location-methods name classname (spec-names spec) rest-patterns binds)
+       ,@(location-methods name classname (spec-kinds spec) rest-patterns binds)
        ;; exports
        (export ',classname)
-       ,@(loop for name in (remove-duplicates toplevel-parts :test #'equal)
+       ,@(loop for name in (remove-duplicates slots :test #'equal)
                collect `(export ',name))
-       ;; spec validated above by spec-names ^
+       ;; spec validated above by spec-kinds ^
        (defmacro ,spec-parser-name (spec)
          (with-gensyms (form body decls doc qualifiers)
            (cond
@@ -726,14 +723,7 @@ Any binding forces a symbol match.
                    (form-parse-error "expected null, got ~a" ,form))))
              ((atom spec)
               `(lambda (,form)
-                 (when (and ,(some ; is binder?, check symbol if so
-                              (lambda (ctx-entries)
-                                (loop for (kind tag) on (cdr ctx-entries) by #'cddr
-                                      thereis (trivia:match tag
-                                                ((eql spec) t)
-                                                ((cons (eql spec) _) t)
-                                                ((cons _ (eql spec)) t))))
-                              ',binds)
+                 (when (and ,(binder-tag-p spec ',binds) ; check symbol if binder
                             (not (or (typep ,form 'symbol) (typep ,form 'symbol-ref))))
                    (form-parse-error "expected binder symbol match: ~a" ,form))
                  (push ,form ,spec)))
@@ -842,22 +832,12 @@ Any binding forces a symbol match.
                (declare (ignorable env walker on-binder))
                (,(symbolicate "WITH-PARSED-" name) rawform
                 ,@(loop for (ctx-tag . entries) in binds
-                        append
+                        append ; shapes validated by `check-binds'
                         (loop for (kind record) on entries by #'cddr
                               while record
-                              collect (trivia:ematch record
-                                        ((list (or (eql '<) (eql '=)) name)
-                                         (with-gensyms (b)
-                                           `(loop for ,b in ,name
-                                                  do (funcall on-binder ,b ,kind))))
-                                        ((list name _) ; macro
-                                         (with-gensyms (b)
-                                           `(loop for ,b in ,name
-                                                  do (funcall on-binder ,b ,kind))))
-                                        ((type symbol)
-                                         (with-gensyms (b)
-                                           `(loop for ,b in ,record
-                                                  do (funcall on-binder ,b ,kind)))))))
+                              collect (with-gensyms (b)
+                                        `(loop for ,b in ,(bind-tag-name record)
+                                               do (funcall on-binder ,b ,kind)))))
                 ,@
                 (loop
                   for (ctx-tag . %entries) in binds
@@ -878,20 +858,20 @@ Any binding forces a symbol match.
                                       `(map-macro-lambda
                                         (function-info-arglist ,info)
                                         #'note-binder
-                                          (lambda (form) ; capture direct reference vvv
-                                            (funcall walker form newenv-with-params)))
+                                        (lambda (form) ; capture direct reference vvv
+                                          (funcall walker form newenv-with-params)))
                                       `(map-lambda-list
                                         (function-info-arglist ,info)
                                         #'note-binder
-                                          (lambda (form)
-                                            (funcall walker form newenv-with-params))
-                                          ,(eq ctx-kind '&method-lambda))))
+                                        (lambda (form)
+                                          (funcall walker form newenv-with-params))
+                                        ,(eq ctx-kind '&method-lambda))))
                                     with newenv-with-params := ,env
                                     for body-form in (function-info-body ,info)
                                     do (funcall walker body-form ,augmented-body))))
                       (cond
                         (seq-tag ; only for let*-style variable bindings
-                         (let ((whole-tag (cdr (assoc seq-tag custom-bind-rest-labels))))
+                         (let ((whole-tag (cdr (assoc seq-tag bind-rest-tags))))
                            (with-gensyms (newenv whole initform)
                              `(or
                                ;; first detect whether a rest pattern was matched at all
@@ -902,10 +882,10 @@ Any binding forces a symbol match.
                                      then (if (symbolp ,whole)
                                               (env-with-variables ,newenv `(,,whole))
                                               (env-with-variables ,newenv `(,(car ,whole))))
-                                   for ,whole in (reverse (first ,whole-tag))
+                                   for ,whole in (first ,whole-tag)
                                    do (when (listp ,whole)
                                         ,(if ctx-kind
-                                             `(loop for bodyform in (second ,whole)
+                                             `(loop for bodyform in (cdr ,whole)
                                                     do (funcall walker bodyform ,newenv))
                                              `(funcall walker (second ,whole) ,newenv))))
                                  t)
@@ -918,7 +898,7 @@ Any binding forces a symbol match.
                            ((&body &rest &declarations &rest-qualifiers nil)
                             (error "unimplemented"))
                            ((&lambda &macro-lambda &method-lambda)
-                            (let* ((whole (cdr (assoc par-tag custom-bind-rest-labels)))
+                            (let* ((whole (cdr (assoc par-tag bind-rest-tags)))
                                    (code-tag (lastcar (cdr (assoc whole rest-patterns)))))
                               (with-gensyms (newenv name info)
                                 `(loop
@@ -953,7 +933,7 @@ Any binding forces a symbol match.
                 (let ((ast (make-instance ',classname)))
                   ,@
                   (loop
-                    for tag in toplevel-parts
+                    for tag in slots
                     for entries := (plist-alist (cdr (assoc tag binds)))
                     for tag-kind := (cdr (assoc tag tag-kinds))
                     collect
@@ -975,14 +955,14 @@ Any binding forces a symbol match.
                                             `(map-macro-lambda
                                               (function-info-arglist ,info)
                                               #'note-binder
-                                                (lambda (form)
-                                                  (funcall walker form newenv-with-params)))
+                                              (lambda (form)
+                                                (funcall walker form newenv-with-params)))
                                             `(map-lambda-list
                                               (function-info-arglist ,info)
                                               #'note-binder
-                                                (lambda (form)
-                                                  (funcall walker form newenv-with-params))
-                                                ,(eq tag-kind '&method-lambda))))
+                                              (lambda (form)
+                                                (funcall walker form newenv-with-params))
+                                              ,(eq tag-kind '&method-lambda))))
                                 for body-form in (function-info-body ,info)
                                 for body-ast = (funcall walker body-form ,augment-body)
                                 do (push body-ast body)
@@ -993,19 +973,17 @@ Any binding forces a symbol match.
                                            'function-code
                                            :docstring (function-info-documentation ,info)
                                            :declarations (function-info-decls ,info)
-                                           :body (reverse body)
+                                           :body (nreverse body)
                                            :lambda-list lambda-list)))))
                       (cond
                         ;; &rest special logic
                         ((eq tag-kind '&rest)
                          (trivia:ematch (cdr (assoc tag rest-patterns))
-                           ;; single variable binding
                            ((or (list name-tag value-tag)
-                                (list (eql '&or) name-tag (list (eql name-tag) value-tag))
-                                ;; allow for multiple forms
                                 (list name-tag (eql '&body) value-tag)
-                                (list (eql '&or) name-tag (list (eql name-tag)
-                                                                (eql '&body) value-tag)))
+                                ;; let style binding
+                                (list (eql '&or) name-tag
+                                      (list (eql name-tag) (eql '&body) value-tag)))
                             (assert (and (symbolp name-tag) (symbolp value-tag)))
                             ;; let*-like
                             (let ((init-binds (plist-alist (cdr (assoc value-tag binds)))))
@@ -1015,11 +993,11 @@ Any binding forces a symbol match.
                                        with ,binder-env := +nullenv+
                                        with ,res := (list)
                                        for ,newenv := ,(augment-env `env init-binds)
-                                         then (if (typep ,whole 'symbol-ref)
+                                         then (if (typep ,whole 'binder)
                                                   (env-with-variables ,newenv `(,,whole))
                                                   (env-with-variables ,newenv
                                                                       `(,(car ,whole))))
-                                       for ,whole in (reverse (first ,tag))
+                                       for ,whole in (first ,tag)
                                        do (if (typep ,whole 'symbol-ref)
                                               (progn
                                                 (setf ,binder-env
@@ -1029,14 +1007,9 @@ Any binding forces a symbol match.
                                               (let* ((,b (first ,whole))
                                                      (,new-whole
                                                        `(,(change-class ,b 'binder)
-                                                         ,,(if (cdr
-                                                                (assoc value-tag tag-kinds))
-                                                               `(mapcar
-                                                                 (rcurry walker ,newenv)
-                                                                 (cdr ,whole))
-                                                               `(funcall walker
-                                                                         (second ,whole)
-                                                                         ,newenv)))))
+                                                         ,@(mapcar
+                                                            (rcurry walker ,newenv)
+                                                            (cdr ,whole)))))
                                                 (funcall alter-identity ,whole ,new-whole)
                                                 (push ,new-whole ,res)
                                                 (setf ,binder-env
@@ -1078,8 +1051,7 @@ Any binding forces a symbol match.
                                                  `(env-with-blocks newenv-with-params
                                                                    `(,,name)))
                                    do (push (cons (change-class ,name 'binder) ,fun) ,res)
-                                   finally (setf ,res (nreverse ,res))
-                                           (setf (,tag ast) ,res)
+                                   finally (setf (,tag ast) ,res)
                                            (funcall alter-identity (first ,tag) ,res)))))))
                         ;; non-&rest binder
                         ((loop for (ctx . %entries) in binds
@@ -1127,20 +1099,19 @@ Any binding forces a symbol match.
 (defform (let (&rest vars)
            &declarations decls
            &body body)
-  ;; XXX should be (name &body init)
-  :rest-patterns ((vars . (&or name (name init))))
+  :rest-patterns ((vars . (&or name (name &body init))))
   :binds ((init) (body :variable name)))
 
 (defform (let* (&rest vars)
            &declarations decls
            &body body)
-  :rest-patterns ((vars . (&or name (name init))))
+  :rest-patterns ((vars . (&or name (name &body init))))
   :binds ((init :variable (< name))
           (body :variable name)))
 
-(defform (alexandria:when-let* (&or (name init) (&rest vars))
+(defform (alexandria:when-let* (&or (name &body init) (&rest vars))
            &body body)
-  :rest-patterns ((vars . (name init)))
+  :rest-patterns ((vars . (name &body init)))
   :binds ((init :variable (< name))
           (body :variable name)))
 
@@ -1213,7 +1184,7 @@ Any binding forces a symbol match.
 (defform (the type-specifier form)
   :binds ((form)))
 
-(defform (tagbody &body body) ; TODO tags should be stored in env and not walked
+(defform (tagbody &body body)
   :binds ((body)))
 (defform (go tag))
 
@@ -1416,9 +1387,9 @@ Walks subforms of the call using WALKER during analysis."
                     (funcall
                      alter-identity form
                      (make-instance 'function-call
-                                     :name (parse (car form) env alter-identity)
-                                     :body (mapcar (rcurry #'parse env alter-identity)
-                                                   (cdr form)))))
+                                    :name (parse (car form) env alter-identity)
+                                    :body (mapcar (rcurry #'parse env alter-identity)
+                                                  (cdr form)))))
                   ;; don't expand explicitly, we only care about explicit call subforms
                   (parse-macro (form)
                     (let* ((macro-subforms (make-hash-table :test #'eq))
@@ -1442,10 +1413,10 @@ Walks subforms of the call using WALKER during analysis."
                    ((null local-expansion) (parse-function form))
                    (t (parse-macro form))))))))))
 
-(defmethod location-kind ((node function-call) id)
+(defmethod location-sort ((node function-call) id)
   (trivia:match id
     ;; XXX can be lambda, but does anyone besides trivia internals use this?
-    ;; ensure that (name lambda) = "lambda" is defined for totality
+    ;; ensure that (parse:name lambda) = "lambda" is defined for totality
     ((eql 'name) 'symbol-ref)
     ((list (eql 'body) (type integer)) 'eval-form)))
 
@@ -1478,6 +1449,7 @@ Walks subforms of the call using WALKER during analysis."
 (defmethod print-object ((object read-cond) stream)
   (format stream "<~a~a ~a>" (kind object) (flags object) (stuff object)))
 
+(defstruct read-evaluated form)
 (defstruct read-conditional result)
 
 (defmethod eclector.parse-result:make-expression-result
@@ -1534,40 +1506,41 @@ Walks subforms of the call using WALKER during analysis."
                                              (gethash form (uneval-data client))))
                              (lastcar children)))
                        (frobber)))))
-        (cond ((consp result)
-               (case (car result)
-                 ;; XXX does not support #+#.(foo) like in bt, nor comments in-between
-                 (function
-                  `(,(make-instance 'symbol-ref
-                                    :name (if (and (typep (first children) 'symbol-ref)
-                                                   (eq 'function (name (first children))))
-                                              'function 'read-function))
-                    ,(lastcar children)))
-                 (quote
-                  `(,(make-instance 'symbol-ref
-                                    :name (if (and (typep (first children) 'symbol-ref)
-                                                   (eq 'quote (name (first children))))
-                                              'quote 'read-quote))
-                    ,(lastcar children)))
-                 ;; XXX technically wrong semantics, but only here in this package.
-                 ;; Could use a typed representation instead.
-                 (%read-eval `(,(make-instance 'symbol-ref :name 'read-eval)
-                               ,(lastcar children)))
-                 (eclector.reader:quasiquote
-                  `(,(make-instance 'symbol-ref :name 'eclector.reader:quasiquote)
-                    ,(lastcar children)))
-                 (eclector.reader:unquote
-                  `(,(make-instance 'symbol-ref :name 'eclector.reader:unquote)
-                    ,(lastcar children)))
-                 (eclector.reader:unquote-splicing
-                  `(,(make-instance 'symbol-ref :name 'eclector.reader:unquote-splicing)
-                    ,(lastcar children)))
-                 (t (frob-cons))))
-              ((vectorp result) (apply #'vector (frobber)))
-              ;; should be read-conditional wrapped
-              (t
-               (assert (member-if #'read-conditional-p children))
-               (frob-cons))))))
+        (typecase result
+          (cons
+           (case (car result)
+             ;; XXX does not support #+#.(foo), this is relatively common
+             (function
+              `(,(make-instance 'symbol-ref
+                                :name (if (and (typep (first children) 'symbol-ref)
+                                               (eq 'function (name (first children))))
+                                          'function 'read-function))
+                ,(lastcar children)))
+             (quote
+              `(,(make-instance 'symbol-ref
+                                :name (if (and (typep (first children) 'symbol-ref)
+                                               (eq 'quote (name (first children))))
+                                          'quote 'read-quote))
+                ,(lastcar children)))
+             (eclector.reader:quasiquote
+              `(,(make-instance 'symbol-ref :name 'eclector.reader:quasiquote)
+                ,(lastcar children)))
+             (eclector.reader:unquote
+              `(,(make-instance 'symbol-ref :name 'eclector.reader:unquote)
+                ,(lastcar children)))
+             (eclector.reader:unquote-splicing
+              `(,(make-instance 'symbol-ref :name 'eclector.reader:unquote-splicing)
+                ,(lastcar children)))
+             (t
+              (frob-cons))))
+          (read-evaluated
+           `(,(make-instance 'symbol-ref :name 'read-eval)
+             ,(lastcar children)))
+          (vector (apply #'vector (frobber)))
+          ;; should be read-conditional wrapped
+          (t
+           (assert (member-if #'read-conditional-p children))
+           (frob-cons))))))
 
 (defmethod eclector.parse-result:make-skipped-input-result
     ((client my-client) (stream t) (reason t) (children t) (source t))
@@ -1592,7 +1565,7 @@ Walks subforms of the call using WALKER during analysis."
        (source-str (car source) (cdr source))))))
 
 (defmethod eclector.reader:evaluate-expression ((client my-client) (expression t))
-  (list '%read-eval expression))
+  (make-read-evaluated :form expression))
 
 (defmethod eclector.reader:fixup ((client my-client) obj state)
   (declare (ignore obj state))

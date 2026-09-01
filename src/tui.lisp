@@ -10,7 +10,7 @@
   (:use :cl #:alexandria-2 #:weave-utils)
   (:import-from #:weave-parser
                 #:location #:make-location #:location-node #:location-id #:location=
-                #:lockind #:getloc #:update)
+                #:locsort #:getloc #:update)
   (:local-nicknames (#:parse #:weave-parser)
                     (#:tui #:uncursed)
                     (#:tui-sys #:uncursed-sys))
@@ -127,7 +127,7 @@ If this returns NIL, propagate up the cursor stack.")
   (declare (ignore id))
   (ast node))
 
-(defmethod parse:location-kind ((ui ui) id)
+(defmethod parse:location-sort ((ui ui) id)
   (declare (ignore id))
   'parse:eval-form)
 
@@ -334,7 +334,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun wrap-arith (op ui)
   "take first arithmetic operator with greater precedence than `op'
 if none, surround current atom"
-  (when (eq (lockind (car (stack ui))) 'parse:eval-form)
+  (when (eq (locsort (car (stack ui))) 'parse:eval-form)
     (loop for stack = (stack ui) then (cdr stack)
           for loc in (stack ui)
           for node = (location-node loc)
@@ -581,7 +581,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 (defmethod handle-key ((node hole) view location ui event)
   (let ((c (tui:event-kind event)))
     (when (is-regular-char-event event)
-      (trivia:match (parse:lockind location)
+      (trivia:match (locsort location)
         ((eql 'parse:binder)
          (when (and (symbol-char-p c) (not (digit-char-p c)))
            (swap-node location (make-instance 'parse:binder :name (string-upcase c)) ui)))
@@ -1098,7 +1098,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                   count a))
                       (name-node (make-instance 'parse:symbol-ref :name s)))
                  (cond
-                   ((and (eq 'parse:eval-form (lockind (focus ui)))
+                   ((and (eq 'parse:eval-form (locsort (focus ui)))
                          (bodylike-id (location-id (focus ui))))
                     (let ((function-node
                             (make-instance 'parse:function-call
@@ -1107,7 +1107,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                                       (list (hole))))))
                       (swap-node (focus ui) function-node ui)
                       (descend ui (if (plusp args) '(parse:body 0) 'parse:name))))
-                   ((eq (parse:lockind (focus ui)) 'parse:symbol-ref)
+                   ((eq (locsort (focus ui)) 'parse:symbol-ref)
                     (let* ((oldbody (parse:body (location-node (focus ui))))
                            (function-node
                              (make-instance
@@ -1158,7 +1158,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
           (cond ((typep focused 'parse:eval-form)
                  (swap-node (focus ui) (hole) ui))
                 ;; note: this is not precise
-                ((and (eq 'parse:eval-form (lockind (focus ui)))
+                ((and (eq 'parse:eval-form (locsort (focus ui)))
                       (typep focused 'hole))
                  (let* ((location (focus ui))
                         (id (location-id location))
@@ -1230,7 +1230,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
             (descend ui '(parse:body 0))
             (descend ui '(parse:body 1))))))
 
-;; slurp - TODO generalise to inorder successor
+;; slurp
 (setf (gethash (tui-sys:make-event :kind #\) :altp t) *default-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
@@ -1285,7 +1285,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
         (let* ((loc (focus ui))
                (node (getloc loc)))
           (slog* `(cut ,node))
-          (when (lockind loc)
+          (when (locsort loc)
             (setf (cutbuffer ui)
                   (make-instance 'cutbuffer :location loc :content node))
             (swap-node loc (hole) ui))
@@ -1297,7 +1297,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
         ;; XXX more generic compatibility check for e.g. copying let bindings
         (let ((focus (focus ui))
               (cutbuffer (cutbuffer ui)))
-          (when (and (eq (lockind focus) (lockind (location cutbuffer))))
+          (when (and (eq (locsort focus) (locsort (location cutbuffer))))
             (swap-node focus (parse:copy-node (content cutbuffer)) ui))
           t)))
 
