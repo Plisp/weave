@@ -277,8 +277,8 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
       (setf (focus-rect context) rect))
     (values-list vals)))
 
-(defvar *default-key-handlers* (make-hash-table :test 'equal))
-(defvar *global-key-handlers* (make-hash-table :test 'equal))
+(defparameter *default-key-handlers* (make-hash-table :test 'equal))
+(defparameter *global-key-handlers* (make-hash-table :test 'equal))
 (defun global-key-handler (node location ui)
   "handler may return t to stop propagation up the stack"
   (lambda (view event)
@@ -323,8 +323,8 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defparameter *arb-arity-binops* #("/" "*" "+" "-" "<" ">" "<=" ">=" "=" "/="))
 (defun binop-precedence (op)
   (trivia:ematch (string op)
-    ((or "*" "/") 3)
-    ((or "+" "-") 2)
+    ((or "*") 3)
+    ((or "/" "+" "-") 2)
     ((or "<" ">" "<=" ">=" "=" "/=") 1)))
 
 (defun is-binop-call (node)
@@ -350,25 +350,15 @@ if none, surround current atom"
                     (descend ui '(parse:body 1)))
                   (return t))))
 
-(setf (gethash (tui-sys:make-event :kind #\+) *global-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (wrap-arith '+ ui)))
-
-(setf (gethash (tui-sys:make-event :kind #\-) *global-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (wrap-arith '- ui)))
-
-(setf (gethash (tui-sys:make-event :kind #\*) *global-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (wrap-arith '* ui)))
-
-(setf (gethash (tui-sys:make-event :kind #\/) *global-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (wrap-arith '/ ui)))
+(loop for s across *arb-arity-binops*
+      do (when (= 1 (length s))
+           (setf (gethash (tui-sys:make-event :kind (schar s 0) :altp t)
+                          *global-key-handlers*)
+                 ;; note: bug if we don't compute from s prior to its mutation by loop
+                 (let ((sym (intern s)))
+                   (lambda (view ui)
+                     (declare (ignore view))
+                     (wrap-arith sym ui))))))
 
 (setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
       (lambda (view ui)
@@ -749,18 +739,19 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
          (view
            (tui:horizontal-container
             rect
-            (flat-list-renderer l
-                                (lambda (index)
-                                  (make-location :node (location-node location)
-                                                 :id (append-id (location-id location) index)))
-                                (cdr stack) context))))
+            (flat-list-renderer
+             l
+             (lambda (index)
+               (make-location :node (location-node location)
+                              :id (append-id (location-id location) index)))
+             (cdr stack) context))))
     ;;
     (setf (tui:key-handler view) (global-key-handler l location context)
           (tui:focused view) (location= location (focus context)))
     view))
 
 ;;; function call
-(defvar *fun-key-handlers* (make-hash-table :test 'equal))
+(defparameter *fun-key-handlers* (make-hash-table :test 'equal))
 
 (defmethod handle-key ((node parse:function-call) view location ui event)
   ;; I don't expect function calls to have any special binds percolated up the tree
@@ -817,10 +808,11 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     ((and (string= (fname node) "/")
           (= 2 (length (parse:body node))))
      (let* ((location (car stack))
-            (arg1-view (render-node (first (parse:body node))
-                                    (cons (make-location :node node :id '(parse:body 0)) stack)
-                                    context
-                                    rect))
+            (arg1-view (render-node
+                        (first (parse:body node))
+                        (cons (make-location :node node :id '(parse:body 0)) stack)
+                        context
+                        rect))
             (arg1-rect (tui:rect arg1-view))
             (arg2-view (render-node
                         (second (parse:body node))
@@ -869,11 +861,13 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
               (arg1-bracketed (is-bracketed arg1))
               (arg1-view
                 (if arg1-bracketed
-                    (render-node arg1 (cons (make-location :node node :id '(parse:body 0)) stack)
+                    (render-node arg1
+                                 (cons (make-location :node node :id '(parse:body 0)) stack)
                                  context (tui:clamp-rect
                                           (tui:copy-rect rect :x (1+ (tui:rect-x rect)))
                                           rect))
-                    (render-node arg1 (cons (make-location :node node :id '(parse:body 0)) stack)
+                    (render-node arg1
+                                 (cons (make-location :node node :id '(parse:body 0)) stack)
                                  context rect)))
               (arg1-rect (tui:rect arg1-view))
               (op-view
@@ -886,7 +880,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
               (arg2 (second (parse:body node)))
               (arg2-bracketed (is-bracketed arg2))
               (arg2-view
-                (render-node arg2 (cons (make-location :node node :id '(parse:body 1)) stack)
+                (render-node arg2
+                             (cons (make-location :node node :id '(parse:body 1)) stack)
                              context (tui:clamp-rect
                                       (tui:copy-rect rect :x (1+ (tui:rect-x2 op-rect)))
                                       rect)))
@@ -947,10 +942,12 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                                     context rect))
             (name-rect (tui:rect name-view))
             (args-view (tui:vertical-container
-                        (tui:clamp-rect (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
-                                        rect)
+                        (tui:clamp-rect
+                         (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
+                         rect)
                         (list-renderer (parse:body node)
-                                       (lambda (i) (make-location :node node :id (list 'parse:body i)))
+                                       (lambda (i) (make-location :node node
+                                                             :id (list 'parse:body i)))
                                        stack context)))
             (args-rect (tui:rect args-view))
             (fun-rect (tui:clamp-rect
@@ -966,7 +963,7 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                       :focused (location= location (focus context)))))))
 
 ;;; let form
-(defvar *let-key-handlers* (make-hash-table :test 'equal))
+(defparameter *let-key-handlers* (make-hash-table :test 'equal))
 (defmethod handle-key ((node parse:let*-form) view location ui event)
   (when-let ((handler (gethash event *let-key-handlers*)))
     (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))

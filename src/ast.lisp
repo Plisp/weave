@@ -126,11 +126,11 @@ These are specific to the `node' type."
 
 (defmethod print-object ((object symbol-ref) stream)
   (pprint-logical-block (stream (list))
-    (format stream "<var ~a@~a>" (name object) (addr-str object))))
+    (format stream "<v ~s@~a>" (name object) (addr-str object))))
 
 (defmethod print-object ((object binder) stream)
   (pprint-logical-block (stream (list))
-    (format stream "<bind ~a@~a>" (name object) (addr-str object))))
+    (format stream "<b ~s@~a>" (name object) (addr-str object))))
 
 (defmethod print-object ((object function-call) stream)
   (pprint-logical-block (stream (body object) :suffix ")>")
@@ -522,34 +522,8 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
     (decls nil)
     (body nil))
 
-  ;;; location method generation
-  (defun bind-tag-name (bind-tag)
-    "The tag named by a BINDS plist entry: X, (< X), (= X) and (X data) all name X."
-    (if (consp bind-tag)
-        (if (member (car bind-tag) '(< =)) (second bind-tag) (first bind-tag))
-        bind-tag))
-
-  (defun binder-tag-p (tag binds)
-    (loop for (nil . entries) in binds
-          thereis (loop for (nil bind-tag) on entries by #'cddr
-                        thereis (eq tag (bind-tag-name bind-tag)))))
-
   (defun eval-ctx-p (tag binds)
     (loop for (ctx) in binds thereis (eq tag ctx)))
-
-  (defun tag-sort (tag binds)
-    "The location-sort of a spec tag. TODO update for lambdas"
-    (cond ((eval-ctx-p tag binds) 'eval-form)
-          ((binder-tag-p tag binds) 'binder)
-          (t 'unevaluated)))
-
-  (defun rest-pattern-tags (pattern)
-    (trivia:ematch pattern
-      ((list (eql '&or) (type symbol) inner) (rest-pattern-tags inner))
-      ((list binder-tag value-kind value-tag)
-       (values binder-tag value-tag value-kind))
-      ((list binder-tag value-tag)
-       (values binder-tag value-tag nil))))
 
   (defun check-binds (tag-kinds rest-patterns binds)
     (let ((bind-rest-tags nil))
@@ -600,6 +574,32 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
                   ;; non < = so macro binding
                   ((list (type symbol) (type symbol))))))
       bind-rest-tags))
+
+  ;;; location method generation
+  (defun bind-tag-name (bind-tag)
+    "The tag named by a BINDS plist entry: X, (< X), (= X) and (X data) all name X."
+    (if (consp bind-tag)
+        (if (member (car bind-tag) '(< =)) (second bind-tag) (first bind-tag))
+        bind-tag))
+
+  (defun binder-tag-p (tag binds)
+    (loop for (nil . entries) in binds
+          thereis (loop for (nil bind-tag) on entries by #'cddr
+                        thereis (eq tag (bind-tag-name bind-tag)))))
+
+  (defun tag-sort (tag binds)
+    "The location-sort of a spec tag. TODO update for lambdas"
+    (cond ((eval-ctx-p tag binds) 'eval-form)
+          ((binder-tag-p tag binds) 'binder)
+          (t 'unevaluated)))
+
+  (defun rest-pattern-tags (pattern)
+    (trivia:ematch pattern
+      ((list (eql '&or) (type symbol) inner) (rest-pattern-tags inner))
+      ((list binder-tag value-kind value-tag)
+       (values binder-tag value-tag value-kind))
+      ((list binder-tag value-tag)
+       (values binder-tag value-tag nil))))
 
   (defun location-methods (name classname spec-kinds rest-patterns binds)
     "Emits the get-location/update/location-sort methods for a defform class.
