@@ -412,59 +412,131 @@ does not touch hardwired operators."
 ;; we need to be more permissive for lambda lists. It makes little sense to preserve
 ;; well-formedness when it often breaks with edits due to positional &keyword context
 ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
-(defun map-lambda-list (list on-binder value-mapper specializer-list-p)
-  "Requires a list but otherwise doesn't force well-formedness and tries to be very
-tolerant. Previous calls to ON-BINDER give exactly the environment of VALUE-MAPPER calls.
-Reconstructs the list structure from the return values of ON-BINDER and VALUE-MAPPER."
-  (loop with seen-keyword := nil
-        with res := (list)
-        for elt in list
-        do (when (member (unwrap-refs elt) lambda-list-keywords)
-             (setf seen-keyword t))
-           (labels ((maybe-default (val)
-                      (if (and specializer-list-p (not seen-keyword))
-                          val
-                          (funcall value-mapper val)))
-                    (map-param (elt)
-                      (trivia:match elt
-                        ((or (and (type symbol-like) x)
-                             ;; keyword or method-like
-                             (list (and (type symbol-like) x)))
-                         (funcall on-binder x))
-                        ;; default value or specializer
-                        ((list (and (type symbol-like) x) val)
-                         `(,(funcall on-binder x) ,(maybe-default val)))
-                        ;; supplied-p
-                        ((list (and (type symbol-like) x) val
-                               (and (type symbol-like) supplied-p))
-                         `(,(funcall on-binder x) ,(maybe-default val)
-                           ,(funcall on-binder supplied-p)))
-                        ;; keyword name
-                        ((list (list call-name (and (type symbol-like) x)) val)
-                         `((,call-name ,(funcall on-binder x)) ,(maybe-default val)))
-                        ;; everything
-                        ((list (list call-name (and (type symbol-like) x)) val
-                               (and (type symbol-like) supplied-p))
-                         `((,call-name ,(funcall on-binder x)) ,(maybe-default val)
-                           ,(funcall on-binder supplied-p)))
-                        (_ (funcall value-mapper elt)))))
-             (if (member (unwrap-refs elt) lambda-list-keywords)
-                 (push elt res)
-                 (push (map-param elt) res))) ; invalid
-        finally (return (nreverse res))))
+(defun map-lambda-list (list on-binder value-mapper specializer-list-p
+                        &optional destructure-p alter-identity)
+  "Requires a proper list but otherwise doesn't force well-formedness and tries to be
+very tolerant. Reconstructs the list structure from the return values of ON-BINDER and
+VALUE-MAPPER, notifying ALTER-IDENTITY, if given, of every newly-built cons for comment
+provenance. DESTRUCTURE-P allows &optional/&rest/&body vars, and &key vars as a
+(keyword-name var) pair, to themselves be nested macro lambda lists (CLHS 3.4.4)."
+  ;; note: dot is treated as a symbol-ref by reading, but dotted lists shouldn't come up
+  ;; even during macroexpansion since lambda list are nested in evaluation contexts
+  (let ((new
+          (loop with current-keyword := nil
+                with res := (list)
+                for elt in list
+                for keyword := (car (member (unwrap-refs elt) lambda-list-keywords))
+                do (labels ((bind-var (v)
+                              (cond ((typep v 'symbol-like) (funcall on-binder v))
+                                    ((and destructure-p (consp v))
+                                     (map-macro-lambda v on-binder value-mapper
+                                                       alter-identity))
+                                    (t (funcall value-mapper v))))
+                            ;; note: only meaningful for a specializer list
+                            (maybe-default (val)
+                              (if (and specializer-list-p (not current-keyword))
+                                  val
+                                  (funcall value-mapper val))))
+                     (if keyword
+                         (progn (setf current-keyword keyword) (push elt res))
+                         (push
+                          (case current-keyword
+                            ((&rest &body) (bind-var elt))
+                            (&key
+                             (trivia:match elt
+                               ((or (and (type symbol-like) v)
+                                    ;; keyword or method-like
+                                    (list (and (type symbol-like) v)))
+                                (funcall on-binder v))
+                               ;; keyword name, optionally wrapping a pattern
+                               ((list (list kw-name v) val)
+                                (let* ((inner `(,kw-name ,(bind-var v)))
+                                       (new `(,inner ,(funcall value-mapper val))))
+                                  (when alter-identity
+                                    (funcall alter-identity (first elt) inner)
+                                    (funcall alter-identity elt new))
+                                  new))
+                               ;; supplied-p
+                               ((list (list kw-name v) val
+                                      (and (type symbol-like) supplied-p))
+                                (let* ((inner `(,kw-name ,(bind-var v)))
+                                       (new `(,inner ,(funcall value-mapper val)
+                                                     ,(funcall on-binder supplied-p))))
+                                  (when alter-identity
+                                    (funcall alter-identity (first elt) inner)
+                                    (funcall alter-identity elt new))
+                                  new))
+                               ;; default value, no keyword-name wrapper
+                               ((list (and (type symbol-like) v) val)
+                                (let ((new `(,(funcall on-binder v)
+                                             ,(funcall value-mapper val))))
+                                  (when alter-identity (funcall alter-identity elt new))
+                                  new))
+                               ((list (and (type symbol-like) v) val
+                                      (and (type symbol-like) supplied-p))
+                                (let ((new `(,(funcall on-binder v)
+                                             ,(funcall value-mapper val)
+                                             ,(funcall on-binder supplied-p))))
+                                  (when alter-identity (funcall alter-identity elt new))
+                                  new))
+                               (_ (funcall value-mapper elt))))
+                            (&optional
+                             (trivia:match elt
+                               ((or (and (type symbol-like) v)
+                                    (list (and (type symbol-like) v)))
+                                (funcall on-binder v))
+                               ((list v val)
+                                (let ((new `(,(bind-var v) ,(funcall value-mapper val))))
+                                  (when alter-identity (funcall alter-identity elt new))
+                                  new))
+                               ((list v val (and (type symbol-like) supplied-p))
+                                (let ((new `(,(bind-var v) ,(funcall value-mapper val)
+                                             ,(funcall on-binder supplied-p))))
+                                  (when alter-identity (funcall alter-identity elt new))
+                                  new))
+                               (_ (funcall value-mapper elt))))
+                            (t
+                             (trivia:match elt
+                               ((or (and (type symbol-like) v)
+                                    ;; keyword or method-like
+                                    (list (and (type symbol-like) v)))
+                                (funcall on-binder v))
+                               ;; default value or specializer
+                               ((list (and (type symbol-like) v) val)
+                                (let ((new `(,(funcall on-binder v) ,(maybe-default val))))
+                                  (when alter-identity (funcall alter-identity elt new))
+                                  new))
+                               ((list (and (type symbol-like) v) val
+                                      (and (type symbol-like) supplied-p))
+                                (let ((new `(,(funcall on-binder v) ,(maybe-default val)
+                                             ,(funcall on-binder supplied-p))))
+                                  (when alter-identity (funcall alter-identity elt new))
+                                  new))
+                               (_ (funcall value-mapper elt)))))
+                          res)))
+                finally (return (nreverse res)))))
+    (when alter-identity (funcall alter-identity list new))
+    new))
 
-(defun map-macro-lambda (list on-binder value-mapper)
-  (loop with res := (list)
-        for rest on list
-        for this = (car rest)
-        do (cond ((member (unwrap-refs this) '(&body &rest &key &optional &aux) :test #'eq)
-                  (return (nreconc res (map-lambda-list rest on-binder value-mapper nil))))
-                 ((member (unwrap-refs this) lambda-list-keywords) (push this res))
-                 ((consp this) (push (map-macro-lambda this on-binder value-mapper) res))
-                 ((null (unwrap-refs this)) (push this res))
-                 ((symbolp (unwrap-refs this)) (push (funcall on-binder this) res))
-                 (t (push (funcall value-mapper this) res)))
-        finally (return (nreverse res))))
+(defun map-macro-lambda (list on-binder value-mapper &optional alter-identity)
+  (let ((new
+          (loop with res := (list)
+                for rest on list
+                for this = (car rest)
+                do (cond ((member (unwrap-refs this) '(&body &rest &key &optional &aux)
+                                  :test #'eq)
+                          (return (nreconc res (map-lambda-list rest on-binder value-mapper
+                                                                nil t alter-identity))))
+                         ((member (unwrap-refs this) lambda-list-keywords) (push this res))
+                         ((consp this)
+                          (push (map-macro-lambda this on-binder value-mapper alter-identity)
+                                res))
+                         ((null (unwrap-refs this)) (push this res))
+                         ((symbolp (unwrap-refs this)) (push (funcall on-binder this) res))
+                         (t (push (funcall value-mapper this) res)))
+                finally (return (nreverse res)))))
+    (when alter-identity (funcall alter-identity list new))
+    new))
 
 (defun parse-body-declarations (body documentation)
   "Wraps alexandria but throws a form-parse-error"
@@ -588,7 +660,7 @@ Reconstructs the list structure from the return values of ON-BINDER and VALUE-MA
                         thereis (eq tag (bind-tag-name bind-tag)))))
 
   (defun tag-sort (tag binds)
-    "The location-sort of a spec tag. TODO update for lambdas"
+    "The location-sort of a spec tag."
     (cond ((eval-ctx-p tag binds) 'eval-form)
           ((binder-tag-p tag binds) 'binder)
           (t 'unevaluated)))
@@ -956,25 +1028,26 @@ Any binding forces a symbol match.
                                               (function-info-arglist ,info)
                                               #'note-binder
                                               (lambda (form)
-                                                (funcall walker form newenv-with-params)))
+                                                (funcall walker form newenv-with-params))
+                                              alter-identity)
                                             `(map-lambda-list
                                               (function-info-arglist ,info)
                                               #'note-binder
                                               (lambda (form)
                                                 (funcall walker form newenv-with-params))
-                                              ,(eq tag-kind '&method-lambda))))
+                                              ,(eq tag-kind '&method-lambda)
+                                              nil alter-identity)))
                                 for body-form in (function-info-body ,info)
                                 for body-ast = (funcall walker body-form ,augment-body)
                                 do (push body-ast body)
-                                finally (funcall alter-identity
-                                                 (function-info-arglist ,info) lambda-list)
-                                        (return
-                                          (make-instance
-                                           'function-code
-                                           :docstring (function-info-documentation ,info)
-                                           :declarations (function-info-decls ,info)
-                                           :body (nreverse body)
-                                           :lambda-list lambda-list)))))
+                                finally
+                                   (return
+                                     (make-instance
+                                      'function-code
+                                      :docstring (function-info-documentation ,info)
+                                      :declarations (function-info-decls ,info)
+                                      :body (nreverse body)
+                                      :lambda-list lambda-list)))))
                       (cond
                         ;; &rest special logic
                         ((eq tag-kind '&rest)
@@ -1505,6 +1578,8 @@ Walks subforms of the call using WALKER during analysis."
                                               :stuff (cdr c))
                                              (gethash form (uneval-data client))))
                              (lastcar children)))
+                       ;; note: dotted lists are parsed with the dot as a symbol reference,
+                       ;; this is needed to preserve comments
                        (frobber)))))
         (typecase result
           (cons
@@ -1578,7 +1653,7 @@ Walks subforms of the call using WALKER during analysis."
       (declare (ignore len))
       (let* ((comment-map (uneval-data client))
              (res
-               (parse form (make-env :%function-bindings '((read-eval)))
+               (parse form (make-env :%function-bindings '(read-eval))
                       (lambda (old new)
                         (setf (gethash new comment-map) (gethash old comment-map))
                         (remhash old comment-map)
