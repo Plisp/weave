@@ -6,6 +6,7 @@
   (:use :cl #:alexandria-2)
   (:export #:disp #:addr-str
            #:list-insert #:list-update #:list-remove
+           #:tree-ref #:tree-update
            #:with-lookup #:or-f #:+fail+
            #:string-drop
            #:flex-vector
@@ -37,6 +38,39 @@
 
 (defun list-remove (list i)
   `(,@(subseq list 0 i) ,@(nthcdr (1+ i) list)))
+
+;; note: an array's rank elements of `path' address one aref, not one level each, since
+;; a multidimensional array isn't nested the way conses/vectors are
+(defun array-copy (array)
+  (let ((copy (make-array (array-dimensions array) :element-type (array-element-type array))))
+    (dotimes (i (array-total-size array) copy)
+      (setf (row-major-aref copy i) (row-major-aref array i)))))
+
+(defun tree-ref (tree path)
+  "Reads the position at `path' (a list of integer indices) within `tree' - an arbitrary
+cons/array structure such as quoted data. An empty `path' returns `tree' itself."
+  (if (null path)
+      tree
+      (etypecase tree
+        (cons (tree-ref (nth (car path) tree) (cdr path)))
+        (array (let ((rank (array-rank tree)))
+                 (tree-ref (apply #'aref tree (subseq path 0 rank)) (nthcdr rank path)))))))
+
+(defun tree-update (tree path new-value)
+  "Functionally replaces the position at `path' within `tree' with `new-value'. May share
+structure with `tree'."
+  (if (null path)
+      new-value
+      (etypecase tree
+        (cons (list-update tree (tree-update (nth (car path) tree) (cdr path) new-value)
+                           (car path)))
+        (array (let* ((rank (array-rank tree))
+                      (indices (subseq path 0 rank))
+                      (copy (array-copy tree)))
+                 (apply #'(setf aref)
+                        (tree-update (apply #'aref tree indices) (nthcdr rank path) new-value)
+                        copy indices)
+                 copy)))))
 
 (defmacro with-lookup ((name (&rest mvcall) &optional otherwise) &body then)
   (with-gensyms (blockname present-p)

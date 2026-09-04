@@ -2,8 +2,6 @@
 ;;;; incremental lisp parsing
 ;;;;
 ;;
-;; note: can use cl-environments:function-information
-;; note: slynk-backend:arglist
 
 (uiop:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
@@ -103,6 +101,9 @@
 (defclass function-code ()
   ((lambda-list :initarg :lambda-list
                 :reader lambda-list)
+   (lambda-list-kind :initarg :lambda-list-kind
+                     :reader lambda-list-kind
+                     :type (member &lambda &macro-lambda &method-lambda))
    (docstring :initarg :docstring
               :reader docstring
               :type string)
@@ -177,6 +178,7 @@ These are specific to the `node' type."
   (:method ((o function-code))
     (make-instance 'function-code
                    :lambda-list (copy-node (lambda-list o))
+                   :lambda-list-kind (lambda-list-kind o)
                    :docstring (docstring o)
                    :declarations (declarations o)
                    :body (mapcar #'copy-node (body o)))))
@@ -402,12 +404,14 @@ does not touch hardwired operators."
          :format-control (concatenate 'string "parse failed: " control)
          :format-arguments args))
 
+;; note: BINDER is included so these also work when re-walking an already-parsed
+;; lambda list, where binder positions were change-classed from symbol-ref to binder
 (defun unwrap-refs (maybe-symbol-ref)
-  (if (typep maybe-symbol-ref 'symbol-ref)
+  (if (typep maybe-symbol-ref '(or symbol-ref binder))
       (name maybe-symbol-ref)
       maybe-symbol-ref))
 
-(deftype symbol-like () '(or symbol symbol-ref))
+(deftype symbol-like () '(or symbol symbol-ref binder))
 
 ;; we need to be more permissive for lambda lists. It makes little sense to preserve
 ;; well-formedness when it often breaks with edits due to positional &keyword context
@@ -415,10 +419,11 @@ does not touch hardwired operators."
 (defun map-lambda-list (list on-binder value-mapper specializer-list-p
                         &optional destructure-p alter-identity)
   "Requires a proper list but otherwise doesn't force well-formedness and tries to be
-very tolerant. Reconstructs the list structure from the return values of ON-BINDER and
-VALUE-MAPPER, notifying ALTER-IDENTITY, if given, of every newly-built cons for comment
-provenance. DESTRUCTURE-P allows &optional/&rest/&body vars, and &key vars as a
-(keyword-name var) pair, to themselves be nested macro lambda lists (CLHS 3.4.4)."
+very tolerant. Reconstructs the list structure from the return values of `on-binder'
+and `value-mapper', notifying `alter-identity', if given, of every newly-built cons
+for comment provenance. `destructure-p' allows &optional/&rest/&body vars, and &key
+vars as a (keyword-name var) pair, to themselves be nested macro lambda lists
+(CLHS 3.4.4)."
   ;; note: dot is treated as a symbol-ref by reading, but dotted lists shouldn't come up
   ;; even during macroexpansion since lambda list are nested in evaluation contexts
   (let ((new
@@ -538,6 +543,45 @@ provenance. DESTRUCTURE-P allows &optional/&rest/&body vars, and &key vars as a
     (when alter-identity (funcall alter-identity list new))
     new))
 
+(defun lambda-list-sorts (node)
+  "A tree isomorphic to (lambda-list `node') whose leaves are location sorts.
+`lambda-list-kind' selects which grammar to walk it with.
+The specializer-list-p argument is always NIL so we can classify specializers."
+  (if (eq (lambda-list-kind node) '&macro-lambda)
+      (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form))
+      (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form) nil)))
+
+(defmethod get-location ((node function-code) id)
+  (trivia:cmatch id
+    ((eql 'lambda-list) (lambda-list node))
+    ((list* (eql 'lambda-list) path) (tree-ref (lambda-list node) path))
+    ((eql 'docstring) (docstring node))
+    ((eql 'declarations) (declarations node))
+    ((eql 'body) (body node))
+    ((list (eql 'body) (and (type integer) i)) (nth i (body node)))))
+
+(defmethod update ((node function-code) id new-value)
+  (flet ((rebuild (&key (lambda-list (lambda-list node)) (docstring (docstring node))
+                     (declarations (declarations node)) (body (body node)))
+           (make-instance 'function-code
+                          :lambda-list lambda-list :lambda-list-kind (lambda-list-kind node)
+                          :docstring docstring :declarations declarations :body body)))
+    (trivia:cmatch id
+      ((eql 'lambda-list) (rebuild :lambda-list new-value))
+      ((list* (eql 'lambda-list) path)
+       (rebuild :lambda-list (tree-update (lambda-list node) path new-value)))
+      ((eql 'docstring) (rebuild :docstring new-value))
+      ((eql 'declarations) (rebuild :declarations new-value))
+      ((eql 'body) (rebuild :body new-value))
+      ((list (eql 'body) (and (type integer) i))
+       (rebuild :body (list-update (body node) new-value i))))))
+
+(defmethod location-sort ((node function-code) id)
+  (trivia:match id
+    ((eql 'docstring) 'string)
+    ((list (eql 'body) (type integer)) 'eval-form)
+    ((list* (eql 'lambda-list) path) (tree-ref (lambda-list-sorts node) path))))
+
 (defun parse-body-declarations (body documentation)
   "Wraps alexandria but throws a form-parse-error"
   (declare (optimize speed))
@@ -555,7 +599,7 @@ provenance. DESTRUCTURE-P allows &optional/&rest/&body vars, and &key vars as a
 (defparameter *special-parsers* (make-hash-table :test #'eq))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (defparameter *parser-keywords* '(&rest &body &or &declarations &rest-qualifiers
+  (defparameter *parser-keywords* '(&rest &body &tree &or &declarations &rest-qualifiers
                                     &lambda &method-lambda &macro-lambda))
   (defparameter *arity-1-parser-keywords* '(&rest &body
                                             &lambda &method-lambda &macro-lambda))
@@ -573,7 +617,8 @@ provenance. DESTRUCTURE-P allows &optional/&rest/&body vars, and &key vars as a
              (cond ((member (car spec) *arity-1-parser-keywords* :test #'eq)
                     (assert (= 2 (length spec)))
                     (list (cons (second spec) (car spec))))
-                   ((member (car spec) '(&declarations &rest-qualifiers) :test #'eq)
+                   ;; note: unlike &body/&rest, these aren't required to be terminal
+                   ((member (car spec) '(&tree &declarations &rest-qualifiers) :test #'eq)
                     (cons (cons (second spec) (car spec)) (spec-kinds (cddr spec))))
                    (t
                     (spec-kinds (cdr spec)))))
@@ -687,54 +732,73 @@ are addressed by (name index) and rest-patterns by (name index i)."
                                        append `(,(make-keyword s)
                                                 ,(if (eq s slot) value `(,s node)))))))
         (push `((eql 'op) ',name) get-clauses)
+        ;; accessors
         (loop
           for part in slots
           for kind = (cdr (assoc part spec-kinds))
           do (push `((eql ',part) (,part node)) get-clauses)
              (push `((eql ',part) ,(rebuild part 'new-value)) update-clauses)
-             (when (member kind '(&rest &body))
-               (push `((list (eql ',part) (and (type integer) i))
-                       (nth i (,part node)))
-                     get-clauses)
-               (push `((list (eql ',part) (and (type integer) i))
-                       ,(rebuild part `(list-update (,part node) new-value i)))
-                     update-clauses))
-             ;; sorts
              (case kind
-               (&body
-                (push `((list (eql ',part) (type integer)) 'eval-form) sort-clauses))
-               (&rest
-                (when-let (pattern (cdr (assoc part rest-patterns)))
-                  (multiple-value-bind (binder-tag value-tag value-kind)
-                      (rest-pattern-tags pattern)
-                    ;; internally normalize lone binders to a list
-                    (push `((list (eql ',part) (and (type integer) i)
-                                  (and (type integer) j))
-                            (nth j (ensure-list (nth i (,part node)))))
-                          get-clauses)
-                    (push `((list (eql ',part) (and (type integer) i)
-                                  (and (type integer) j))
-                            ,(rebuild part `(list-update
-                                             (,part node)
-                                             (list-update
-                                              (ensure-list (nth i (,part node)))
-                                              new-value j)
-                                             i)))
-                          update-clauses)
-                    ;; this has to be checked first
-                    (push `((list (eql ',part) (type integer) (eql 0))
-                            ',(tag-sort binder-tag binds))
-                          sort-clauses)
-                    ;; logic for body, or singular value
-                    (when (member value-kind '(nil &body))
-                      (push `((list (eql ',part) (type integer)
-                                    ,(if (eq value-kind '&body)
-                                         '(type integer)
-                                         '(eql 1)))
-                              ',(tag-sort value-tag binds))
-                            sort-clauses)))))
-               ((nil)
-                (push `((eql ',part) ',(tag-sort part binds)) sort-clauses)))))
+               ((&rest &body)
+                (push `((list (eql ',part) (and (type integer) i))
+                        (nth i (,part node)))
+                      get-clauses)
+                (push `((list (eql ',part) (and (type integer) i))
+                        ,(rebuild part `(list-update (,part node) new-value i)))
+                      update-clauses))
+               (&tree
+                (push `((list* (eql ',part) path) (tree-ref (,part node) path))
+                      get-clauses)
+                (push `((list* (eql ',part) path)
+                        ,(rebuild part `(tree-update (,part node) path new-value)))
+                      update-clauses)))
+
+             ;; rest-patterns address a further index within each &rest element
+             (when (eq kind '&rest)
+               (when-let (pattern (cdr (assoc part rest-patterns)))
+                 (push `((list (eql ',part) (and (type integer) i)
+                               (and (type integer) j))
+                         (nth j (ensure-list (nth i (,part node)))))
+                       get-clauses)
+                 (push `((list (eql ',part) (and (type integer) i)
+                               (and (type integer) j))
+                         ,(rebuild part `(list-update
+                                          (,part node)
+                                          (list-update
+                                           (ensure-list (nth i (,part node)))
+                                           new-value j)
+                                          i)))
+                       update-clauses)))
+             ;; sorts
+             (loop
+               for part in slots
+               for kind = (cdr (assoc part spec-kinds))
+               do (case kind
+                    (&body
+                     (push `((list (eql ',part) (type integer)) 'eval-form) sort-clauses))
+                    ;; note: nothing inside quoted data is ever a binder or eval-form
+                    ;; TODO refine sorts by value type (symbol/string/number/...)
+                    (&tree
+                     (push `((eql ',part) 'unevaluated) sort-clauses)
+                     (push `((list* (eql ',part) (type list)) 'unevaluated) sort-clauses))
+                    (&rest
+                     (when-let (pattern (cdr (assoc part rest-patterns)))
+                       (multiple-value-bind (binder-tag value-tag value-kind)
+                           (rest-pattern-tags pattern)
+                         ;; this has to be checked first
+                         (push `((list (eql ',part) (type integer) (eql 0))
+                                 ',(tag-sort binder-tag binds))
+                               sort-clauses)
+                         ;; logic for body, or singular value
+                         (when (member value-kind '(nil &body))
+                           (push `((list (eql ',part) (type integer)
+                                         ,(if (eq value-kind '&body)
+                                              '(type integer)
+                                              '(eql 1)))
+                                   ',(tag-sort value-tag binds))
+                                 sort-clauses)))))
+                    ((nil)
+                     (push `((eql ',part) ',(tag-sort part binds)) sort-clauses))))))
 
       `((defmethod get-location ((node ,classname) id)
           (trivia:cmatch id ,@(nreverse get-clauses)))
@@ -837,6 +901,10 @@ Any binding forces a symbol match.
                 (&body
                  `(lambda (,form)
                     (push ,form ,(second spec))))
+                (&tree
+                 `(lambda (,form)
+                    (push (car ,form) ,(second spec))
+                    (funcall (,',spec-parser-name ,(cddr spec)) (cdr ,form))))
                 (&rest
                  `(lambda (,form)
                     ,(if-let (pattern (cdr (assoc (second spec) ',rest-patterns)))
@@ -1009,7 +1077,7 @@ Any binding forces a symbol match.
                     for entries := (plist-alist (cdr (assoc tag binds)))
                     for tag-kind := (cdr (assoc tag tag-kinds))
                     collect
-                    (flet ((walk-function-body (env info augment-body)
+                    (flet ((walk-function-body (env info augment-body kind)
                              `(loop
                                 with binder-env := +nullenv+
                                 with newenv-with-params := ,env
@@ -1023,7 +1091,7 @@ Any binding forces a symbol match.
                                                     (env-with-variables binder-env
                                                                         `(,(name binder))))
                                               (change-class binder 'binder)))
-                                       ,(if (eq tag-kind '&macro-lambda)
+                                       ,(if (eq kind '&macro-lambda)
                                             `(map-macro-lambda
                                               (function-info-arglist ,info)
                                               #'note-binder
@@ -1035,7 +1103,7 @@ Any binding forces a symbol match.
                                               #'note-binder
                                               (lambda (form)
                                                 (funcall walker form newenv-with-params))
-                                              ,(eq tag-kind '&method-lambda)
+                                              ,(eq kind '&method-lambda)
                                               nil alter-identity)))
                                 for body-form in (function-info-body ,info)
                                 for body-ast = (funcall walker body-form ,augment-body)
@@ -1044,6 +1112,7 @@ Any binding forces a symbol match.
                                    (return
                                      (make-instance
                                       'function-code
+                                      :lambda-list-kind ',kind
                                       :docstring (function-info-documentation ,info)
                                       :declarations (function-info-decls ,info)
                                       :body (nreverse body)
@@ -1109,7 +1178,8 @@ Any binding forces a symbol match.
                                          (first ,tag)))
                                        (funcall alter-identity (first ,tag) (,tag ast)))))))
                            ;; function-like bindings
-                           ((list (type symbol) (or (eql '&lambda) (eql '&macro-lambda))
+                           ((list (type symbol)
+                                  (and (or (eql '&lambda) (eql '&macro-lambda)) lambda-kind)
                                   (type symbol))
                             (let ((name-tag (first (cdr (assoc tag rest-patterns))))
                                   (code-tag (lastcar (cdr (assoc tag rest-patterns)))))
@@ -1122,7 +1192,8 @@ Any binding forces a symbol match.
                                    for ,fun := ,(walk-function-body
                                                  newenv info
                                                  `(env-with-blocks newenv-with-params
-                                                                   `(,,name)))
+                                                                   `(,,name))
+                                                 lambda-kind)
                                    do (push (cons (change-class ,name 'binder) ,fun) ,res)
                                    finally (setf (,tag ast) ,res)
                                            (funcall alter-identity (first ,tag) ,res)))))))
@@ -1153,7 +1224,7 @@ Any binding forces a symbol match.
                               `(let ((,newenv ,(augment-env `env entries)))
                                  (setf (,tag ast)
                                        ,(walk-function-body newenv `(first ,tag)
-                                                            `newenv-with-params))))))))))
+                                                            `newenv-with-params tag-kind))))))))))
                   ast)))
              ))
        (setf (gethash ',name *special-walkers*) ',(symbolicate name "-WALKER"))
@@ -1229,8 +1300,8 @@ Any binding forces a symbol match.
 
 (defform (read-function fun-designator))
 (defform (function fun-designator))
-(defform (read-quote thing))
-(defform (quote thing))
+(defform (read-quote &tree thing))
+(defform (quote &tree thing))
 
 (defform (setq &body forms)
   :binds ((forms)))
@@ -1446,7 +1517,7 @@ Walks subforms of the call using WALKER during analysis."
   (cond
     ((atom form)
      ;; vectors are self evaluating and non-atomic
-     (assert (typep form '(or symbol-ref literal vector)))
+     (assert (typep form '(or symbol-ref literal array)))
      form)
     ((not (typep (car form) 'symbol-ref)) (error "lambda in car unimplemented"))
     (t
@@ -1536,6 +1607,8 @@ Walks subforms of the call using WALKER during analysis."
                   ((and (keywordp result) (= (- (cdr source) (car source))
                                              (length (string result))))
                    (make-read-conditional :result result))
+                  ((and (vectorp result) (zerop (length result))) ; not bit vector
+                   result)
                   (t
                    (make-instance 'literal :str s))))
           (progn
@@ -1578,8 +1651,8 @@ Walks subforms of the call using WALKER during analysis."
                                               :stuff (cdr c))
                                              (gethash form (uneval-data client))))
                              (lastcar children)))
-                       ;; note: dotted lists are parsed with the dot as a symbol reference,
-                       ;; this is needed to preserve comments
+                       ;; XXX dotted lists are parsed with the dot as a symbol reference,
+                       ;; this is needed to preserve comments. They must be treated specially
                        (frobber)))))
         (typecase result
           (cons
@@ -1612,6 +1685,12 @@ Walks subforms of the call using WALKER during analysis."
            `(,(make-instance 'symbol-ref :name 'read-eval)
              ,(lastcar children)))
           (vector (apply #'vector (frobber)))
+          ;; how to track comments for multidimensional array literals?
+          ;; fortunately nobody really uses them so I'll say won't fix
+          (array (make-array (parse-integer (source client)
+                                            :start (1+ (car source))
+                                            :junk-allowed t)
+                             :initial-contents (car children)))
           ;; should be read-conditional wrapped
           (t
            (assert (member-if #'read-conditional-p children))
