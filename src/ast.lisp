@@ -15,7 +15,8 @@
 
            #:location-sort #:locsort
 
-           #:eval-form #:symbol-ref #:binder #:function-call #:literal
+           #:eval-form #:symbol-ref #:binder #:wrapped-symbol
+           #:function-call #:literal
            #:unevaluated
            #:body #:name #:str #:vars #:op
            #:function-code #:lambda-list
@@ -79,6 +80,26 @@
   ()
   (:documentation "A symbol inserted to represent reader syntax"))
 
+(defclass dot-marker (reader-marker)
+  ()
+  (:documentation "The dot marker produced by the reader as a symbol.
+This class exists because an uninterned symbol also has a null HOME-PACKAGE,
+so a name test alone can't distinguish #:|.| from a dot."))
+
+(defclass label-ref (reader-marker)
+  ()
+  (:documentation "#n#, distinguished from the uninterned #:|n|"))
+
+(defclass label-def (eval-form atom-form)
+  ((name :initarg :name
+         :initform (error "must provide label name")
+         :reader name
+         :type string)
+   (labeled :initarg :labeled
+            :initform (error "must provide labeled form")
+            :reader labeled))
+  (:documentation "#n=form"))
+
 (defclass binder (atom-form)
   ((name :initarg :name
          :initform (error "must provide symbol ref name")
@@ -87,6 +108,10 @@
                  :initform *package*
                  :reader home-package))
   (:documentation "Represents a binder, NOT a reference in evaluation position."))
+
+(deftype wrapped-symbol () '(or symbol-ref binder))
+;; for code shared between the wrapped AST and the real symbols STRIP-WRAPPERS produces
+(deftype symbol-like () '(or symbol wrapped-symbol))
 
 (defclass function-call (eval-form)
   ((name :initarg :name
@@ -174,11 +199,20 @@ These are specific to the `node' type."
 ;; - semantic uniqueness of binders, used for attaching information
 ;; - uniqueness of locations used for the user interface
 (defgeneric copy-node (node)
+  (:method ((o cons)) (cons (copy-node (car o)) (copy-node (cdr o))))
+  (:method ((o array))
+    (let ((new (copy-array o)))
+      (dotimes (i (array-total-size new) new)
+        (setf (row-major-aref new i) (copy-node (row-major-aref o i))))))
+  ;; NIL slots and nodes deliberately left unstructured (reader conditionals).
+  (:method (o) o)
   (:method ((o comment)) (make-instance 'comment :kind (kind o) :str (str o)))
   (:method ((o literal)) (make-instance 'literal :str (str o)))
   ;; note: class-of, so a reader-marker doesn't decay into a plain symbol-ref
   (:method ((o symbol-ref))
     (make-instance (class-of o) :name (name o) :home-package (home-package o)))
+  (:method ((o label-def)) (make-instance 'label-def :name (name o)
+                                                     :labeled (copy-node (labeled o))))
   (:method ((o binder)) (make-instance 'binder :name (name o)
                                                :home-package (home-package o)))
   (:method ((o function-call)) (make-instance 'function-call
@@ -191,7 +225,9 @@ These are specific to the `node' type."
                                             (subform-asts o))
                                    new)
                    :eval-binders (eval-binders o)
-                   :body (body o) :op (op o)))
+                   ;; note: unlike a defform class, this op is a SYMBOL-REF node, so it is
+                   ;; a location of its own and needs copying too
+                   :body (mapcar #'copy-node (body o)) :op (copy-node (op o))))
   (:method ((o function-code))
     (make-instance 'function-code
                    :lambda-list (copy-node (lambda-list o))
@@ -256,17 +292,25 @@ List structure may share conses with the old node."))
 ;;; code walking
 ;;
 
+(defun unlock-declaration (name)
+  "We only rebuild lexical scopes to macroexpand so this is safe. Needed for
+pprint-exit-if-list-exhausted/pop and other forms that introduce local macrolet bindings."
+  (declare (ignorable name))
+  #+sbcl `((declare (sb-ext:disable-package-locks ,name))))
+
 (defun macrolet-code-wrap (name rest form)
-  `(macrolet ((,name ,@rest))
-     ,form))
+  `(locally ,@(unlock-declaration name)
+     (macrolet ((,name ,@rest))
+       ,form)))
 
 (defun symbol-macrolet-wrap (name expansion form)
   `(symbol-macrolet ((,name ,expansion))
      ,form))
 
 (defun flet-wrap (name form)
-  `(flet ((,name (&rest args) (declare (ignorable args))))
-     ,form))
+  `(locally ,@(unlock-declaration name)
+     (flet ((,name (&rest args) (declare (ignorable args))))
+       ,form)))
 
 (defun let-wrap (name form)
   "some globals don't like to ever be bound to nil, so try a global value first"
@@ -309,13 +353,21 @@ copy-env can exploit structure sharing, remember to PUSH!"
              (return (values (car entry) (cdr entry))))))
 
 (defun env-with-variables (env bindings)
+  "Expects entry names to be strictly SYMBOLS."
   (let ((new-env (copy-env env)))
-    (setf (%variable-bindings new-env) (append bindings (%variable-bindings new-env)))
+    (setf (%variable-bindings new-env)
+          ;; note: constants are possible in intermediate editing states
+          (nconc (remove-if (lambda (s) (constantp (ensure-car s))) bindings)
+                 (%variable-bindings new-env)))
     new-env))
 
 (defun env-with-functions (env bindings)
+  "Expects entry names to be strictly SYMBOLS."
+  ;; note: CL names are kept - a local binding shadowing one is needed to expand
+  ;; macrolets like pprint-exit-if-list-exhausted
   (let ((new-env (copy-env env)))
-    (setf (%function-bindings new-env) (append bindings (%function-bindings new-env)))
+    (setf (%function-bindings new-env)
+          (append bindings (%function-bindings new-env)))
     new-env))
 
 (defun env-with-blocks (env bindings)
@@ -370,7 +422,10 @@ copy-env can exploit structure sharing, remember to PUSH!"
                        (wrap-tag-env (tags env)))))
 
 (declaim (type simple-vector *hardwired-operators*))
-(defparameter *hardwired-operators* #(lambda defun defmethod defmacro)
+(defparameter *hardwired-operators* #(lambda defun defmethod defmacro
+                                      eclector.reader:quasiquote
+                                      eclector.reader:unquote
+                                      eclector.reader:unquote-splicing)
   "The list of nonportable hardwired macros, not macroexpanded.")
 
 (defun hardwired-p (macro-name)
@@ -422,7 +477,7 @@ does not touch hardwired operators."
          :format-arguments args))
 
 (defun unwrap-refs (maybe-symbol-ref)
-  (if (typep maybe-symbol-ref '(or symbol-ref binder))
+  (if (typep maybe-symbol-ref 'wrapped-symbol)
       (name maybe-symbol-ref)
       maybe-symbol-ref))
 
@@ -431,8 +486,6 @@ does not touch hardwired operators."
   (let ((name (unwrap-refs elt)))
     (and (stringp name) (find name symbols :test #'string-equal))))
 
-(deftype symbol-like () '(or symbol symbol-ref binder))
-
 (defun null-ref-p (list)
   (and (typep list 'literal) (string= (str list) "()")))
 
@@ -440,6 +493,16 @@ does not touch hardwired operators."
   (if (and (typep list 'literal) (string= (str list) "()"))
       nil
       list))
+
+(defun resolve (wrapper)
+  (if-let (p (home-package wrapper))
+    (find-symbol (name wrapper) p)
+    (values (name wrapper) '#:uninterned)))
+
+(defun ref-coerce-symbol (s)
+  (if (symbolp s)
+      s
+      (resolve s)))
 
 ;; we need to be more permissive for lambda lists. It makes little sense to preserve
 ;; well-formedness when it often breaks with edits due to positional &keyword context
@@ -550,21 +613,21 @@ vars as a (keyword-name var) pair, to themselves be nested macro lambda lists (C
     new))
 
 (defun map-macro-lambda (list on-binder value-mapper &optional alter-identity)
-  (let ((new
-          (loop with res := (list)
-                for rest on list
-                for this = (car rest)
-                do (cond ((tag-member this '(&body &rest &key &optional &aux))
-                          (return (nreconc res (map-lambda-list rest on-binder value-mapper
-                                                                nil t alter-identity))))
-                         ((tag-member this lambda-list-keywords) (push this res))
-                         ((consp this)
-                          (push (map-macro-lambda this on-binder value-mapper alter-identity)
-                                res))
-                         ((null (unwrap-refs this)) (push this res))
-                         ((stringp (unwrap-refs this)) (push (funcall on-binder this) res))
-                         (t (push (funcall value-mapper this) res)))
-                finally (return (nreverse res)))))
+  (let ((new (loop
+               with res := (list)
+               for rest on list
+               for this = (car rest)
+               do (cond ((tag-member this '(&body &rest &key &optional &aux))
+                         (return (nreconc res (map-lambda-list rest on-binder value-mapper
+                                                               nil t alter-identity))))
+                        ((tag-member this lambda-list-keywords) (push this res))
+                        ((consp this)
+                         (push (map-macro-lambda this on-binder value-mapper alter-identity)
+                               res))
+                        ((null (unwrap-refs this)) (push this res))
+                        ((stringp (unwrap-refs this)) (push (funcall on-binder this) res))
+                        (t (push (funcall value-mapper this) res)))
+               finally (return (nreverse res)))))
     (when alter-identity (funcall alter-identity list new))
     new))
 
@@ -574,7 +637,8 @@ vars as a (keyword-name var) pair, to themselves be nested macro lambda lists (C
 The specializer-list-p argument is always NIL so we can classify specializers."
   (if (eq (lambda-list-kind node) '&macro-lambda)
       (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form))
-      (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form) nil)))
+      (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form)
+                       nil)))
 
 (defmethod get-location ((node function-code) id)
   (trivia:cmatch id
@@ -622,11 +686,6 @@ The specializer-list-p argument is always NIL so we can classify specializers."
 
 (defparameter *special-walkers* (make-hash-table :test #'eq))
 (defparameter *special-parsers* (make-hash-table :test #'eq))
-
-(defun resolve (wrapper)
-  (if-let (p (home-package wrapper))
-    (find-symbol (name wrapper) p)
-    (values (name wrapper) '#:uninterned)))
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (defparameter *parser-keywords* '(&rest &body &tree &or &declarations &rest-qualifiers
@@ -747,7 +806,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
       ((list binder-tag value-tag)
        (values binder-tag value-tag nil))))
 
-  (defun location-methods (name classname spec-kinds rest-patterns binds)
+  (defun location-methods (classname spec-kinds rest-patterns binds)
     "Emits the get-location/update/location-sort methods for a defform class.
 Generally the tag name indexes the whole slot and (tag integer*) index tree structure."
     (let ((slots (mapcar #'car spec-kinds))
@@ -756,10 +815,11 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
           (sort-clauses (list)))
       (flet ((rebuild (slot value)
                `(make-instance ',classname
+                               :op (op node)
                                ,@(loop for s in slots
                                        append `(,(make-keyword s)
                                                 ,(if (eq s slot) value `(,s node)))))))
-        (push `((eql 'op) ',name) get-clauses)
+        (push `((eql 'op) (op node)) get-clauses)
         ;; accessors
         (loop
           for part in slots
@@ -856,7 +916,9 @@ a parsed representation."
          `(lambda (,form)
             (when (and ,(binder-tag-p spec binds)
                        ;; binders cannot be literal NIL
-                       (not ,(if ref-p `(typep ,form 'symbol-ref) `(typep ,form 'symbol))))
+                       (not ,(if ref-p
+                                 `(typep ,form 'wrapped-symbol)
+                                 `(typep ,form 'symbol))))
               (form-parse-error "expected binder symbol match: ~a" ,form))
             (push ,form ,spec)))
         ;; note: catches list nil before car recursion
@@ -883,8 +945,9 @@ a parsed representation."
                  ,@(mapcar
                     (lambda (pattern)
                       `(handler-case
-                           (return (funcall (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
-                                            ,form))
+                           (return
+                             (funcall (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
+                                      ,form))
                          (form-parse-error () nil)))
                     (cdr spec))
                  (form-parse-error "expected one of ~a got ~a" ',(cdr spec) ,form))))
@@ -905,7 +968,8 @@ a parsed representation."
            (&tree
             `(lambda (,form)
                (push (car ,form) ,(second spec))
-               (funcall (spec-parser ,(cddr spec) ,binds ,rest-patterns ,ref-p) (cdr ,form))))
+               (funcall (spec-parser ,(cddr spec) ,binds ,rest-patterns ,ref-p)
+                        (cdr ,form))))
            (&rest
             `(lambda (,form)
                ,(if-let (pattern (cdr (assoc (second spec) rest-patterns)))
@@ -913,7 +977,7 @@ a parsed representation."
                      (mapc (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
                            ,(ref-ensure-list-form `,form))
                      (push ,(ref-ensure-list-form `,form) ,(second spec)))
-                  `(push ,(ref-ensure-list-form `,form) ,(second spec)))))
+                  (error "no pattern for rest"))))
            (&rest-qualifiers
             `(lambda (,form)
                (let ((,qualifiers
@@ -962,17 +1026,19 @@ Any binding forces a symbol match.
          (slots (mapcar #'car (spec-kinds spec))))
     `(progn
        (defclass ,classname (irregular-form)
-         (,@(loop for name in (remove-duplicates slots :test #'equal)
+         ((op :initarg :op :initform ',name :accessor op)
+          ,@(loop for name in (remove-duplicates slots :test #'equal)
                   collect `(,name :initarg ,(make-keyword name)
                                   :accessor ,name))))
        ;; methods
        ,(when (member 'body slots)
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
        (defmethod copy-node ((old ,classname))
-         (let ((new (make-instance ',classname)))
+         (let ((new (make-instance ',classname :op (op old))))
            ,@(loop for name in (remove-duplicates slots :test #'equal)
-                   collect `(setf (,name new) (copy-node (,name old))))))
-       ,@(location-methods name classname (spec-kinds spec) rest-patterns binds)
+                   collect `(setf (,name new) (copy-node (,name old))))
+           new))
+       ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
        ;; exports
        (export ',classname)
        ,@(loop for name in (remove-duplicates slots :test #'equal)
@@ -1000,9 +1066,11 @@ Any binding forces a symbol match.
                                    ,env-exp
                                    ,(trivia:ematch record
                                       ((list (type symbol) whole-tag)
-                                       `(apply #'append ,whole-tag))
+                                       `(mapcar (lambda (r) (ref-coerce-symbol (car r)))
+                                                (apply #'append ,whole-tag)))
                                       ;; binding records may SHARE STRUCTURE
-                                      ((type symbol) record))))
+                                      ((type symbol)
+                                       `(mapcar #'ref-coerce-symbol ,record)))))
                                 ;; note: functions needed for parsing, normalize env
                                 (:function
                                  `(env-with-functions
@@ -1011,15 +1079,18 @@ Any binding forces a symbol match.
                                       ((list (type symbol) whole-tag)
                                        (with-gensyms (name info)
                                          `(loop
-                                            for ,name in ,(first (cdr (assoc whole-tag
-                                                                             rest-patterns)))
-                                            for ,info in ,(lastcar (cdr (assoc whole-tag
-                                                                               rest-patterns)))
+                                            for ,name
+                                              in ,(first (cdr (assoc whole-tag
+                                                                     rest-patterns)))
+                                            for ,info
+                                              in ,(lastcar (cdr (assoc whole-tag
+                                                                       rest-patterns)))
                                             collect
-                                            (list* (if (symbolp ,name) ,name (resolve ,name))
+                                            (list* (ref-coerce-symbol ,name)
                                                    (function-info-arglist ,info)
                                                    (function-info-body ,info)))))
-                                      ((type symbol) record))))
+                                      ((type symbol)
+                                       `(mapcar #'ref-coerce-symbol ,record)))))
                                 (:block `(env-with-blocks ,env-exp ,record))))
                           rest))
                        env-exp)))
@@ -1127,7 +1198,10 @@ Any binding forces a symbol match.
              (defun ,(symbolicate name "-PARSER") (rawform env walker alter-identity)
                (declare (ignorable env walker alter-identity))
                (,(symbolicate "WITH-PARSED-" name) (rawform t)
-                (let ((ast (make-instance ',classname)))
+                (let ((ast (make-instance ',classname
+                                           :op (if (typep (car rawform) 'reader-marker)
+                                                   ',(symbolicate "READ-" name)
+                                                    ',name))))
                   ,@
                   (loop
                     for tag in slots
@@ -1275,6 +1349,73 @@ Any binding forces a symbol match.
            (lambda (form env) (disp (list form env)))
            (lambda (binder kind) (disp (list binder kind)))))
 
+;;
+;;; quasiquotation
+;;
+;; Code using reader macros (like in this file) requires markers to tell apart reader
+;; syntax from explicitly written symbols. There's also a bug in eclector which causes
+;; `(,'eclector.reader:quasiquote) to expand to (append (list (quote quote nil)) 'nil).
+;; So instead of macroexpanding, we traverse the ast ourselves with a custom walker
+;; using the reader-marker objects inserted in operator position
+;;
+(defform (eclector.reader:quasiquote &tree thing))
+
+(defun map-quasiquote (thing on-eval &optional (on-data (constantly nil))
+                                       (alter-identity (lambda (old new)
+                                                         (declare (ignore old))
+                                                         new)))
+  "Walks `thing', the quoted tree of a quasiquote form, rebuilding an isomorphic tree with
+`on-eval' applied to every subform an unquote actually evaluates and `on-data' to every
+other atom."
+  (labels ((rebuild (old new) (funcall alter-identity old new))
+           (rec (form depth)
+             (if (atom form)
+                 (funcall on-data form)
+                 ;; only a READER-MARKER is syntax, so source naming one of these symbols is
+                 ;; data. Raw symbols come from the walker since STRIP-WRAPPERS erases types
+                 (case (typecase (car form)
+                         (symbol (car form))
+                         (reader-marker (resolve (car form))))
+                   (eclector.reader:quasiquote
+                    (rebuild form (list (funcall on-data (car form))
+                                        (rec (second form) (1+ depth)))))
+                   ((eclector.reader:unquote eclector.reader:unquote-splicing)
+                    (rebuild form (list (funcall on-data (car form))
+                                        (if (= 1 depth) ; 0 depth underneath
+                                            (funcall on-eval (second form))
+                                            (rec (second form) (1- depth))))))
+                   (t
+                    (rebuild form (cons (rec (car form) depth)
+                                        (rec (cdr form) depth))))))))
+    (rec thing 1)))
+
+(defun walk-quasiquote (form env walker on-binder)
+  (declare (ignore on-binder))
+  (map-quasiquote (second form) (lambda (subform) (funcall walker subform env)))
+  nil)
+
+(defun parse-quasiquote (rawform env walker alter-identity)
+  (make-instance
+   'quasiquote-form
+   :op (if (typep (car rawform) 'reader-marker)
+           'read-quasiquote
+            'eclector.reader:quasiquote)
+   :thing (map-quasiquote (second rawform)
+                          (lambda (subform) (funcall walker subform env))
+                          #'identity alter-identity)))
+
+(defun quasiquote-sorts (node)
+  "See lambda-list-sorts"
+  (map-quasiquote (thing node) (constantly 'eval-form) (constantly 'unevaluated)))
+
+(defmethod location-sort ((node quasiquote-form) id)
+  (trivia:match id
+    ((eql 'thing) 'unevaluated)
+    ((list* (eql 'thing) path) (tree-ref (quasiquote-sorts node) path))))
+
+(setf (gethash 'eclector.reader:quasiquote *special-walkers*) #'walk-quasiquote)
+(setf (gethash 'eclector.reader:quasiquote *special-parsers*) #'parse-quasiquote)
+
 (defform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
   :binds ((fun-code :function name :block name)))
 
@@ -1336,15 +1477,13 @@ Any binding forces a symbol match.
 (defform (defmacro name &macro-lambda macro-code)
   :binds ((macro-code :block name)))
 
-(defform (read-function fun-designator))
 (defform (function fun-designator))
-(defform (read-quote &tree thing))
 (defform (quote &tree thing))
 
 (defform (setq &body forms)
   :binds ((forms)))
 
-(defform (return-from name value)
+(defform (return-from name &body value)
   :binds ((value)))
 (defform (if test &body then-else)
   :binds ((test) (then-else)))
@@ -1416,7 +1555,9 @@ Any binding forces a symbol match.
   "`interned' is a vector of symbols for temporary internment during macro analysis."
   (cond ((atom form)
          (cond ((null-ref-p form) nil)
-               ((typep form '(or symbol-ref binder))
+               ((and (typep form 'wrapped-symbol) (null (home-package form)))
+                (make-symbol (name form)))
+               ((typep form 'wrapped-symbol)
                 (multiple-value-bind (sym status)
                     (resolve form)
                   (if status
@@ -1428,8 +1569,7 @@ Any binding forces a symbol match.
                (t form)))
         ;; note: the reader represents dotted lists with a "." symbol marker,
         ;; make sure to replace this before attempting ordinary lisp macroexpansion.
-        ((and (consp (cdr form)) (typep (cadr form) 'symbol-ref)
-              (null (home-package (cadr form))) (string= (name (cadr form)) "."))
+        ((and (consp (cdr form)) (typep (cadr form) 'dot-marker))
          (cons (strip-wrappers (car form) interned)
                (strip-wrappers (caddr form) interned)))
         (t (cons (strip-wrappers (car form) interned)
@@ -1463,13 +1603,11 @@ Any binding forces a symbol match.
   "Identifies body forms and binding scopes to return a map of {sexp -> binding env}.
 Walks subforms of the call using WALKER during analysis."
   (with-temporary-interning (interned)
-    (labels ((dot-marker-p (x)
-               (and (typep x 'symbol-ref) (null (home-package x)) (string= (name x) ".")))
-             (call-nth (i form)
+    (labels ((call-nth (i form)
                ;; we need to map paths in the raw source back to the parsed representation
                ;; with symbolic dot markers
                (let ((rest (nthcdr i form)))
-                 (if (dot-marker-p (car rest))
+                 (if (typep (car rest) 'dot-marker)
                      (cadr rest) ; the real elt is one later
                      (car rest))))
              (lookup-path (path form)
@@ -1497,7 +1635,7 @@ Walks subforms of the call using WALKER during analysis."
                                   (walk-call-collecting-forms subform newpath))
                                 (when (symbolp subform)
                                   (push newpath (gethash subform raw-form->loc))))
-                            ;; a dotted tail's final cdr is itself a subform at this position
+                            ;; a dotted tail's last cdr is itself a subform at this position
                             ;; we only care if it's a symbol as ~(consp rest) from while
                          finally (when (and (not (null rest)) (symbolp rest))
                                    (push (cons i path) (gethash rest raw-form->loc))))))
@@ -1522,7 +1660,7 @@ Walks subforms of the call using WALKER during analysis."
                    ;; binder currently may be unused TODO block analysis
                    (lambda (sym kind)
                      (setf (gethash sym possible-identifiers) kind)))
-        ;; (disp (hash-table-plist possible-identifiers))
+        ;;(disp (hash-table-plist possible-identifiers))
         ;; analysis, first to understand syntax before constructing the returned maps
         (let ((gensym->path (make-hash-table :test #'eq))
               (gensym->refpath (make-hash-table :test #'eq)))
@@ -1530,10 +1668,16 @@ Walks subforms of the call using WALKER during analysis."
                      (loop for rest on (reverse path)
                            for i := (car rest)
                            do (if (null (cdr rest))
-                                  (setf (nth i form) sym)
+                                  (if (= i 0)
+                                      (setf (car form) sym)
+                                      (let ((before (nthcdr (1- i) form)))
+                                        (if (consp (cdr before))
+                                            (setf (second before) sym)
+                                            (setf (cdr before) sym))))
                                   (setf form (nth i form))))))
             (loop ; we need to know where the refs and binders are first
-                  for sym being the hash-keys of possible-identifiers using (hash-value kind)
+                  for sym being the hash-keys of possible-identifiers
+                    using (hash-value kind)
                   do (loop for path in (gethash sym raw-form->loc)
                            for gensym := (gensym "PB")
                            for ident-kind := nil
@@ -1556,7 +1700,7 @@ Walks subforms of the call using WALKER during analysis."
                                                    (setf ident-kind :variable)
                                                    (return-from walk)))))))
                               ;; an actual reference will be independent of the binding name
-                              ;; counter: step forms may have spurious refs not from the call
+                              ;; counter: step forms may have spurious refs generated
                               (if ident-kind
                                   (progn
                                     (setf (gethash gensym gensym->path) path)
@@ -1574,18 +1718,19 @@ Walks subforms of the call using WALKER during analysis."
                  expansion env
                  (lambda (form subenv)
                    (flet ((calc-bindings ()
-                            (loop with res := (list)
-                                  for v in (ldiff (variable-bindings subenv)
-                                                  (variable-bindings env))
-                                  do (with-lookup (path (gethash (ensure-car v) gensym->path))
-                                       (let ((binder (lookup-path path call)))
-                                         ;; note: on-binder idempotent callback, may see the
-                                         ;; same binder again via ldiff at deeper nesting
-                                         (unless (typep binder 'binder)
-                                           (assert (typep binder 'symbol-ref))
-                                           (change-class binder 'binder))
-                                         (push binder res)))
-                                  finally (return res))))
+                            (loop
+                              with res := (list)
+                              for v in (ldiff (variable-bindings subenv)
+                                              (variable-bindings env))
+                              do (with-lookup (path (gethash (ensure-car v) gensym->path))
+                                   (let ((binder (lookup-path path call)))
+                                     ;; note: on-binder idempotent callback, may see the
+                                     ;; same binder again via ldiff at deeper nesting
+                                     (assert (typep binder 'wrapped-symbol))
+                                     (unless (typep binder 'binder)
+                                       (change-class binder 'binder))
+                                     (push binder res)))
+                              finally (return res))))
                      (if (and (consp form) (gethash form raw-form->loc))
                          (progn
                            (setf (gethash (gethash form raw-form->form) eval->binders)
@@ -1602,8 +1747,8 @@ Walks subforms of the call using WALKER during analysis."
 (defun parse (form env alter-identity)
   (cond
     ((atom form)
-     ;; vectors are self evaluating and non-atomic
-     (assert (typep form '(or symbol-ref literal array)))
+     ;; note: a LABEL-DEF is atomic here because in practice only literals are labelled
+     (assert (typep form '(or symbol-ref literal array label-def)))
      form)
     ((not (typep (car form) 'symbol-ref)) (error "non-operator ~a in car" (car form)))
     (t
@@ -1662,6 +1807,12 @@ Walks subforms of the call using WALKER during analysis."
    (trailing-data :initform (make-hash-table)
                   :reader trailing-data)))
 
+;; We need two kinds of fancy anchoring: (#|in|#) #|after|#
+(defstruct (trailing (:conc-name trailing-))
+  ;; only explicit empty ()
+  (inside nil)
+  (after nil))
+
 ;; and or not
 (defclass read-cond (eval-form atom-form)
   ((stuff :initarg :stuff
@@ -1679,20 +1830,57 @@ Walks subforms of the call using WALKER during analysis."
 (defmethod print-object ((object read-cond) stream)
   (format stream "<~a~a ~a>" (kind object) (flags object) (stuff object)))
 
-(defstruct read-evaluated form)
+(defstruct read-evaluated form feature-p)
 (defstruct read-conditional result)
+
+(defun label-reference-p (client source)
+  "Whether the span is some #n#. Needed for objects in construction."
+  (let ((str (source client)) (start (car source)) (end (cdr source)))
+    (and (> (- end start) 2)
+         (char= (char str start) #\#)
+         (char= (char str (1- end)) #\#)
+         (every #'digit-char-p (subseq str (1+ start) (1- end))))))
+
+(defun label-name (client source)
+  "pulls out the numeric part from #n= or #n#"
+  (multiple-value-bind (n end)
+      (parse-integer (source client) :start (1+ (car source)) :junk-allowed t)
+    (declare (ignore n))
+    (subseq (source client) (1+ (car source)) end)))
+
+(defun make-label-ref (client source)
+  (make-instance 'label-ref :name (label-name client source) :home-package nil))
+
+(defun wrap-marker (sym)
+  "For reader syntax, which must stay distinct from explicit references to that symbol."
+  (make-instance 'reader-marker :name (string sym) :home-package (symbol-package sym)))
+
+(defun anchor-trailing (client node kind comments)
+  (unless (null comments)
+    (let ((entry (ensure-gethash node (trailing-data client) (make-trailing))))
+      (ecase kind
+        (:inside (nconcf (trailing-inside entry) comments))
+        (:after (nconcf (trailing-after entry) comments))))))
 
 (defmethod eclector.parse-result:make-expression-result
     ((client my-client) (result t) (children t) (source t))
   (if (null children)
-      (cond ((symbolp result)
+      (cond ((label-reference-p client source) (make-label-ref client source))
+            ((symbolp result)
              (cond ((and (keywordp result) (= (- (cdr source) (car source))
                                               (length (string result))))
                     ;; note: eclector doesn't distinguish a literal keyword from a feature
                     (make-read-conditional :result result))
                    ((and (null result) (= 2 (- (cdr source) (car source))))
                     (make-instance 'literal :str "()"))
-                   (t (wrap-symbol result))))
+                   ;; note: eclector doesn't distinguish #:|.| and |.|
+                   ((and (null (symbol-package result))
+                         (= 1 (- (cdr source) (car source)))
+                         (string= (string result) "."))
+                    (make-instance 'dot-marker :name "." :home-package nil))
+                   (t
+                    (make-instance 'symbol-ref :name (string result)
+                                               :home-package (symbol-package result)))))
             ((and (atom result) (constantp result))
              (cond ((and (vectorp result) (zerop (length result))) ; empty, not bit vector
                     result)
@@ -1702,17 +1890,23 @@ Walks subforms of the call using WALKER during analysis."
             (t (error "weird constant ~a" result)))
       ;; compound form, or some wrapper
       (labels ((frobber ()
-                 ;; TODO discards trailing comments, could anchor to parent instead
+                 "the second value holds contained comments if the list was empty"
                  (loop with comments = nil
                        with res = (list)
                        for c in children
-                       do (if (not (typep c 'comment))
+                       do (if (not (typep c '(or comment read-cond)))
                               (progn
-                                (nconcf (gethash c (uneval-data client)) comments)
+                                (nconcf (gethash c (uneval-data client))
+                                        (nreverse comments))
                                 (push c res)
-                                (setf comments nil))
+                                (setf comments nil)) ; reset after reading form
                               (push c comments))
-                       finally (return (nreverse res))))
+                       finally (return
+                                 (if res
+                                     (progn (anchor-trailing client (car res) :after
+                                                             (nreverse comments))
+                                            (values (nreverse res) nil))
+                                     (values nil (nreverse comments))))))
                (frob-cons ()
                  (let ((conds (count-if #'read-conditional-p children)))
                    (if (plusp conds)
@@ -1721,7 +1915,7 @@ Walks subforms of the call using WALKER during analysis."
                             :result (mapcar #'(lambda (c) (if (read-conditional-p c)
                                                          (read-conditional-result c)
                                                          c))
-                                            children))
+                                              children))
                            (let ((read-cond-pos
                                    (position-if #'read-conditional-p children))
                                  (form (lastcar children)))
@@ -1737,33 +1931,38 @@ Walks subforms of the call using WALKER during analysis."
                                               :stuff (cdr c))
                                              (gethash form (uneval-data client))))
                              (lastcar children)))
-                       ;; note: dotted lists are parsed with the dot as a symbol reference,
-                       ;; this is needed to preserve comments. They must be treated specially
+                       ;; dotted lists are parsed with the dot as a symbol reference,
+                       ;; this is needed to preserve comments
                        (frobber)))))
         (typecase result
           (cons
            (case (car result)
-             ;; XXX does not support #+#.(foo), this is relatively common
              (function
-              `(,(wrap-symbol (if (and (typep (first children) 'symbol-ref)
-                                       (eq (resolve (first children)) 'function))
-                                  'function 'read-function))
+              `(,(if (and (typep (first children) 'symbol-ref)
+                          (eq (resolve (first children)) 'function))
+                     (first children)
+                     (wrap-marker 'function))
                 ,(lastcar children)))
              (quote
-              `(,(wrap-symbol (if (and (typep (first children) 'symbol-ref)
-                                       (eq (resolve (first children)) 'quote))
-                                  'quote 'read-quote))
+              `(,(if (and (typep (first children) 'symbol-ref)
+                          (eq (resolve (first children)) 'quote))
+                     (first children)
+                     (wrap-marker 'quote))
                 ,(lastcar children)))
              (eclector.reader:quasiquote
-              `(,(wrap-symbol 'eclector.reader:quasiquote) ,(lastcar children)))
+              `(,(wrap-marker 'eclector.reader:quasiquote) ,(lastcar children)))
              (eclector.reader:unquote
-              `(,(wrap-symbol 'eclector.reader:unquote) ,(lastcar children)))
+              `(,(wrap-marker 'eclector.reader:unquote) ,(lastcar children)))
              (eclector.reader:unquote-splicing
-              `(,(wrap-symbol 'eclector.reader:unquote-splicing) ,(lastcar children)))
+              `(,(wrap-marker 'eclector.reader:unquote-splicing) ,(lastcar children)))
              (t
               (frob-cons))))
           (read-evaluated
-           `(,(wrap-symbol 'read-eval) ,(lastcar children)))
+           (let ((form `(,(wrap-marker 'read-eval) ,(lastcar children))))
+             ;; as marked by eclector.reader:evaluate-expression below
+             (if (read-evaluated-feature-p result)
+                 (make-read-conditional :result form)
+                 form)))
           (vector (apply #'vector (frobber)))
           ;; how to track comments for multidimensional array literals?
           ;; fortunately nobody really uses them so I'll say won't fix
@@ -1771,10 +1970,15 @@ Walks subforms of the call using WALKER during analysis."
                                             :start (1+ (car source))
                                             :junk-allowed t)
                              :initial-contents (car children)))
-          ;; should be read-conditional wrapped
           (t
-           (assert (member-if #'read-conditional-p children))
-           (frob-cons))))))
+           (if (member-if #'read-conditional-p children)
+               (frob-cons)
+               ;; for (comments...), anchor them inside the empty list literal
+               (multiple-value-bind (res comments) (frobber)
+                 (assert (and (null result) (null res)))
+                 (let ((empty (make-instance 'literal :str "()")))
+                   (anchor-trailing client empty :inside comments)
+                   empty))))))))
 
 (defmethod eclector.parse-result:make-skipped-input-result
     ((client my-client) (stream t) (reason t) (children t) (source t))
@@ -1790,20 +1994,43 @@ Walks subforms of the call using WALKER during analysis."
        (make-instance 'comment :kind :block
                                :str (source-str (car source) (cdr source))))
       ((cons (eql :sharpsign-plus) res)
-       (print children)
        (make-instance 'read-cond :kind #\+ :flags res :stuff (rest children)))
       ((cons (eql :sharpsign-minus) res)
        (make-instance 'read-cond :kind #\- :flags res :stuff (rest children)))
       ((eql '*read-suppress*)
-       (assert (null children))
        (source-str (car source) (cdr source))))))
 
-(defmethod eclector.reader:evaluate-expression ((client my-client) (expression t))
-  (make-read-evaluated :form expression))
+(defmethod eclector.reader:find-character ((client my-client) (designator string))
+  (or (name-char designator) (call-next-method)))
 
-(defmethod eclector.reader:fixup ((client my-client) obj state)
-  (declare (ignore obj state))
-  (error "TODO handle circular lists, check eclector parse-result suite"))
+;; capture read-evaluated forms explicitly
+(defmethod eclector.reader:evaluate-expression ((client my-client) (expression t))
+  (make-read-evaluated
+   :form expression
+   ;; note: assume a feature expression is the sole place with *package* = KEYWORD
+   :feature-p (eq (eclector.reader:state-value client '*package*)
+                  (find-package '#:keyword))))
+
+(defmethod eclector.reader:evaluate-feature-expression
+    ((client my-client) (expression read-evaluated))
+  (eclector.reader:evaluate-feature-expression
+   client (eval (read-evaluated-form expression))))
+
+(defmethod eclector.parse-result:make-expression-result
+    ((client my-client) (result eclector.parse-result:definition) (children t) (source t))
+  "#n=form. The label is read back out of the source because the labeled object itself is
+passed with dynamic extent."
+  (make-instance 'label-def :name (label-name client source)
+                            :labeled (lastcar children)))
+
+(defmethod eclector.parse-result:make-expression-result
+    ((client my-client) (result eclector.parse-result:reference) (children t) (source t))
+  (declare (ignore children))
+  (make-label-ref client source))
+
+(defmethod eclector.reader:fixup-graph-p ((client my-client) (root t))
+  "This is a tree editor not a graph editor."
+  nil)
 
 (defun parse-from-string (s)
   (let ((client (make-instance 'my-client :source s)))
@@ -1811,11 +2038,18 @@ Walks subforms of the call using WALKER during analysis."
         (eclector.parse-result:read-from-string client s)
       (declare (ignore len))
       (let* ((comment-map (uneval-data client))
+             (trailing-map (trailing-data client))
              (res
                (parse form (make-env :%function-bindings '(read-eval))
                       (lambda (old new)
-                        (setf (gethash new comment-map) (gethash old comment-map))
-                        (remhash old comment-map)
+                        (when-let (data (gethash old comment-map))
+                          (setf (gethash new comment-map) data)
+                          (remhash old comment-map))
+                        (when-let (data (gethash old trailing-map))
+                          (setf (gethash new trailing-map) data)
+                          (remhash old trailing-map))
                         new))))
-        (setf (gethash res comment-map) leading-comments)
-        (values res (uneval-data client))))))
+        ;; note res can be a toplevel atom
+        (setf (gethash res comment-map)
+              (append leading-comments (gethash res comment-map)))
+        (values res (uneval-data client) (trailing-data client))))))
