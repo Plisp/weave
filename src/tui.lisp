@@ -390,7 +390,7 @@ if none, surround current atom"
 
 (defun view-below (atom-array y col)
   "Takes a y-offset from 0 to rows, this way it's possible to search the first row.
-COL should essentially indicate some preferred column. Returns NIL if not found."
+`col' should essentially indicate some preferred column. Returns NIL if not found."
   ;; note: must bounds-check y first
   (let ((new-y (position-if-not #'null atom-array :start y)))
     (or new-y (return-from view-below nil))
@@ -641,7 +641,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
       (cond ((symbol-char-p c)
              (let ((newnode
                      (make-instance 'parse:symbol-ref
-                                    :name (format nil "~a~a" s (string-upcase c)))))
+                                    :name (format nil "~a~a" s (string-upcase c))
+                                    :home-package (parse:home-package node))))
                (swap-node location newnode ui)
                (if-let (state (completion-state ui))
                  (setf (anchor state) newnode)
@@ -654,7 +655,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
              (let ((s (string s)))
                (if (< 1 (length s))
                    (let ((newnode (make-instance 'parse:symbol-ref
-                                                 :name (string-drop s 1))))
+                                                 :name (string-drop s 1)
+                                                 :home-package (parse:home-package node))))
                      (swap-node location newnode ui)
                      (when (completion-state ui)
                        (setf (completion-state ui)
@@ -689,7 +691,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
           (c (tui:event-kind event)))
       (cond ((symbol-char-p c)
              (swap-node location
-                        (make-instance 'parse:binder :name (format nil "~a~a" s c))
+                        (make-instance 'parse:binder :name (format nil "~a~a" s c)
+                                                     :home-package (parse:home-package node))
                         ui)
              t)
             ((char= c #\Rubout)
@@ -697,7 +700,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                (if (< 1 (length s))
                    (swap-node location
                               (make-instance 'parse:binder
-                                             :name (string-drop s 1))
+                                             :name (string-drop s 1)
+                                             :home-package (parse:home-package node))
                               ui)
                    (swap-node location (hole) ui)))
              t)))))
@@ -714,6 +718,21 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                    :key-handler (when focused
                                   (global-key-handler node location context))
                    :focused focused)))
+
+(defun render-symbol (op loc stack context rect)
+  "Renders `loc' as a bare focusable token for `op', a symbol."
+  (let* ((text (string-downcase op))
+         (focused (location= loc (focus context)))
+         (view (make-instance 'ast-view
+                              :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                              :location loc
+                              :hoverable t
+                              :key-handler (when focused (global-key-handler op loc context))
+                              :focused focused)))
+    (tui:puts text 1 1 rect)
+    (setf (view-stack view) (cons loc stack))
+    (when focused (setf (focus-rect context) (tui:rect view)))
+    view))
 
 ;;; list
 (defun flat-list-renderer (list loc-mapper stack context)
@@ -1035,15 +1054,16 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
     view))
 
 (defparameter *let-indent* 2)
+
 (defmethod render-node ((letnode parse:let*-form) stack context rect)
-  (let* ((op "let*")
+  (let* ((op 'let*)
          (location (car stack))
          (bindings
            (render-node
             (make-bindings :list (parse:vars letnode))
             (cons (make-location :node letnode :id 'parse:vars) stack)
             context
-            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length op) 1))
+            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "let*") 1))
                             rect)))
          (bind-rect (tui:rect bindings))
          (body-view
@@ -1055,30 +1075,77 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
                            (lambda (i) (make-location :node letnode :id (list 'parse:body i)))
                            stack context)))
          (body-rect (tui:rect body-view))
-         (let-op-loc (make-location :node letnode :id 'parse:op))
-         (let-op-focused (location= let-op-loc (focus context)))
-         (let-view
-           (make-instance 'ast-view
-                          :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width op))
-                          :location let-op-loc
-                          :hoverable t
-                          :key-handler (when let-op-focused
-                                         (global-key-handler 'let* let-op-loc context))
-                          :focused let-op-focused)))
-    (setf (view-stack let-view) (cons let-op-loc stack))
-    (when let-op-focused
-      (setf (focus-rect context) (tui:rect let-view)))
-    (tui:puts op 1 1 rect)
+         (let-view (render-symbol op (make-location :node letnode :id 'parse:op)
+                                 stack context rect)))
     (make-instance 'ast-view
                    :location location
                    :children (list let-view bindings body-view)
                    :rect (tui:copy-rect rect
                                         :rows (+ (tui:rect-rows bind-rect)
                                                  (tui:rect-rows body-rect))
-                                        :cols (max (+ (length op)
+                                        :cols (max (+ (length "let*")
                                                       1 (tui:rect-cols bind-rect))
                                                    (+ 2 (tui:rect-cols body-rect))))
                    :key-handler (global-key-handler letnode location context)
+                   :focused (location= location (focus context)))))
+
+;;; function-code (lambda-list and body, shared by defun/defmacro/defmethod/
+;;; lambda/flet/labels). TODO docstring/declarations
+(defparameter *lambda-body-indent* 2)
+(defmethod render-node ((node parse:function-code) stack context rect)
+  (let* ((location (car stack))
+         (lambda-list-view
+           (render-node
+            (parse:lambda-list node)
+            (cons (make-location :node node :id 'parse:lambda-list) stack)
+            context rect))
+         (ll-rect (tui:rect lambda-list-view))
+         (body-view
+           (tui:vertical-container
+            (tui:clamp-rect (tui:copy-rect rect :x (+ *lambda-body-indent* (tui:rect-x rect))
+                                                :y (tui:rect-y2 ll-rect))
+                            rect)
+            (list-renderer (parse:body node)
+                           (lambda (i) (make-location :node node :id (list 'parse:body i)))
+                           stack context)))
+         (body-rect (tui:rect body-view)))
+    (make-instance 'ast-view
+                   :location location
+                   :children (list lambda-list-view body-view)
+                   :rect (tui:copy-rect rect
+                                        :rows (+ (tui:rect-rows ll-rect)
+                                                 (tui:rect-rows body-rect))
+                                        :cols (max (tui:rect-cols ll-rect)
+                                                   (+ *lambda-body-indent*
+                                                      (tui:rect-cols body-rect))))
+                   :key-handler (global-key-handler node location context)
+                   :focused (location= location (focus context)))))
+
+(defmethod move-back ((node parse:function-code) id)
+  (trivia:cmatch id
+    ((list (eql 'parse:body) (and (type integer) i))
+     (if (< 0 i) (list 'parse:body (1- i)) 'parse:lambda-list))))
+
+(defmethod render-node ((node parse:lambda-form) stack context rect)
+  (let* ((op 'lambda)
+         (location (car stack))
+         (fc-view
+           (render-node
+            (parse:fun-code node)
+            (cons (make-location :node node :id 'parse:fun-code) stack)
+            context
+            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "lambda") 1))
+                            rect)))
+         (fc-rect (tui:rect fc-view))
+         (op-view (render-symbol op (make-location :node node :id 'parse:op)
+                                stack context rect)))
+    (make-instance 'ast-view
+                   :location location
+                   :children (list op-view fc-view)
+                   :rect (tui:copy-rect rect
+                                        :rows (tui:rect-rows fc-rect)
+                                        :cols (+ (length "lambda") 1 (tui:rect-cols fc-rect)))
+                   :key-handler (global-key-handler node location context)
                    :focused (location= location (focus context)))))
 
 ;;; global key handlers
@@ -1378,8 +1445,8 @@ COL should essentially indicate some preferred column. Returns NIL if not found.
 
 (defun tui-main ()
   (let* ((ast (parse::parse-from-string
-               "(let* ((aaa 3) (bbb (/ aaa aaa)))
-                  (1- b))"))
+               "(lambda (a &key (b a supplied-p))
+                  (1- b) :test)"))
          (root-loc (make-location :node 'undefined))
          (tui (make-instance 'ui :ast ast :stack (list root-loc))))
     (setf *state* tui)
