@@ -514,15 +514,15 @@ Otherwise RAW's identity migrates to the rebuilt list."
 ;; we need to be more permissive for lambda lists. It makes little sense to preserve
 ;; well-formedness when it often breaks with edits due to positional &keyword context
 ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
-(defun map-lambda-list (list on-binder value-mapper specializer-list-p
+;; note: dot is treated as a symbol-ref by reading, but dotted lists shouldn't come up
+;; even during macroexpansion since lambda list are nested in evaluation contexts
+(defun map-lambda-list (list on-binder value-mapper on-syntax specializer-list-p
                         &optional destructure-p alter-identity)
   "Doesn't force well-formedness and tries to be very tolerant. Reconstructs the list
-structure from the return values of `on-binder' and `value-mapper'. `destructure-p' allows
-&optional/&rest/&body vars, and &key vars as a (keyword-name var) pair, to themselves be
-nested macro lambda lists (CLHS 3.4.4). An empty list () is handed back as itself, nothing
-being rebuilt, so it keeps its provenance."
-  ;; note: dot is treated as a symbol-ref by reading, but dotted lists shouldn't come up
-  ;; even during macroexpansion since lambda list are nested in evaluation contexts
+structure from the return values of `on-binder', `value-mapper' and `on-syntax' - the
+latter sees specifically lambda-list list keywords and the keyword of a ((:key var) ...)
+pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
+(keyword-name var) pair, to themselves be nested macro lambda lists (CLHS 3.4.4)."
   (when (null-ref-p list)
     (return-from map-lambda-list list))
   (let ((new
@@ -534,7 +534,7 @@ being rebuilt, so it keeps its provenance."
             do (labels ((bind-var (v)
                           (cond ((typep v 'symbol-like) (funcall on-binder v))
                                 ((and destructure-p (consp v))
-                                 (map-macro-lambda v on-binder value-mapper
+                                 (map-macro-lambda v on-binder value-mapper on-syntax
                                                    alter-identity))
                                 (t (funcall value-mapper v))))
                         ;; note: only meaningful for a specializer list
@@ -543,7 +543,8 @@ being rebuilt, so it keeps its provenance."
                               val
                               (funcall value-mapper val))))
                  (if keyword
-                     (progn (setf current-keyword keyword) (push elt res))
+                     (progn (setf current-keyword keyword)
+                            (push (funcall on-syntax elt) res))
                      (push
                       (case current-keyword
                         ((&rest &body) (bind-var elt))
@@ -562,8 +563,9 @@ being rebuilt, so it keeps its provenance."
                                   (let* ((new-var
                                            (if (typep var 'symbol-like)
                                                (funcall on-binder var)
-                                               (let ((inner `(,(first var)
-                                                              ,(bind-var (second var)))))
+                                               (let ((inner
+                                                       `(,(funcall on-syntax (first var))
+                                                         ,(bind-var (second var)))))
                                                  (when alter-identity
                                                    (funcall alter-identity var inner))
                                                  inner)))
@@ -619,7 +621,7 @@ being rebuilt, so it keeps its provenance."
     (when alter-identity (funcall alter-identity list new))
     new))
 
-(defun map-macro-lambda (list on-binder value-mapper &optional alter-identity)
+(defun map-macro-lambda (list on-binder value-mapper on-syntax &optional alter-identity)
   (when (null-ref-p list)
     (return-from map-macro-lambda list))
   (let ((new (loop
@@ -628,12 +630,19 @@ being rebuilt, so it keeps its provenance."
                for this = (car rest)
                do (cond ((tag-member this '(&body &rest &key &optional &aux))
                          (return (nreconc res (map-lambda-list rest on-binder value-mapper
-                                                               nil t alter-identity))))
-                        ((tag-member this lambda-list-keywords) (push this res))
+                                                               on-syntax nil t
+                                                               alter-identity))))
+                        ((tag-member this lambda-list-keywords)
+                         (push (funcall on-syntax this) res))
                         ((consp this)
-                         (push (map-macro-lambda this on-binder value-mapper alter-identity)
+                         (push (map-macro-lambda this on-binder value-mapper on-syntax
+                                                 alter-identity)
                                res))
-                        ((or (null-ref-p this) (null (unwrap-refs this))) (push this res))
+                        ;; reader dot, or a literal nil placeholder
+                        ((or (typep this 'dot-marker)
+                             (null-ref-p this)
+                             (null (unwrap-refs this)))
+                         (push (funcall on-syntax this) res))
                         ((stringp (unwrap-refs this)) (push (funcall on-binder this) res))
                         (t (push (funcall value-mapper this) res)))
                finally (return (nreverse res)))))
@@ -645,9 +654,10 @@ being rebuilt, so it keeps its provenance."
 `lambda-list-kind' selects which grammar to walk it with.
 The specializer-list-p argument is always NIL so we can classify specializers."
   (if (eq (lambda-list-kind node) '&macro-lambda)
-      (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form))
+      (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form)
+                        (constantly 'unevaluated))
       (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form)
-                       nil)))
+                       (constantly 'unevaluated) nil)))
 
 (defmethod get-location ((node function-code) id)
   (trivia:cmatch id
@@ -1144,12 +1154,14 @@ Any binding forces a symbol match.
                                         (function-info-arglist ,info)
                                         #'note-binder
                                         (lambda (form) ; capture direct reference vvv
-                                          (funcall walker form newenv-with-params)))
+                                          (funcall walker form newenv-with-params))
+                                        #'identity)
                                       `(map-lambda-list
                                         (function-info-arglist ,info)
                                         #'note-binder
                                         (lambda (form)
                                           (funcall walker form newenv-with-params))
+                                        #'identity
                                         ,(eq ctx-kind '&method-lambda))))
                                     with newenv-with-params := ,env
                                     for body-form in (function-info-body ,info)
@@ -1238,12 +1250,14 @@ Any binding forces a symbol match.
                                               #'note-binder
                                               (lambda (form)
                                                 (funcall walker form newenv-with-params))
+                                              #'identity
                                               alter-identity)
                                             `(map-lambda-list
                                               (function-info-arglist ,info)
                                               #'note-binder
                                               (lambda (form)
                                                 (funcall walker form newenv-with-params))
+                                              #'identity
                                               ,(eq kind '&method-lambda)
                                               nil alter-identity)))
                                 for body-form in (function-info-body ,info)
