@@ -526,99 +526,96 @@ being rebuilt, so it keeps its provenance."
   (when (null-ref-p list)
     (return-from map-lambda-list list))
   (let ((new
-          (loop with current-keyword := nil
-                with res := (list)
-                for elt in list
-                for keyword := (tag-member elt lambda-list-keywords)
-                do (labels ((bind-var (v)
-                              (cond ((typep v 'symbol-like) (funcall on-binder v))
-                                    ((and destructure-p (consp v))
-                                     (map-macro-lambda v on-binder value-mapper
-                                                       alter-identity))
-                                    (t (funcall value-mapper v))))
-                            ;; note: only meaningful for a specializer list
-                            (maybe-default (val)
-                              (if (and specializer-list-p (not current-keyword))
-                                  val
-                                  (funcall value-mapper val))))
-                     (if keyword
-                         (progn (setf current-keyword keyword) (push elt res))
-                         (push
-                          (case current-keyword
-                            ((&rest &body) (bind-var elt))
-                            (&key
-                             (trivia:match elt
-                               ((or (and (type symbol-like) v)
-                                    ;; keyword or method-like
-                                    (list (and (type symbol-like) v)))
-                                (funcall on-binder v))
-                               ;; keyword name, optionally wrapping a pattern
-                               ((list (list kw-name v) val)
-                                (let* ((inner `(,kw-name ,(bind-var v)))
-                                       (new `(,inner ,(funcall value-mapper val))))
-                                  (when alter-identity
-                                    (funcall alter-identity (first elt) inner)
-                                    (funcall alter-identity elt new))
-                                  new))
-                               ;; supplied-p
-                               ((list (list kw-name v) val
-                                      (and (type symbol-like) supplied-p))
-                                (let* ((inner `(,kw-name ,(bind-var v)))
-                                       (new `(,inner ,(funcall value-mapper val)
-                                                     ,(funcall on-binder supplied-p))))
-                                  (when alter-identity
-                                    (funcall alter-identity (first elt) inner)
-                                    (funcall alter-identity elt new))
-                                  new))
-                               ;; default value, no keyword-name wrapper
-                               ((list (and (type symbol-like) v) val)
-                                (let ((new `(,(funcall on-binder v)
-                                             ,(funcall value-mapper val))))
-                                  (when alter-identity (funcall alter-identity elt new))
-                                  new))
-                               ((list (and (type symbol-like) v) val
-                                      (and (type symbol-like) supplied-p))
-                                (let ((new `(,(funcall on-binder v)
-                                             ,(funcall value-mapper val)
-                                             ,(funcall on-binder supplied-p))))
-                                  (when alter-identity (funcall alter-identity elt new))
-                                  new))
-                               (_ (funcall value-mapper elt))))
-                            (&optional
-                             (trivia:match elt
-                               ((or (and (type symbol-like) v)
-                                    (list (and (type symbol-like) v)))
-                                (funcall on-binder v))
-                               ((list v val)
-                                (let ((new `(,(bind-var v) ,(funcall value-mapper val))))
-                                  (when alter-identity (funcall alter-identity elt new))
-                                  new))
-                               ((list v val (and (type symbol-like) supplied-p))
-                                (let ((new `(,(bind-var v) ,(funcall value-mapper val)
-                                             ,(funcall on-binder supplied-p))))
-                                  (when alter-identity (funcall alter-identity elt new))
-                                  new))
-                               (_ (funcall value-mapper elt))))
-                            (t
-                             (trivia:match elt
-                               ((or (and (type symbol-like) v)
-                                    ;; keyword or method-like
-                                    (list (and (type symbol-like) v)))
-                                (funcall on-binder v))
-                               ;; default value or specializer
-                               ((list (and (type symbol-like) v) val)
-                                (let ((new `(,(funcall on-binder v) ,(maybe-default val))))
-                                  (when alter-identity (funcall alter-identity elt new))
-                                  new))
-                               ((list (and (type symbol-like) v) val
-                                      (and (type symbol-like) supplied-p))
-                                (let ((new `(,(funcall on-binder v) ,(maybe-default val)
-                                             ,(funcall on-binder supplied-p))))
-                                  (when alter-identity (funcall alter-identity elt new))
-                                  new))
-                               (_ (funcall value-mapper elt)))))
-                          res)))
-                finally (return (nreverse res)))))
+          (loop
+            with current-keyword := nil
+            with res := (list)
+            for elt in list
+            for keyword := (tag-member elt lambda-list-keywords)
+            do (labels ((bind-var (v)
+                          (cond ((typep v 'symbol-like) (funcall on-binder v))
+                                ((and destructure-p (consp v))
+                                 (map-macro-lambda v on-binder value-mapper
+                                                   alter-identity))
+                                (t (funcall value-mapper v))))
+                        ;; note: only meaningful for a specializer list
+                        (maybe-default (val)
+                          (if (and specializer-list-p (not current-keyword))
+                              val
+                              (funcall value-mapper val))))
+                 (if keyword
+                     (progn (setf current-keyword keyword) (push elt res))
+                     (push
+                      (case current-keyword
+                        ((&rest &body) (bind-var elt))
+                        (&key
+                         (trivia:match elt
+                           ((and (type symbol-like) v) (funcall on-binder v))
+                           ((list* var tail)
+                            (destructuring-bind
+                                (&optional (val nil val-p) (supplied-p nil supplied)
+                                 &rest extra)
+                                tail
+                              (if (or extra
+                                      (and supplied (not (typep supplied-p 'symbol-like)))
+                                      (not (typep var '(or symbol-like cons))))
+                                  (funcall value-mapper elt)
+                                  (let* ((new-var
+                                           (if (typep var 'symbol-like)
+                                               (funcall on-binder var)
+                                               (let ((inner `(,(first var)
+                                                              ,(bind-var (second var)))))
+                                                 (when alter-identity
+                                                   (funcall alter-identity var inner))
+                                                 inner)))
+                                         (new `(,new-var
+                                                ,@(when val-p
+                                                    `(,(funcall value-mapper val)))
+                                                ,@(when supplied
+                                                    `(,(funcall on-binder supplied-p))))))
+                                    (when alter-identity
+                                      (funcall alter-identity elt new))
+                                    new))))
+                           (_ (funcall value-mapper elt))))
+                        (&optional
+                         (trivia:match elt
+                           ((and (type symbol-like) v) (funcall on-binder v))
+                           ((list* var (and (type list) tail))
+                            (destructuring-bind
+                                (&optional (val nil val-p) (supplied-p nil supplied)
+                                 &rest extra)
+                                tail
+                              (if (or extra
+                                      (and supplied (not (typep supplied-p 'symbol-like))))
+                                  (funcall value-mapper elt)
+                                  (let ((new `(,(bind-var var)
+                                               ,@(when val-p
+                                                   `(,(funcall value-mapper val)))
+                                               ,@(when supplied
+                                                   `(,(funcall on-binder supplied-p))))))
+                                    (when alter-identity
+                                      (funcall alter-identity elt new))
+                                    new))))
+                           (_ (funcall value-mapper elt))))
+                        (t
+                         (trivia:match elt
+                           ((or (and (type symbol-like) v)
+                                ;; keyword or method-like
+                                (list (and (type symbol-like) v)))
+                            (funcall on-binder v))
+                           ;; default value or specializer
+                           ((list (and (type symbol-like) v) val)
+                            (let ((new `(,(funcall on-binder v) ,(maybe-default val))))
+                              (when alter-identity (funcall alter-identity elt new))
+                              new))
+                           ((list (and (type symbol-like) v) val
+                                  (and (type symbol-like) supplied-p))
+                            (let ((new `(,(funcall on-binder v) ,(maybe-default val)
+                                         ,(funcall on-binder supplied-p))))
+                              (when alter-identity (funcall alter-identity elt new))
+                              new))
+                           (_ (funcall value-mapper elt)))))
+                      res)))
+            finally (return (nreverse res)))))
     (when alter-identity (funcall alter-identity list new))
     new))
 
@@ -823,7 +820,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
   (defun location-methods (classname spec-kinds rest-patterns binds)
     "Emits the get-location/update/location-sort methods for a defform class.
 Generally the tag name indexes the whole slot and (tag integer*) index tree structure."
-    (let ((slots (mapcar #'car spec-kinds))
+    (let ((slots (remove-duplicates (mapcar #'car spec-kinds)))
           (get-clauses (list))
           (update-clauses (list))
           (sort-clauses (list)))
@@ -1042,11 +1039,11 @@ Any binding forces a symbol match.
                                    rest-patterns)))
          (bind-rest-tags (check-binds tag-kinds rest-patterns binds))
          (classname (symbolicate name "-FORM"))
-         (slots (mapcar #'car (spec-kinds spec))))
+         (slots (remove-duplicates (mapcar #'car (spec-kinds spec)))))
     `(progn
        (defclass ,classname (irregular-form)
          ((op :initarg :op :initform ',name :accessor op)
-          ,@(loop for name in (remove-duplicates slots :test #'equal)
+          ,@(loop for name in slots
                   collect `(,name :initarg ,(make-keyword name)
                                   :accessor ,name))))
        ;; methods
@@ -1054,13 +1051,13 @@ Any binding forces a symbol match.
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
        (defmethod copy-node ((old ,classname))
          (let ((new (make-instance ',classname :op (op old))))
-           ,@(loop for name in (remove-duplicates slots :test #'equal)
+           ,@(loop for name in slots
                    collect `(setf (,name new) (copy-node (,name old))))
            new))
        ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
        ;; exports
        (export ',classname)
-       ,@(loop for name in (remove-duplicates slots :test #'equal)
+       ,@(loop for name in slots
                collect `(export ',name))
 
        ;; this merely does validation and preserves identity of all checked lists
@@ -1448,7 +1445,8 @@ other atom."
 (setf (gethash 'eclector.reader:quasiquote *special-walkers*) #'walk-quasiquote)
 (setf (gethash 'eclector.reader:quasiquote *special-parsers*) #'parse-quasiquote)
 
-(defform (defmethod name &rest-qualifiers qualifiers &method-lambda fun-code)
+(defform (defmethod &or (name &rest-qualifiers qualifiers &method-lambda fun-code)
+                    ((setf-op name) &rest-qualifiers qualifiers &method-lambda fun-code))
   :binds ((fun-code :function name :block name)))
 
 (defform (let (&rest vars)
@@ -1500,7 +1498,7 @@ other atom."
 (defform (block name &body body)
   :binds ((body :block name)))
 
-(defform (defun name &lambda fun-code)
+(defform (defun &or (name &lambda fun-code) ((setf-op name) &lambda fun-code))
   :binds ((fun-code :block name :function name)))
 
 (defform (lambda &lambda fun-code)
@@ -1894,6 +1892,19 @@ Walks subforms of the call using WALKER during analysis."
         (:inside (nconcf (trailing-inside entry) comments))
         (:after (nconcf (trailing-after entry) comments))))))
 
+(defun sharpsign-start (client source)
+  "work backwards from the list returned by eclector"
+  (let* ((str (source client))
+         (hash (position #\# str :end (car source) :from-end t)))
+    (if (and hash (loop for i from (1+ hash) below (car source)
+                        always (alphanumericp (char str i))))
+        hash
+        (car source))))
+
+(defmethod eclector.reader:make-structure-instance
+    ((client my-client) (name t) (initargs t))
+  nil)
+
 (defmethod eclector.parse-result:make-expression-result
     ((client my-client) (result t) (children t) (source t))
   (if (null children)
@@ -2003,14 +2014,23 @@ Walks subforms of the call using WALKER during analysis."
                                             :junk-allowed t)
                              :initial-contents (car children)))
           (t
-           (if (member-if #'read-conditional-p children)
-               (frob-cons)
-               ;; for (comments...), anchor them inside the empty list literal
-               (multiple-value-bind (res comments) (frobber)
-                 (assert (and (null result) (null res)))
-                 (let ((empty (make-instance 'literal :str "()")))
-                   (anchor-trailing client empty :inside comments)
-                   empty))))))))
+           (cond ((member-if #'read-conditional-p children)
+                  (frob-cons))
+                 ;; atom with children #C(1 2), #P"/tmp", #S(pt :x 1)
+                 (result
+                  (make-instance 'literal :str (subseq (source client)
+                                                       (car source) (cdr source))))
+                 (t
+                  (multiple-value-bind (res comments) (frobber)
+                    (if res
+                        (make-instance 'literal
+                                       :str (subseq (source client)
+                                                    (sharpsign-start client source)
+                                                    (cdr source)))
+                        ;; for (comments...), anchor them inside the empty list literal
+                        (let ((empty (make-instance 'literal :str "()")))
+                          (anchor-trailing client empty :inside comments)
+                          empty))))))))))
 
 (defmethod eclector.parse-result:make-skipped-input-result
     ((client my-client) (stream t) (reason t) (children t) (source t))
