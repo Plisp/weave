@@ -213,14 +213,16 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 
 (defun ast-insert (item loc index ui &optional (stack (stack ui)))
   (multiple-value-bind (new-stack root)
-      (rebuild-spine loc (lambda (body) (list-insert body item index)) stack)
+      (rebuild-spine loc
+                     (lambda (body) (list-insert (parse:ref-list body) item index))
+                     stack)
     (commit-edit ui new-stack root)
     (refocus ui (append-id (location-id loc) index))))
 
 (defun ast-delete (loc index ui &optional (stack (stack ui)))
   "assumes that list has length > 1"
   (multiple-value-bind (new-stack root)
-      (rebuild-spine loc (lambda (body) (list-remove body index)) stack)
+      (rebuild-spine loc (lambda (body) (list-remove (parse:ref-list body) index)) stack)
     (commit-edit ui new-stack root)
     (refocus ui (append-id (location-id loc) (max 0 (1- index))))))
 
@@ -720,15 +722,16 @@ if none, surround current atom"
                    :focused focused)))
 
 (defun render-symbol (op loc stack context rect)
-  "Renders `loc' as a bare focusable token for `op', a symbol."
+  "Renders `loc' as a bare focusable token for `op', a string designator."
   (let* ((text (string-downcase op))
          (focused (location= loc (focus context)))
-         (view (make-instance 'ast-view
-                              :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
-                              :location loc
-                              :hoverable t
-                              :key-handler (when focused (global-key-handler op loc context))
-                              :focused focused)))
+         (view
+           (make-instance 'ast-view
+                          :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                          :location loc
+                          :hoverable t
+                          :key-handler (when focused (global-key-handler op loc context))
+                          :focused focused)))
     (tui:puts text 1 1 rect)
     (setf (view-stack view) (cons loc stack))
     (when focused (setf (focus-rect context) (tui:rect view)))
@@ -997,7 +1000,7 @@ if none, surround current atom"
           (vars-loc (make-location :node letnode :id 'parse:vars)))
      (trivia:match (slog (location-id letloc))
        ((list (eql 'parse:vars) (and (type integer) bi))
-        (if (= 1 (length (getloc vars-loc)))
+        (if (= 1 (length (parse:ref-list (getloc vars-loc))))
             (swap-node vars-loc (list `(,(hole) ,(hole))) ui)
             (progn
               (save-history ui)
@@ -1060,7 +1063,7 @@ if none, surround current atom"
          (location (car stack))
          (bindings
            (render-node
-            (make-bindings :list (parse:vars letnode))
+            (make-bindings :list (parse:ref-list (parse:vars letnode)))
             (cons (make-location :node letnode :id 'parse:vars) stack)
             context
             (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "let*") 1))
@@ -1096,7 +1099,7 @@ if none, surround current atom"
   (let* ((location (car stack))
          (lambda-list-view
            (render-node
-            (parse:lambda-list node)
+            (parse:ref-list (parse:lambda-list node))
             (cons (make-location :node node :id 'parse:lambda-list) stack)
             context rect))
          (ll-rect (tui:rect lambda-list-view))
@@ -1127,14 +1130,14 @@ if none, surround current atom"
      (if (< 0 i) (list 'parse:body (1- i)) 'parse:lambda-list))))
 
 (defmethod render-node ((node parse:lambda-form) stack context rect)
-  (let* ((op 'lambda)
+  (let* ((op "λ")
          (location (car stack))
          (fc-view
            (render-node
             (parse:fun-code node)
             (cons (make-location :node node :id 'parse:fun-code) stack)
             context
-            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "lambda") 1))
+            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) 1 1))
                             rect)))
          (fc-rect (tui:rect fc-view))
          (op-view (render-symbol op (make-location :node node :id 'parse:op)
@@ -1144,7 +1147,7 @@ if none, surround current atom"
                    :children (list op-view fc-view)
                    :rect (tui:copy-rect rect
                                         :rows (tui:rect-rows fc-rect)
-                                        :cols (+ (length "lambda") 1 (tui:rect-cols fc-rect)))
+                                        :cols (+ 1 1 (tui:rect-cols fc-rect)))
                    :key-handler (global-key-handler node location context)
                    :focused (location= location (focus context)))))
 

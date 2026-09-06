@@ -19,6 +19,7 @@
            #:function-call #:literal
            #:unevaluated
            #:body #:name #:str #:vars #:op
+           #:ref-list
            #:function-code #:lambda-list
            #:home-package
            ))
@@ -489,10 +490,16 @@ does not touch hardwired operators."
 (defun null-ref-p (list)
   (and (typep list 'literal) (string= (str list) "()")))
 
-(defun ref-ensure-list (list)
-  (if (and (typep list 'literal) (string= (str list) "()"))
-      nil
-      list))
+(defun ref-list (list)
+  "Coerces an ast list representation to an actual list. In particular empty list -> nil. "
+  (if (null-ref-p list) nil list))
+
+(defun parsed-ref-list (raw parsed alter-identity)
+  "An explicit empty list () has no elements to parse and retains its provenance.
+Otherwise RAW's identity migrates to the rebuilt list."
+  (if (null-ref-p raw)
+      raw
+      (funcall alter-identity raw parsed)))
 
 (defun resolve (wrapper)
   (if-let (p (home-package wrapper))
@@ -509,12 +516,15 @@ does not touch hardwired operators."
 ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
 (defun map-lambda-list (list on-binder value-mapper specializer-list-p
                         &optional destructure-p alter-identity)
-  "Requires a proper list (NOT literal) but otherwise doesn't force well-formedness and
-tries to be very tolerant. Reconstructs the list structure from the return values of
-`on-binder' and `value-mapper'. `destructure-p' allows &optional/&rest/&body vars, and &key
-vars as a (keyword-name var) pair, to themselves be nested macro lambda lists (CLHS 3.4.4)."
+  "Doesn't force well-formedness and tries to be very tolerant. Reconstructs the list
+structure from the return values of `on-binder' and `value-mapper'. `destructure-p' allows
+&optional/&rest/&body vars, and &key vars as a (keyword-name var) pair, to themselves be
+nested macro lambda lists (CLHS 3.4.4). An empty list () is handed back as itself, nothing
+being rebuilt, so it keeps its provenance."
   ;; note: dot is treated as a symbol-ref by reading, but dotted lists shouldn't come up
   ;; even during macroexpansion since lambda list are nested in evaluation contexts
+  (when (null-ref-p list)
+    (return-from map-lambda-list list))
   (let ((new
           (loop with current-keyword := nil
                 with res := (list)
@@ -613,6 +623,8 @@ vars as a (keyword-name var) pair, to themselves be nested macro lambda lists (C
     new))
 
 (defun map-macro-lambda (list on-binder value-mapper &optional alter-identity)
+  (when (null-ref-p list)
+    (return-from map-macro-lambda list))
   (let ((new (loop
                with res := (list)
                for rest on list
@@ -624,7 +636,7 @@ vars as a (keyword-name var) pair, to themselves be nested macro lambda lists (C
                         ((consp this)
                          (push (map-macro-lambda this on-binder value-mapper alter-identity)
                                res))
-                        ((null (unwrap-refs this)) (push this res))
+                        ((or (null-ref-p this) (null (unwrap-refs this))) (push this res))
                         ((stringp (unwrap-refs this)) (push (funcall on-binder this) res))
                         (t (push (funcall value-mapper this) res)))
                finally (return (nreverse res)))))
@@ -643,7 +655,8 @@ The specializer-list-p argument is always NIL so we can classify specializers."
 (defmethod get-location ((node function-code) id)
   (trivia:cmatch id
     ((eql 'lambda-list) (lambda-list node))
-    ((list* (eql 'lambda-list) path) (tree-ref (lambda-list node) path))
+    ((list* (eql 'lambda-list) path)
+     (when-let (l (ref-list (lambda-list node))) (tree-ref l path)))
     ((eql 'docstring) (docstring node))
     ((eql 'declarations) (declarations node))
     ((eql 'body) (body node))
@@ -658,7 +671,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
     (trivia:cmatch id
       ((eql 'lambda-list) (rebuild :lambda-list new-value))
       ((list* (eql 'lambda-list) path)
-       (rebuild :lambda-list (tree-update (lambda-list node) path new-value)))
+       (rebuild :lambda-list (tree-update (ref-list (lambda-list node)) path new-value)))
       ((eql 'docstring) (rebuild :docstring new-value))
       ((eql 'declarations) (rebuild :declarations new-value))
       ((eql 'body) (rebuild :body new-value))
@@ -669,7 +682,8 @@ The specializer-list-p argument is always NIL so we can classify specializers."
   (trivia:match id
     ((eql 'docstring) 'string)
     ((list (eql 'body) (type integer)) 'eval-form)
-    ((list* (eql 'lambda-list) path) (tree-ref (lambda-list-sorts node) path))))
+    ((list* (eql 'lambda-list) path)
+     (when-let (sorts (ref-list (lambda-list-sorts node))) (tree-ref sorts path)))))
 
 (defun parse-body-declarations (body documentation)
   "Wraps alexandria but throws a form-parse-error"
@@ -818,7 +832,11 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                                :op (op node)
                                ,@(loop for s in slots
                                        append `(,(make-keyword s)
-                                                ,(if (eq s slot) value `(,s node)))))))
+                                                ,(if (eq s slot) value `(,s node))))))
+             ;; note: a whole &rest slot is fetched as written, () included, since it names
+             ;; a location the editor may sit on. Indexing into it means its elements
+             (elements (part kind)
+               (if (eq kind '&rest) `(ref-list (,part node)) `(,part node))))
         (push `((eql 'op) (op node)) get-clauses)
         ;; accessors
         (loop
@@ -829,10 +847,10 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
              (case kind
                ((&rest &body)
                 (push `((list (eql ',part) (and (type integer) i))
-                        (nth i (,part node)))
+                        (nth i ,(elements part kind)))
                       get-clauses)
                 (push `((list (eql ',part) (and (type integer) i))
-                        ,(rebuild part `(list-update (,part node) new-value i)))
+                        ,(rebuild part `(list-update ,(elements part kind) new-value i)))
                       update-clauses))
                (&tree
                 (push `((list* (eql ',part) path) (tree-ref (,part node) path))
@@ -846,14 +864,14 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                (when-let (pattern (cdr (assoc part rest-patterns)))
                  (push `((list (eql ',part) (and (type integer) i)
                                (and (type integer) j))
-                         (nth j (ensure-list (nth i (,part node)))))
+                         (nth j (ensure-list (nth i ,(elements part kind)))))
                        get-clauses)
                  (push `((list (eql ',part) (and (type integer) i)
                                (and (type integer) j))
                          ,(rebuild part `(list-update
-                                          (,part node)
+                                          ,(elements part kind)
                                           (list-update
-                                           (ensure-list (nth i (,part node)))
+                                           (ensure-list (nth i ,(elements part kind)))
                                            new-value j)
                                           i)))
                        update-clauses)))
@@ -903,10 +921,10 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
 
 (defmacro spec-parser (spec binds rest-patterns ref-p)
   "Expects a valid spec, binds and rest-patterns. ref-p controls whether to check
-a parsed representation."
+our reader representation or ordinary sexps."
   (with-gensyms (form body decls doc qualifiers)
-    (flet ((ref-ensure-list-form (form)
-             `(if ,ref-p (ref-ensure-list ,form) ,form)))
+    (flet ((ref-list-form (form)
+             `(if ,ref-p (ref-list ,form) ,form)))
       (cond
         ((null spec) ; no more entries in current list, not forced by spec keyword
          `(lambda (,form)
@@ -924,7 +942,7 @@ a parsed representation."
         ;; note: catches list nil before car recursion
         ((listp (car spec))
          `(lambda (,form)
-            (if (listp ,(ref-ensure-list-form `(car ,form)))
+            (if (listp ,(ref-list-form `(car ,form)))
                 (progn (funcall (spec-parser ,(car spec) ,binds ,rest-patterns ,ref-p)
                                 (car ,form))
                        (funcall (spec-parser ,(cdr spec) ,binds ,rest-patterns ,ref-p)
@@ -957,14 +975,14 @@ a parsed representation."
                  (form-parse-error "missing lambda list"))
                (multiple-value-bind (,body ,decls ,doc)
                    (parse-body-declarations (cdr ,form) t)
-                 (push (make-function-info :arglist ,(ref-ensure-list-form `(car ,form))
+                 (push (make-function-info :arglist (car ,form)
                                            :documentation ,doc
                                            :decls ,decls
                                            :body ,body)
                        ,(second spec)))))
            (&body
             `(lambda (,form)
-               (push ,(ref-ensure-list-form `,form) ,(second spec))))
+               (push ,(ref-list-form `,form) ,(second spec))))
            (&tree
             `(lambda (,form)
                (push (car ,form) ,(second spec))
@@ -975,8 +993,9 @@ a parsed representation."
                ,(if-let (pattern (cdr (assoc (second spec) rest-patterns)))
                   `(progn
                      (mapc (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
-                           ,(ref-ensure-list-form `,form))
-                     (push ,(ref-ensure-list-form `,form) ,(second spec)))
+                           ,(ref-list-form `,form))
+                     ;; preserve empty list literal
+                     (push ,form ,(second spec)))
                   (error "no pattern for rest"))))
            (&rest-qualifiers
             `(lambda (,form)
@@ -1067,7 +1086,8 @@ Any binding forces a symbol match.
                                    ,(trivia:ematch record
                                       ((list (type symbol) whole-tag)
                                        `(mapcar (lambda (r) (ref-coerce-symbol (car r)))
-                                                (apply #'append ,whole-tag)))
+                                                (apply #'append
+                                                       (mapcar #'ref-list ,whole-tag))))
                                       ;; binding records may SHARE STRUCTURE
                                       ((type symbol)
                                        `(mapcar #'ref-coerce-symbol ,record)))))
@@ -1258,7 +1278,7 @@ Any binding forces a symbol match.
                                     `(loop
                                        with ,res := (list)
                                        with ,newenv := ,(augment-env `env init-binds)
-                                       for ,whole in (first ,tag)
+                                       for ,whole in (ref-list (first ,tag))
                                        do (if (typep ,whole 'symbol-ref)
                                               (push (change-class ,whole 'binder) ,res)
                                               (let* ((,b (first ,whole))
@@ -1269,26 +1289,30 @@ Any binding forces a symbol match.
                                                             (cdr ,whole)))))
                                                 (funcall alter-identity ,whole ,new-whole)
                                                 (push ,new-whole ,res)))
-                                       finally (setf ,res (nreverse ,res))
-                                               (setf (,tag ast) ,res)
-                                               (funcall alter-identity (first ,tag) ,res)))
+                                       finally (setf (,tag ast)
+                                                     (parsed-ref-list (first ,tag)
+                                                                      (nreverse ,res)
+                                                                      alter-identity))))
                                   ;; normal, parallel bindings
                                   (with-gensyms (whole)
-                                    `(progn
-                                       (setf
-                                        (,tag ast)
-                                        (mapcar
-                                         (lambda (,whole)
-                                           (if (typep ,whole 'symbol-ref)
-                                               (change-class ,whole 'binder)
+                                    `(setf
+                                      (,tag ast)
+                                      (parsed-ref-list
+                                       (first ,tag)
+                                       (mapcar
+                                        (lambda (,whole)
+                                          (if (typep ,whole 'symbol-ref)
+                                              (change-class ,whole 'binder)
+                                              (funcall
+                                               alter-identity ,whole
                                                `(,(change-class (first ,whole) 'binder)
                                                  ,,(if (cdr (assoc value-tag tag-kinds))
                                                        `(mapcar (rcurry walker env)
                                                                 (cdr ,whole)) ;(b &body ...)
                                                        `(funcall walker (second ,whole)
-                                                                 env)))))
-                                         (first ,tag)))
-                                       (funcall alter-identity (first ,tag) (,tag ast)))))))
+                                                                 env))))))
+                                        (ref-list (first ,tag)))
+                                       alter-identity))))))
                            ;; function-like bindings
                            ((list (type symbol)
                                   (and (or (eql '&lambda) (eql '&macro-lambda)) lambda-kind)
@@ -1306,13 +1330,21 @@ Any binding forces a symbol match.
                                                  `(env-with-blocks newenv-with-params
                                                                    `(,,name))
                                                  lambda-kind)
+                                   ;; note: NAME-TAG and CODE-TAG are accumulated by push,
+                                   ;; this loop reverses the order back to normal
                                    do (push (cons (change-class ,name 'binder) ,fun) ,res)
-                                   finally (setf (,tag ast) ,res)
-                                           (funcall alter-identity (first ,tag) ,res)))))))
+                                   finally
+                                      (setf (,tag ast)
+                                            (parsed-ref-list
+                                             (first ,tag)
+                                             (mapcar alter-identity
+                                                     (ref-list (first ,tag)) ,res)
+                                             alter-identity))))))))
                         ;; non-&rest binder
                         ((loop for (ctx . %entries) in binds
                                thereis (cdr (rassoc tag (plist-alist %entries))))
-                         `(setf (,tag ast) (change-class (first ,tag) 'binder)))
+                         `(setf (,tag ast)
+                                (when-let (b (first ,tag)) (change-class b 'binder))))
                         ;; unevaluated - declarations, tags etc.
                         ((not (assoc tag binds)) `(setf (,tag ast) (first ,tag)))
                         ;; evaluation contexts
