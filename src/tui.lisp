@@ -214,7 +214,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun ast-insert (item loc index ui &optional (stack (stack ui)))
   (multiple-value-bind (new-stack root)
       (rebuild-spine loc
-                     (lambda (body) (list-insert (parse:ref-list body) item index))
+                     (lambda (body) (list-insert (parse:elements body) item index))
                      stack)
     (commit-edit ui new-stack root)
     (refocus ui (append-id (location-id loc) index))))
@@ -222,7 +222,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun ast-delete (loc index ui &optional (stack (stack ui)))
   "assumes that list has length > 1"
   (multiple-value-bind (new-stack root)
-      (rebuild-spine loc (lambda (body) (list-remove (parse:ref-list body) index)) stack)
+      (rebuild-spine loc (lambda (body) (list-remove (parse:elements body) index)) stack)
     (commit-edit ui new-stack root)
     (refocus ui (append-id (location-id loc) (max 0 (1- index))))))
 
@@ -755,6 +755,23 @@ if none, surround current atom"
                     index (+ 1 index)
                     pad t)))))))
 
+;; a list as written, drawn as the elements it holds
+(defmethod render-node ((l parse:ref-list) stack context rect)
+  (let* ((location (car stack))
+         (view
+           (tui:horizontal-container
+            rect
+            (flat-list-renderer
+             (parse:elements l)
+             (lambda (index)
+               (make-location :node (location-node location)
+                              :id (append-id (location-id location) index)))
+             (cdr stack) context))))
+    ;;
+    (setf (tui:key-handler view) (global-key-handler l location context)
+          (tui:focused view) (location= location (focus context)))
+    view))
+
 ;; simple list
 (defmethod render-node ((l list) stack context rect)
   (let* ((location (car stack))
@@ -1000,7 +1017,7 @@ if none, surround current atom"
           (vars-loc (make-location :node letnode :id 'parse:vars)))
      (trivia:match (slog (location-id letloc))
        ((list (eql 'parse:vars) (and (type integer) bi))
-        (if (= 1 (length (parse:ref-list (getloc vars-loc))))
+        (if (= 1 (length (parse:elements (getloc vars-loc))))
             (swap-node vars-loc (list `(,(hole) ,(hole))) ui)
             (progn
               (save-history ui)
@@ -1063,7 +1080,7 @@ if none, surround current atom"
          (location (car stack))
          (bindings
            (render-node
-            (make-bindings :list (parse:ref-list (parse:vars letnode)))
+            (make-bindings :list (parse:elements (parse:vars letnode)))
             (cons (make-location :node letnode :id 'parse:vars) stack)
             context
             (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "let*") 1))
@@ -1099,7 +1116,7 @@ if none, surround current atom"
   (let* ((location (car stack))
          (lambda-list-view
            (render-node
-            (parse:ref-list (parse:lambda-list node))
+            (parse:elements (parse:lambda-list node))
             (cons (make-location :node node :id 'parse:lambda-list) stack)
             context rect))
          (ll-rect (tui:rect lambda-list-view))
