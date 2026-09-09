@@ -192,12 +192,6 @@ so a name test alone can't distinguish #:|.| from a dot."))
             :reader labeled))
   (:documentation "#n=form"))
 
-(defstruct location
-  "`id's are typically either (slot) or (slot integer*) and should respect `cl:equal'.
-They are specific to the `node' type."
-  (node (error "must provide parent node"))
-  (id nil))
-
 (defmethod print-object ((object comment) stream)
   (format stream "<~a>" (str object)))
 
@@ -314,6 +308,33 @@ They are specific to the `node' type."
 (defgeneric to-text (ast) (:documentation "Serialize ast to text"))
 (defgeneric to-sexp (ast) (:documentation "convert to sexp for macroexpansion")
   (:method ((ast t)) nil))
+
+;;; location
+(defstruct location
+  "`id's are typically either (slot) or (slot integer*) and should respect `cl:equal'.
+They are specific to the `node' type."
+  (node (error "must provide parent node"))
+  (id nil))
+
+(defun append-id (id i)
+  (if (atom id)
+      (list id i)
+      `(,@id ,i)))
+
+(defun parent-id (id)
+  (if (listp id)
+      (let ((l (butlast id)))
+        (if (= (length l) 1)
+            (car l)
+            l))
+      (error "parent of ~a?" id)))
+
+(defun bodylike-id (id)
+  "T when ID addresses an element of a list slot"
+  (and (listp id) (integerp (lastcar id))))
+
+(defun id-index (id)
+  (lastcar id))
 
 (defgeneric location-sort (node id))
 (defgeneric get-location (node id)
@@ -576,7 +597,7 @@ the walker sees read the same way. In particular an empty list -> nil."
   "tree-ref but for syntactic lists"
   (cond ((null path) tree)
         ((ref-list-p tree) (ref-tree-ref (ref-nth (car path) tree) (cdr path)))
-        (t (tree-ref tree path))))
+        (t nil)))
 
 (defun with-elements (list elements)
   "Replaces a ref-list `list's elements with `elements', copying anchored data.
@@ -591,7 +612,10 @@ Otherwise in the walker just returns elements."
 
 (defun ref-tree-update (tree path new-value)
   "tree-update through syntactic lists, keeping the anchors of each one rebuilt."
-  (cond ((null path) new-value)
+  (cond ((null path)
+         (if (and (listp new-value) (typep tree 'ref-list))
+             (with-elements tree new-value)
+             new-value))
         ((ref-list-p tree)
          (with-elements tree
            (list-update (elements tree)
@@ -620,10 +644,11 @@ Otherwise in the walker just returns elements."
 ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
 ;; note: dot is treated as a symbol-ref by reading, but dotted lists shouldn't come up
 ;; even during macroexpansion since lambda list are nested in evaluation contexts
-(defun map-lambda-list (list on-binder value-mapper on-syntax specializer-list-p
+(defun map-lambda-list (list on-binder value-mapper on-syntax on-name specializer-list-p
                         &optional destructure-p alter-identity)
   "Doesn't force well-formedness and tries to be very tolerant. Reconstructs the list
-structure from the return values of `on-binder', `value-mapper' and `on-syntax' - the
+structure from the return values of `on-binder', `value-mapper', `on-syntax' and
+`on-name', which sees the keyword of a ((:key var) ...) pair - the
 latter sees specifically lambda-list list keywords and the keyword of a ((:key var) ...)
 pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
 (keyword-name var) pair, to themselves be nested macro lambda lists (CLHS 3.4.4)."
@@ -637,7 +662,8 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                           (cond ((typep v 'symbol-like) (funcall on-binder v))
                                 ((and destructure-p (ref-list-p v))
                                  (map-macro-lambda v on-binder value-mapper on-syntax
-                                                   alter-identity))
+                                                   on-name alter-identity))
+                                ((is-atom v) (funcall on-binder v))
                                 (t (funcall value-mapper v))))
                         ;; note: only meaningful for a specializer list
                         (maybe-default (val)
@@ -659,7 +685,6 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                  &rest extra)
                                 tail
                               (if (or extra
-                                      (and supplied (not (typep supplied-p 'symbol-like)))
                                       (not (and (typep var '(or symbol-like cons
                                                              ref-list))
                                                 (elements var))))
@@ -670,7 +695,7 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                                (let ((inner
                                                        (with-elements
                                                          var
-                                                         `(,(funcall on-syntax (ref-car var))
+                                                         `(,(funcall on-name (ref-car var))
                                                            ,(bind-var (ref-nth 1 var))))))
                                                  (when alter-identity
                                                    (funcall alter-identity var inner))
@@ -684,7 +709,9 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                     (when alter-identity
                                       (funcall alter-identity elt new))
                                     new))))
-                           (_ (funcall value-mapper elt))))
+                           (_ (if (is-atom elt)
+                                  (funcall on-binder elt)
+                                  (funcall value-mapper elt)))))
                         (&optional
                          (trivia:match (elements elt)
                            ((and (type symbol-like) v) (funcall on-binder v))
@@ -693,8 +720,7 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                 (&optional (val nil val-p) (supplied-p nil supplied)
                                  &rest extra)
                                 tail
-                              (if (or extra
-                                      (and supplied (not (typep supplied-p 'symbol-like))))
+                              (if extra
                                   (funcall value-mapper elt)
                                   (let ((new (with-elements elt
                                                `(,(bind-var var)
@@ -705,7 +731,9 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                     (when alter-identity
                                       (funcall alter-identity elt new))
                                     new))))
-                           (_ (funcall value-mapper elt))))
+                           (_ (if (is-atom elt)
+                                  (funcall on-binder elt)
+                                  (funcall value-mapper elt)))))
                         (t
                          (trivia:match (elements elt)
                            ((or (and (type symbol-like) v)
@@ -725,13 +753,16 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                            ,(funcall on-binder supplied-p)))))
                               (when alter-identity (funcall alter-identity elt new))
                               new))
-                           (_ (funcall value-mapper elt)))))
+                           (_ (if (is-atom elt)
+                                  (funcall on-binder elt)
+                                  (funcall value-mapper elt))))))
                       res)))
             finally (return (with-elements list (nreverse res))))))
     (when alter-identity (funcall alter-identity list new))
     new))
 
-(defun map-macro-lambda (list on-binder value-mapper on-syntax &optional alter-identity)
+(defun map-macro-lambda (list on-binder value-mapper on-syntax on-name
+                         &optional alter-identity)
   (let ((new (with-elements
                list
                (loop
@@ -740,13 +771,13 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                  for this = (car rest)
                  do (cond ((tag-member this '(&body &rest &key &optional &aux))
                            (return (nreconc res (map-lambda-list rest on-binder value-mapper
-                                                                 on-syntax nil t
+                                                                 on-syntax on-name nil t
                                                                  alter-identity))))
                           ((tag-member this lambda-list-keywords)
                            (push (funcall on-syntax this) res))
                           ((ref-list-p this)
                            (push (map-macro-lambda this on-binder value-mapper on-syntax
-                                                   alter-identity)
+                                                   on-name alter-identity)
                                  res))
                           ;; reader dot, or a literal nil placeholder
                           ((or (typep this 'dot-marker)
@@ -764,9 +795,9 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
 The specializer-list-p argument is always NIL so we can classify specializers."
   (if (eq (lambda-list-kind node) '&macro-lambda)
       (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form)
-                        (constantly 'unevaluated))
+                        (constantly 'unevaluated) (constantly 'symbol-ref))
       (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form)
-                       (constantly 'unevaluated) nil)))
+                       (constantly 'unevaluated) (constantly 'symbol-ref) nil)))
 
 (defmethod get-location ((node function-code) id)
   (trivia:cmatch id
@@ -786,7 +817,8 @@ The specializer-list-p argument is always NIL so we can classify specializers."
                           :lambda-list lambda-list :lambda-list-kind (lambda-list-kind node)
                           :docstring docstring :declarations declarations :body body)))
     (trivia:cmatch id
-      ((eql 'lambda-list) (rebuild :lambda-list new-value))
+      ((eql 'lambda-list)
+       (rebuild :lambda-list (with-elements (lambda-list node) new-value)))
       ((list* (eql 'lambda-list) path)
        (rebuild :lambda-list (ref-tree-update (lambda-list node) path new-value)))
       ((eql 'docstring) (rebuild :docstring new-value))
@@ -1315,13 +1347,13 @@ Any binding forces a symbol match.
                                         #'note-binder
                                         (lambda (form) ; capture direct reference vvv
                                           (funcall walker form newenv-with-params))
-                                        #'identity)
+                                        #'identity #'identity)
                                       `(map-lambda-list
                                         (function-info-arglist ,info)
                                         #'note-binder
                                         (lambda (form)
                                           (funcall walker form newenv-with-params))
-                                        #'identity
+                                        #'identity #'identity
                                         ,(eq ctx-kind '&method-lambda))))
                                     with newenv-with-params := ,env
                                     for body-form in (function-info-body ,info)
@@ -1403,21 +1435,23 @@ Any binding forces a symbol match.
                                 with body := (list)
                                 with lambda-list
                                   := (flet ((note-binder (binder)
-                                              (change-class binder 'binder)))
+                                              (if (typep binder 'wrapped-symbol)
+                                                  (change-class binder 'binder)
+                                                  binder)))
                                        ,(if (eq kind '&macro-lambda)
                                             `(map-macro-lambda
                                               (function-info-arglist ,info)
                                               #'note-binder
                                               (lambda (form)
                                                 (funcall walker form newenv-with-params))
-                                              #'identity
+                                              #'identity #'identity
                                               alter-identity)
                                             `(map-lambda-list
                                               (function-info-arglist ,info)
                                               #'note-binder
                                               (lambda (form)
                                                 (funcall walker form newenv-with-params))
-                                              #'identity
+                                              #'identity #'identity
                                               ,(eq kind '&method-lambda)
                                               nil alter-identity)))
                                 for body-form in (function-info-body ,info)

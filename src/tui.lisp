@@ -10,7 +10,9 @@
   (:use :cl #:alexandria-2 #:weave-utils)
   (:import-from #:weave-parser
                 #:location #:make-location #:location-node #:location-id #:location=
-                #:locsort #:getloc #:update)
+                #:locsort #:getloc #:update
+                #:append-id #:parent-id #:bodylike-id #:id-index
+                #:ref-list #:elements)
   (:local-nicknames (#:parse #:weave-parser)
                     (#:tui #:uncursed)
                     (#:tui-sys #:uncursed-sys))
@@ -77,7 +79,7 @@ If this returns NIL, propagate up the cursor stack.")
              :reader location)))
 
 (defclass ui (tui:elemental)
-  ((ast :initarg :ast
+  ((ast :initarg :ast ; this slot exists to cache the back of the stack (root)
         :initform (error "no ast")
         :accessor ast)
    (edit-loc :initarg :edit-loc
@@ -132,63 +134,30 @@ If this returns NIL, propagate up the cursor stack.")
   'parse:eval-form)
 
 ;;
-;;; location/stack invariants
+;;; location/stack
 ;;
-;; - a slot is addressed by its symbol name and subforms by (slot integer-index...),
-;;   with successive indices
 ;; - a stack tracks locations from the focus outward to the root, ending in `ui'
 ;; - ast-delete/insert/replace are stack-respecting edit operations
-
-(defun append-id (id i)
-  (if (atom id)
-      (list id i)
-      `(,@id ,i)))
-
-(defun parent-id (id)
-  (if (listp id)
-      (let ((l (butlast id)))
-        (if (= (length l) 1)
-            (car l)
-            l))
-      (error "parent of ~a?" id)))
-
-(defun bodylike-id (id)
-  "T when ID addresses an element of a list slot"
-  (and (listp id) (integerp (lastcar id))))
-
-(defun id-index (id)
-  (lastcar id))
-
+;;
 (defun rebuild-spine (loc updater stack)
   "Requires that (location-node `loc') = (location-node (car `stack')).
 Functionally rebuilds the path from `loc' out to the root, applying `updater' to
 the value at `loc', but retaining the current focus. Returns the new stack and root."
-  ;; (flet ((rebuild (stack newnode newstack)
-  ;;          (let ((head (car stack)))
-  ;;            (if (typep (location-node head) 'ui)
-  ;;                (nreverse newstack)
-  ;;                (rebuild (cdr stack)
-  ;;                         (update (location-node head) (location-id head) newnode)
-  ;;                         (cons (make-location :node newnode :id (location-id head))
-  ;;                               newstack))))))
-  ;;   (rebuild stack
-  ;;            (update (location-node loc) (location-id loc)
-  ;;                    (funcall updater (getloc loc)))
-  ;;            ()))
   (assert (eq (location-node loc) (location-node (car stack))))
-  (let ((newnode (update (location-node loc) (location-id loc)
-                         (funcall updater (getloc loc)))))
-    (do ((frames stack (cdr frames))
-         (node newnode (update (location-node (cadr frames))
-                               (location-id (cadr frames))
-                               node))
-         (rebuilt (list) (cons (make-location :node node :id (location-id (car frames)))
-                               rebuilt)))
-        ((typep (location-node (cadr frames)) 'ui)
-         (values (nreconc (cons (make-location :node node :id (location-id (car frames)))
-                                rebuilt)
-                          (cdr frames))
-                 node)))))
+  (labels ((rebuild (stack newnode id newstack)
+             (let ((loc (car stack)))
+               (if (typep (location-node loc) 'ui)
+                   (values (reverse (cons loc newstack)) newnode)
+                   (let ((new-parent (update (location-node loc) id newnode)))
+                     (rebuild (cdr stack)
+                              new-parent
+                              (location-id (cadr stack))
+                              (cons (make-location :node new-parent :id id)
+                                    newstack)))))))
+    (rebuild stack
+             (funcall updater (getloc loc))
+             (location-id loc)
+             (list))))
 
 (defun commit-edit (ui stack root)
   "Installs a `rebuild-spine' result."
@@ -214,7 +183,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun ast-insert (item loc index ui &optional (stack (stack ui)))
   (multiple-value-bind (new-stack root)
       (rebuild-spine loc
-                     (lambda (body) (list-insert (parse:elements body) item index))
+                     (lambda (body) (list-insert (elements body) item index))
                      stack)
     (commit-edit ui new-stack root)
     (refocus ui (append-id (location-id loc) index))))
@@ -222,7 +191,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun ast-delete (loc index ui &optional (stack (stack ui)))
   "assumes that list has length > 1"
   (multiple-value-bind (new-stack root)
-      (rebuild-spine loc (lambda (body) (list-remove (parse:elements body) index)) stack)
+      (rebuild-spine loc (lambda (body) (list-remove (elements body) index)) stack)
     (commit-edit ui new-stack root)
     (refocus ui (append-id (location-id loc) (max 0 (1- index))))))
 
@@ -257,11 +226,9 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 ;;; ast classes
 ;;
 
-(defgeneric unwrap (node)
-  (:method (node) node))
-(defgeneric render-node (node stack context rect))
+(defgeneric render-node (node stack context rect &key &allow-other-keys))
 
-(defmethod render-node :around (node stack context rect)
+(defmethod render-node :around (node stack context rect &key)
   (let* ((vals (multiple-value-list (call-next-method)))
          (view (first vals))
          (rect (tui:rect view)))
@@ -271,7 +238,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
         (tui:fill-rect (tui:make-style :bg (tui:color i i i))
                        (tui:copy-rect rect :x 0 :y 0) rect
                        :blend 0.1)))
-    ;; save window (don't need to unwrap node for now).
+    ;; save window
     (setf (gethash node (node-views context)) view)
     (when (typep view 'ast-view)
       (setf (view-stack view) stack))
@@ -342,7 +309,9 @@ if none, surround current atom"
           for node = (location-node loc)
           while (and (is-binop-call node)
                      (> (binop-precedence (fname node)) (binop-precedence op)))
-          finally (let ((sym (make-instance 'parse:symbol-ref :name op))
+          finally (let ((sym (make-instance 'parse:symbol-ref
+                                            :name (symbol-name op)
+                                            :home-package (symbol-package op)))
                         (loc (car stack)))
                     (swap-node loc
                                (make-instance 'parse:function-call
@@ -541,7 +510,7 @@ if none, surround current atom"
 ;; note: holes only replace symbols or evaluation contexts
 
 (defmethod parse:is-atom ((node hole)) t)
-(defmethod render-node ((node hole) stack context rect)
+(defmethod render-node ((node hole) stack context rect &key)
   (with-accessors ((text text)) node
     (let* ((location (car stack))
            (text (if (string= text "") "hole" text))
@@ -568,12 +537,12 @@ if none, surround current atom"
   (loop for s being the symbols of (find-package "CL") collect (string s)))
 
 (defun symbol-char-p (c)
-  (and (graphic-char-p c) (not (char= c #\space))))
+  (or (alphanumericp c) (find c "+-*/=<>!?&%$_~^.:@[]{}")))
 
 (defmethod handle-key ((node hole) view location ui event)
   (let ((c (tui:event-kind event)))
     (when (is-regular-char-event event)
-      (trivia:match (locsort location)
+      (trivia:match (slog (locsort location))
         ((eql 'parse:binder)
          (when (and (symbol-char-p c) (not (digit-char-p c)))
            (swap-node location (make-instance 'parse:binder :name (string-upcase c)) ui)))
@@ -581,24 +550,25 @@ if none, surround current atom"
          (cond
            ((and (symbol-char-p c) (not (digit-char-p c)))
             (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
-              (swap-node location newnode ui)
-              ;; begin completion
-              (setf (completion-state ui)
-                    (make-instance 'completion-state
-                                   :anchor newnode
-                                   :candidates (completion-candidates ui)))))
+              (swap-node location newnode ui)))
            ((digit-char-p c)
             (let ((newnode (make-instance 'parse:literal :str (string c))))
               (swap-node location newnode ui)))))
         ((eql 'parse:symbol-ref)
          (when (and (symbol-char-p c) (not (digit-char-p c)))
            (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
-             (swap-node location newnode ui)
-             ;; begin completion
-             (setf (completion-state ui)
-                   (make-instance 'completion-state
-                                  :anchor newnode
-                                  :candidates (completion-candidates ui))))))))))
+             (swap-node location newnode ui))))
+        ((eql 'parse:unevaluated)
+         (cond
+           ((char= c #\()
+            (swap-node location (ref-list (hole)) ui)
+            (refocus ui (append-id (location-id (focus ui)) 0)))
+           ((and (symbol-char-p c) (not (digit-char-p c)))
+            (swap-node location
+                       (make-instance 'parse:symbol-ref :name (string-upcase c))
+                       ui))
+           ((digit-char-p c)
+            (swap-node location (make-instance 'parse:literal :str (string c)) ui))))))))
 
 ;;; literals - no cursor state needed
 (defmethod handle-key ((node parse:literal) view location ui event)
@@ -620,7 +590,7 @@ if none, surround current atom"
                    (swap-node location (hole) ui)))
              t)))))
 
-(defmethod render-node ((node parse:literal) stack context rect)
+(defmethod render-node ((node parse:literal) stack context rect &key)
   (let* ((location (car stack))
          (str (format nil "~a" (parse:str node)))
          (focused (location= location (focus context))))
@@ -648,10 +618,11 @@ if none, surround current atom"
                (swap-node location newnode ui)
                (if-let (state (completion-state ui))
                  (setf (anchor state) newnode)
-                 (setf (completion-state ui)
-                       (make-instance 'completion-state
-                                      :anchor newnode
-                                      :candidates (completion-candidates ui)))))
+                 (when (< 1 (length s))
+                   (setf (completion-state ui)
+                         (make-instance 'completion-state
+                                        :anchor newnode
+                                        :candidates (completion-candidates ui))))))
              t)
             ((char= c #\Rubout)
              (let ((s (string s)))
@@ -670,7 +641,7 @@ if none, surround current atom"
 
 (defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (* . #\⋅) (/= . #\≠)))
 
-(defmethod render-node ((node parse:symbol-ref) stack context rect)
+(defmethod render-node ((node parse:symbol-ref) stack context rect &key)
   (let* ((location (car stack))
          (name (parse:name node))
          (str (if-let (exp (assoc-value *symbol-mappings* name :test #'string-equal))
@@ -693,8 +664,9 @@ if none, surround current atom"
           (c (tui:event-kind event)))
       (cond ((symbol-char-p c)
              (swap-node location
-                        (make-instance 'parse:binder :name (format nil "~a~a" s c)
-                                                     :home-package (parse:home-package node))
+                        (make-instance 'parse:binder
+                                       :name (format nil "~a~a" s c)
+                                       :home-package (parse:home-package node))
                         ui)
              t)
             ((char= c #\Rubout)
@@ -708,7 +680,7 @@ if none, surround current atom"
                    (swap-node location (hole) ui)))
              t)))))
 
-(defmethod render-node ((node parse:binder) stack context rect)
+(defmethod render-node ((node parse:binder) stack context rect &key)
   (let* ((location (car stack))
          (str (string-downcase (parse:name node)))
          (focused (location= location (focus context))))
@@ -756,34 +728,20 @@ if none, surround current atom"
                     pad t)))))))
 
 ;; a list as written, drawn as the elements it holds
-(defmethod render-node ((l parse:ref-list) stack context rect)
+(defmethod render-node ((l parse:ref-list) stack context rect &key (direction :horizontal))
   (let* ((location (car stack))
-         (view
-           (tui:horizontal-container
-            rect
-            (flat-list-renderer
-             (parse:elements l)
-             (lambda (index)
-               (make-location :node (location-node location)
-                              :id (append-id (location-id location) index)))
-             (cdr stack) context))))
-    ;;
-    (setf (tui:key-handler view) (global-key-handler l location context)
-          (tui:focused view) (location= location (focus context)))
-    view))
-
-;; simple list
-(defmethod render-node ((l list) stack context rect)
-  (let* ((location (car stack))
-         (view
-           (tui:horizontal-container
-            rect
-            (flat-list-renderer
-             l
-             (lambda (index)
-               (make-location :node (location-node location)
-                              :id (append-id (location-id location) index)))
-             (cdr stack) context))))
+         (elements
+           (funcall (ecase direction
+                      (:horizontal #'flat-list-renderer)
+                      (:vertical #'list-renderer))
+                    (elements l)
+                    (lambda (index)
+                      (make-location :node (location-node location)
+                                     :id (append-id (location-id location) index)))
+                    (cdr stack) context))
+         (view (ecase direction
+                 (:horizontal (tui:horizontal-container rect elements))
+                 (:vertical (tui:vertical-container rect elements)))))
     ;;
     (setf (tui:key-handler view) (global-key-handler l location context)
           (tui:focused view) (location= location (focus context)))
@@ -841,7 +799,7 @@ if none, surround current atom"
 ;; - for 2 arguments, draw *arb-arity-binops* infix
 ;;   - higher arity duplicated op views break invariant: always a single focused view
 ;; - for 2 arg division, draw horizontally. maybe future: (f)floor/ceiling/truncate
-(defmethod render-node ((node parse:function-call) stack context rect)
+(defmethod render-node ((node parse:function-call) stack context rect &key)
   (cond
     ;; note this case must go first since division is a binop
     ((and (string= (fname node) "/")
@@ -1017,14 +975,14 @@ if none, surround current atom"
           (vars-loc (make-location :node letnode :id 'parse:vars)))
      (trivia:match (slog (location-id letloc))
        ((list (eql 'parse:vars) (and (type integer) bi))
-        (if (= 1 (length (parse:elements (getloc vars-loc))))
-            (swap-node vars-loc (list `(,(hole) ,(hole))) ui)
+        (if (= 1 (length (elements (getloc vars-loc))))
+            (swap-node vars-loc (ref-list (ref-list (hole) (hole))) ui)
             (progn
               (save-history ui)
               (ast-delete vars-loc bi ui stack))))
        ((eql 'parse:vars)
         (save-history ui)
-        (swap-node vars-loc (list `(,(hole) ,(hole))) ui))))))
+        (swap-node vars-loc (ref-list (ref-list (hole) (hole))) ui))))))
 
 (setf
  (gethash (tui-sys:make-event :kind #\newline) *let-key-handlers*)
@@ -1034,7 +992,7 @@ if none, surround current atom"
      (save-history ui)
      (flet ((insert-binding (index)
               ;; focus the binder of the pair just inserted
-              (let ((bindloc (ast-insert `(,(hole) ,(hole))
+              (let ((bindloc (ast-insert (ref-list (hole) (hole))
                                          (make-location :node letnode :id 'parse:vars)
                                          index ui stack)))
                 (refocus ui `(,@(location-id bindloc) 0)))))
@@ -1055,36 +1013,19 @@ if none, surround current atom"
                       (make-location :node letnode :id `(parse:vars ,bi))
                       (1+ i) ui stack)))))))
 
-;; exception to not having wrappers, used for code sharing the :around method
-(defstruct bindings (list))
-(defmethod unwrap ((node bindings)) (bindings-list node))
-(defmethod render-node ((l bindings) stack context rect)
-  (let* ((location (car stack))
-         (view
-           (tui:vertical-container
-            rect
-            (list-renderer (bindings-list l)
-                           (lambda (index)
-                             (make-location :node (location-node location)
-                                            :id (append-id (location-id location) index)))
-                           (cdr stack) context))))
-    ;;
-    (setf (tui:key-handler view) (global-key-handler l location context)
-          (tui:focused view) (location= location (focus context)))
-    view))
-
 (defparameter *let-indent* 2)
 
-(defmethod render-node ((letnode parse:let*-form) stack context rect)
+(defmethod render-node ((letnode parse:let*-form) stack context rect &key)
   (let* ((op 'let*)
          (location (car stack))
          (bindings
            (render-node
-            (make-bindings :list (parse:elements (parse:vars letnode)))
+            (parse:vars letnode)
             (cons (make-location :node letnode :id 'parse:vars) stack)
             context
             (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "let*") 1))
-                            rect)))
+                            rect)
+            :direction :vertical))
          (bind-rect (tui:rect bindings))
          (body-view
            (tui:vertical-container
@@ -1109,14 +1050,86 @@ if none, surround current atom"
                    :key-handler (global-key-handler letnode location context)
                    :focused (location= location (focus context)))))
 
+;;; lambda list
+(defparameter *fun-code-key-handlers* (make-hash-table :test 'equal))
+
+(defmethod handle-key ((node parse:function-code) view location ui event)
+  (declare (ignore view))
+  (when-let ((handler (gethash event *fun-code-key-handlers*)))
+    (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
+      (unless (zerop i)
+        (funcall handler (nthcdr (1- i) (stack ui)) ui)))))
+
+(setf
+ (gethash (tui-sys:make-event :kind #\newline) *fun-code-key-handlers*)
+ (lambda (stack ui)
+   (let* ((loc (car stack))
+          (node (location-node loc)))
+     (flet ((insert-into (id index)
+              (save-history ui)
+              (ast-insert (hole) (make-location :node node :id id) index ui stack))
+            (shorter-than (id limit)
+              (< (length (elements (getloc (make-location :node node :id id)))) limit)))
+       (trivia:cmatch (location-id loc)
+         ((list (eql 'parse:lambda-list) (and (type integer) i))
+          (insert-into 'parse:lambda-list (1+ i)))
+         ((eql 'parse:lambda-list) (insert-into 'parse:lambda-list 0))
+         ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j))
+          (when (shorter-than `(parse:lambda-list ,i) 3)
+            (insert-into `(parse:lambda-list ,i) (1+ j))))
+         ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j)
+                (and (type integer) k))
+          (when (shorter-than `(parse:lambda-list ,i ,j) 2)
+            (insert-into `(parse:lambda-list ,i ,j) (1+ k))))
+         ((list (eql 'parse:body) (and (type integer) i))
+          (insert-into 'parse:body (1+ i))))))))
+
+(setf
+ (gethash (tui-sys:make-event :kind #\() *fun-code-key-handlers*)
+ (lambda (stack ui)
+   (let ((loc (car stack)))
+     (trivia:match (location-id loc)
+       ((or (list (eql 'parse:lambda-list) (type integer))
+            (list (eql 'parse:lambda-list) (type integer) (type integer)))
+        (save-history ui)
+        (ast-replace loc (lambda (param) (ref-list param (hole))) ui stack)
+        (refocus ui (append-id (location-id loc) 1))
+        t)))))
+
+(setf
+ (gethash (tui-sys:make-event :kind #\rubout) *fun-code-key-handlers*)
+ (lambda (stack ui)
+   (let* ((loc (car stack))
+          (node (location-node loc))
+          (ll-loc (make-location :node node :id 'parse:lambda-list)))
+     (trivia:match (location-id loc)
+       ((list (eql 'parse:lambda-list) (and (type integer) i))
+        (save-history ui)
+        (if (= 1 (length (parse:elements (getloc ll-loc))))
+            (swap-node ll-loc (parse:ref-list) ui)
+            (ast-delete ll-loc i ui stack)))
+       ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j))
+        (unless (zerop j)
+          (save-history ui)
+          (ast-delete (make-location :node node :id `(parse:lambda-list ,i)) j ui stack)))
+       ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j)
+              (and (type integer) k))
+        (unless (zerop k)
+          (save-history ui)
+          (ast-delete (make-location :node node :id `(parse:lambda-list ,i ,j))
+                      k ui stack)))
+       ((eql 'parse:lambda-list)
+        (save-history ui)
+        (swap-node ll-loc (parse:ref-list) ui))))))
+
 ;;; function-code (lambda-list and body, shared by defun/defmacro/defmethod/
 ;;; lambda/flet/labels). TODO docstring/declarations
 (defparameter *lambda-body-indent* 2)
-(defmethod render-node ((node parse:function-code) stack context rect)
+(defmethod render-node ((node parse:function-code) stack context rect &key)
   (let* ((location (car stack))
          (lambda-list-view
            (render-node
-            (parse:elements (parse:lambda-list node))
+            (parse:lambda-list node)
             (cons (make-location :node node :id 'parse:lambda-list) stack)
             context rect))
          (ll-rect (tui:rect lambda-list-view))
@@ -1146,7 +1159,7 @@ if none, surround current atom"
     ((list (eql 'parse:body) (and (type integer) i))
      (if (< 0 i) (list 'parse:body (1- i)) 'parse:lambda-list))))
 
-(defmethod render-node ((node parse:lambda-form) stack context rect)
+(defmethod render-node ((node parse:lambda-form) stack context rect &key)
   (let* ((op "λ")
          (location (car stack))
          (fc-view
@@ -1180,7 +1193,9 @@ if none, surround current atom"
                (let* ((args (loop for a in (slynk-backend:arglist s)
                                   while (not (find a lambda-list-keywords))
                                   count a))
-                      (name-node (make-instance 'parse:symbol-ref :name s)))
+                      (name-node (make-instance 'parse:symbol-ref
+                                                :name (symbol-name s)
+                                                :home-package (symbol-package s))))
                  (cond
                    ((and (eq 'parse:eval-form (locsort (focus ui)))
                          (bodylike-id (location-id (focus ui))))
@@ -1206,11 +1221,13 @@ if none, surround current atom"
                           (make-instance 'parse:let*-form
                                           :body (list (hole))
                                           :decls ()
-                                          :vars (list `(,(hole) ,(hole))))
+                                          :vars (ref-list (ref-list (hole) (hole))))
                           ui))
               (t
                (swap-node (focus ui)
-                          (make-instance 'parse:symbol-ref :name s)
+                          (make-instance 'parse:symbol-ref
+                                         :name (symbol-name s)
+                                         :home-package (symbol-package s))
                           ui))))
           (setf (completion-state ui) nil)
           t)))
@@ -1251,7 +1268,7 @@ if none, surround current atom"
                    (when (bodylike-id id)
                      (let ((body-loc (make-location :node parent :id (parent-id id))))
                        (save-history ui)
-                       (if (< 1 (length (getloc body-loc)))
+                       (if (< 1 (length (elements (getloc body-loc))))
                            (ast-delete body-loc (id-index id) ui)
                            (let ((child-loc
                                    (ast-replace body-loc
