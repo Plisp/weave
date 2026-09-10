@@ -70,6 +70,76 @@ If this returns NIL, propagate up the cursor stack.")
           :initform (error "must provide insertion stack")
           :reader stack)))
 
+(defclass selection ()
+  (;; tracks the stack during selection-mode, for growing and shrinking zippers
+   (context :initarg :context
+            :initform (error "no context")
+            :accessor selection-context)
+   ;; the location of the child where the selection was started
+   (location :initarg :location
+             :initform (error "no location")
+             :reader selection-location)
+   (point :initarg :point
+          :initform (error "no point")
+          :accessor selection-point
+          :type integer)
+   (activep :initform t
+            :accessor selection-activep)))
+
+(defclass zipper (selection)
+  ;; from the selection start location out to the top of the zipper
+  ((stack :initarg :stack
+          :initform (error "no stack")
+          :reader zipper-stack
+          :type list)))
+
+(defun end-selection-mode (ui)
+  (when-let (selection (selection ui))
+    (setf (selection-activep selection) nil)))
+
+(defun selection-anchor (selection)
+  (id-index (location-id (selection-location selection))))
+
+(defun selection-range (selection)
+  (values (min (selection-anchor selection) (selection-point selection))
+          (max (selection-anchor selection) (selection-point selection))))
+
+(defun selection-parent-id (selection)
+  (parent-id (location-id (selection-location selection))))
+
+(defun selection-forms (selection)
+  (let ((loc (selection-location selection)))
+    (assert (bodylike-id (location-id loc)))
+    (multiple-value-bind (low high)
+        (selection-range selection)
+      (subseq (elements (parse:get-location (location-node loc)
+                                            (selection-parent-id selection)))
+              low (1+ high)))))
+
+(defun zipper-top-p (ui stack)
+  (when-let (selection (selection ui))
+    (and (typep selection 'zipper)
+         (eq (getloc (car stack)) ; top of zipper
+             (location-node (lastcar (zipper-stack selection)))))))
+
+(defun zipper-depth (zipper)
+  (length (zipper-stack zipper)))
+
+(defun location-selected-p (ui stack)
+  (when-let* ((selection (selection ui))
+              (id (location-id (car stack))))
+    (and (eq (location-node (selection-location selection))
+             (location-node (car stack)))
+         (bodylike-id id)
+         (equal (selection-parent-id selection) (parent-id id))
+         (multiple-value-bind (low high)
+             (selection-range selection)
+           (<= low (id-index id) high)))))
+
+(defun selection-at-focus (ui)
+  (when (location-selected-p ui (stack ui))
+    (selection ui)))
+
 (defclass cutbuffer ()
   ((content :initarg :content
             :initform (error "no content")
@@ -93,6 +163,12 @@ If this returns NIL, propagate up the cursor stack.")
    (completion-state :initform nil
                      :accessor completion-state
                      :type (or null completion-state))
+   (selection :initform nil
+              :accessor selection
+              :type (or null selection))
+   (zipper :initform nil
+           :accessor zipper
+           :type (or null zipper))
    (history :initform (list)
             :accessor history
             :type list)
@@ -140,39 +216,43 @@ If this returns NIL, propagate up the cursor stack.")
 ;; - ast-delete/insert/replace are stack-respecting edit operations
 ;;
 (defun rebuild-spine (loc updater stack)
-  "Requires that (location-node `loc') = (location-node (car `stack')).
-Functionally rebuilds the path from `loc' out to the root, applying `updater' to
+  "Requires that (location-node `loc') = (location-node (car `stack'))
+Functionally rebuilds the path from `loc' out to the ui or root, applying `updater' to
 the value at `loc', but retaining the current focus. Returns the new stack and root."
   (assert (eq (location-node loc) (location-node (car stack))))
-  (labels ((rebuild (stack newnode id newstack)
-             (let ((loc (car stack)))
-               (if (typep (location-node loc) 'ui)
-                   (values (reverse (cons loc newstack)) newnode)
-                   (let ((new-parent (update (location-node loc) id newnode)))
-                     (rebuild (cdr stack)
-                              new-parent
-                              (location-id (cadr stack))
-                              (cons (make-location :node new-parent :id id)
-                                    newstack)))))))
-    (rebuild stack
+  (labels ((rebuild (stack newnode newstack)
+             (if (null stack)
+                 (values (reverse newstack) newnode)
+                 (let ((this (car stack)))
+                   (if (typep (location-node this) 'ui) ; no need to update ui
+                       (values (reverse (cons this newstack)) newnode)
+                       (let* ((id (location-id this))
+                              (new-parent (update (location-node this) id newnode)))
+                         (rebuild (cdr stack)
+                                  new-parent
+                                  (cons (make-location :node new-parent :id id)
+                                        newstack))))))))
+    (rebuild (cons loc (cdr stack))
              (funcall updater (getloc loc))
-             (location-id loc)
              (list))))
 
 (defun commit-edit (ui stack root)
   "Installs a `rebuild-spine' result."
+  (end-selection-mode ui)
   (setf (ast ui) root
         (stack ui) stack)
   (focus ui))
 
 (defun refocus (ui id)
   "Moves the focus to another location in the node it is already within."
+  (end-selection-mode ui)
   (let ((loc (make-location :node (location-node (focus ui)) :id id)))
     (setf (stack ui) (cons loc (cdr (stack ui))))
     loc))
 
 (defun descend (ui id)
   "Moves the focus to a location-id inside the currently focused node."
+  (end-selection-mode ui)
   (let ((loc (make-location :node (getloc (focus ui)) :id id)))
     (push loc (stack ui))
     loc))
@@ -238,6 +318,20 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
         (tui:fill-rect (tui:make-style :bg (tui:color i i i))
                        (tui:copy-rect rect :x 0 :y 0) rect
                        :blend 0.1)))
+    (when (location-selected-p context stack)
+      (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
+                     (tui:copy-rect rect :x 0 :y 0) rect
+                     :blend 0.4))
+    (when (zipper-top-p context stack)
+      (dolist (form (selection-forms (selection context)))
+        (when-let (view (gethash form (node-views context)))
+          (let ((form-rect (tui:rect view)))
+            (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
+                           (tui:copy-rect form-rect :x 0 :y 0) form-rect
+                           :blend 0.4))))
+      (tui:fill-rect (tui:make-style :bg (tui:color #xb5 #x89 #x00))
+                     (tui:copy-rect rect :x 0 :y 0) rect
+                     :blend 0.2))
     ;; save window
     (setf (gethash node (node-views context)) view)
     (when (typep view 'ast-view)
@@ -282,8 +376,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                           (sort valid #'<
                                 :key (lambda (s)
                                        (mk-string-metrics:damerau-levenshtein s name))))
-                    (setf candidates valid)))))))
-    ))
+                    (setf candidates valid)))))))))
 
 (defun fname (node)
   (parse:name (parse:name node)))
@@ -399,6 +492,7 @@ if none, surround current atom"
     (view-below atom-array (1+ y) 1)))
 
 (defun atom-move (view-finder view ui)
+  (end-selection-mode ui)
   (let* ((atom-array (build-atom-array (tui:root-view ui) (tui:rows ui)))
          (this-rect (tui:rect view)))
     (multiple-value-bind (new-view new-goal)
@@ -455,7 +549,99 @@ if none, surround current atom"
 (setf (gethash (tui-sys:make-event :kind :right-arrow) *default-key-handlers*)
       #'move-right)
 
+(defun selection-list-location (selection)
+  (make-location :node (location-node (selection-location selection))
+                 :id (selection-parent-id selection)))
+
+(defun current-selection (ui)
+  (when-let (selection (selection ui))
+    (and (selection-activep selection) selection)))
+
+(defun begin-selection (ui)
+  (let* ((loc (focus ui))
+         (id (location-id loc)))
+    (when (and (bodylike-id id) (eq 'parse:eval-form (locsort loc)))
+      (setf (selection ui)
+            (make-instance 'selection
+                           :context (stack ui)
+                           :location loc
+                           :point (id-index id))))))
+
+(defun extend-selection (ui delta)
+  (when-let (selection (or (current-selection ui) (begin-selection ui)))
+    (let ((point (+ (selection-point selection) delta)))
+      (when (<= 0 point (1- (length (elements (getloc (selection-list-location selection))))))
+        ;; when the underlying range is reselected, forget the zipper
+        (when (typep selection 'zipper)
+          (change-class selection 'selection))
+        (setf (selection-point selection) point)
+        ;; keep selection active after move
+        (refocus ui (append-id (selection-parent-id selection) point))
+        (setf (selection-activep selection) t)))
+    t))
+
+(defun eval-list-position-p (location)
+  "Whether LOCATION is an element of a list of evaluated forms."
+  (let ((id (location-id location)))
+    (and (bodylike-id id)
+         (eq 'parse:eval-form
+             (parse:location-sort (location-node location)
+                                  (append-id (parent-id id) 0))))))
+
+(defun zipper-target-p (location)
+  "Whether a zipper can top out at `location'."
+  (or (eval-list-position-p location)
+      (eq 'parse:eval-form (locsort location))))
+
+(defun expand-selection (ui)
+  (when-let (selection (or (current-selection ui) (begin-selection ui)))
+    (let ((depth (if (typep selection 'zipper) (zipper-depth selection) 0)))
+      ;; skip positions where we cannot copy a usefully pastable zipper
+      ;; e.g. nonevaluated let bindings need more sophisticated sort tracking
+      (loop for location in (nthcdr (1+ depth) (selection-context selection))
+            for level from (1+ depth)
+            do (when (zipper-target-p location)
+                 (let ((stack (subseq (selection-context selection) 0 level)))
+                   (if (plusp depth)
+                       (reinitialize-instance selection :stack stack)
+                       (change-class selection 'zipper :stack stack)))
+                 (return t))))))
+
+(defun shrink-selection (ui)
+  (when-let (selection (current-selection ui))
+    (when (typep selection 'zipper)
+      (loop for level from (1- (zipper-depth selection)) downto 1
+            for location = (nth level (selection-context selection))
+            do (when (zipper-target-p location)
+                 (reinitialize-instance
+                  selection :stack (subseq (selection-context selection) 0 level))
+                 (return t))
+            finally ;; normal selection
+                    (change-class selection 'selection)
+                    (return t)))))
+
+(setf (gethash (tui-sys:make-event :kind :up-arrow :shiftp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (expand-selection ui)))
+
+(setf (gethash (tui-sys:make-event :kind :down-arrow :shiftp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (shrink-selection ui)))
+
+(setf (gethash (tui-sys:make-event :kind :left-arrow :shiftp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (extend-selection ui -1)))
+
+(setf (gethash (tui-sys:make-event :kind :right-arrow :shiftp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (extend-selection ui 1)))
+
 (defun move-parent (ui)
+  (end-selection-mode ui)
   (when-let (new-stack (parent-stack (stack ui)))
     (slog* `(moving to ,new-stack))
     (setf (stack ui) new-stack)))
@@ -1357,21 +1543,6 @@ if none, surround current atom"
                             i)
                ui))))))
 
-;; raise
-(setf (gethash (tui-sys:make-event :kind #\} :controlp t) *default-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (let ((focus-node (getloc (focus ui))))
-          (when (and (< 1 (length (stack ui)))
-                     (or (typep focus-node 'parse:eval-form)
-                         (typep focus-node 'hole)))
-            (loop for stack = (cdr (stack ui)) then (cdr stack)
-                  while stack
-                  for loc = (car stack)
-                  for node = (getloc loc)
-                  until (typep node 'parse:eval-form)
-                  finally (swap-node loc focus-node ui))))))
-
 ;; barf
 ;; (setf (gethash (tui-sys:make-event :kind #\} :altp t) *default-key-handlers*)
 ;;       (lambda (view ui)
@@ -1379,28 +1550,147 @@ if none, surround current atom"
 ;;         (when (typep (getloc (focus ui)) 'parse:eval-form)
 ;;           (swap-node (focus ui) (hole) ui))))
 
-;; these two are sufficient for easily wrapping forms
+(defun fill-zipper (zipper forms)
+  "Fills the zipper hole with forms and returns a complete node."
+  (multiple-value-bind (low high) (selection-range zipper)
+    (parse:copy-node
+     (nth-value 1 (rebuild-spine (selection-list-location zipper)
+                                 (lambda (body)
+                                   (let ((elts (elements body)))
+                                     `(,@(subseq elts 0 low)
+                                       ,@forms
+                                       ,@(subseq elts (1+ high)))))
+                                 (zipper-stack zipper))))))
+
+(defun take-selection (ui selection)
+  "Reifies selection state into the cutbuffer without editing."
+  (if (typep selection 'zipper)
+      (setf (zipper ui) selection
+            (cutbuffer ui) nil)
+      (let ((forms (mapcar #'parse:copy-node (selection-forms selection))))
+        (setf (cutbuffer ui)
+              (make-instance 'cutbuffer
+                             :location (selection-location selection)
+                             :content (if (rest forms) forms (first forms)))
+              (zipper ui) nil)))
+  t)
+
+(defun cut-selection (ui selection)
+  "Cuts the current selection or zipper, modifying the ast."
+  (let ((forms (selection-forms selection)))
+    (take-selection ui selection)
+    (if (typep selection 'zipper)
+        (let* ((stack (nthcdr (zipper-depth selection) (stack ui)))
+               (hole (car stack))
+               (id (location-id hole)))
+          (if (> (length forms) 1)
+              ;; a zipper may top out at any eval-form, which is not always a place
+              ;; several forms can be left in e.g. dotimes counter
+              (when (eval-list-position-p hole)
+                (save-history ui)
+                (let ((slot (parent-id id))
+                      (index (id-index id)))
+                  (ast-replace (make-location :node (location-node hole) :id slot)
+                               (lambda (body)
+                                 (let ((elts (elements body)))
+                                   `(,@(subseq elts 0 index)
+                                     ,@forms
+                                     ,@(subseq elts (1+ index)))))
+                               ui stack)
+                  (refocus ui (append-id slot index))))
+              (progn (save-history ui)
+                     (ast-replace hole (constantly (first forms)) ui stack))))
+        (multiple-value-bind (low high) (selection-range selection)
+          (save-history ui)
+          (let ((slot (selection-parent-id selection)))
+            (ast-replace (selection-list-location selection)
+                         (lambda (body)
+                           (let ((elts (elements body)))
+                             (or `(,@(subseq elts 0 low) ,@(subseq elts (1+ high)))
+                                 (list (hole)))))
+                         ui)
+            (refocus ui (append-id slot (max 0 (1- low)))))))
+    t))
+
+(setf (gethash (tui-sys:make-event :kind #\c :controlp t) *default-key-handlers*)
+      (lambda (view ui)
+        (declare (ignore view))
+        (if-let (selection (selection-at-focus ui))
+          (take-selection ui selection)
+          (let ((loc (focus ui)))
+            (when (locsort loc)
+              (setf (cutbuffer ui)
+                    (make-instance 'cutbuffer :location loc
+                                              :content (parse:copy-node (getloc loc)))
+                    (zipper ui) nil))))
+        t))
+
 (setf (gethash (tui-sys:make-event :kind #\x :controlp t) *default-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
-        (let* ((loc (focus ui))
-               (node (getloc loc)))
-          (slog* `(cut ,node))
-          (when (locsort loc)
-            (setf (cutbuffer ui)
-                  (make-instance 'cutbuffer :location loc :content node))
-            (swap-node loc (hole) ui))
-          t)))
+        (if-let (selection (selection-at-focus ui))
+          (cut-selection ui selection)
+          (let* ((loc (focus ui))
+                 (node (getloc loc)))
+            (when (locsort loc)
+              (setf (cutbuffer ui)
+                    (make-instance 'cutbuffer :location loc
+                                              :content (parse:copy-node node))
+                    (zipper ui) nil)
+              (swap-node loc (hole) ui))))
+        t))
+
+(defun paste-forms (ui forms)
+  (let ((focus (focus ui)))
+    (when (eval-list-position-p focus)
+      (let ((slot (parent-id (location-id focus)))
+            (index (id-index (location-id focus))))
+        (save-history ui)
+        (ast-replace (make-location :node (location-node focus) :id slot)
+                     (lambda (body)
+                       (let ((elts (elements body)))
+                         `(,@(subseq elts 0 index)
+                           ,@(mapcar #'parse:copy-node forms)
+                           ,@(subseq elts index))))
+                     ui)
+        (refocus ui (append-id slot index))
+        t))))
+
+(defun paste-zipper (ui zipper)
+  "Pastes from (zipper ui) around the current selection using fill-zipper,
+modifying the ast."
+  (let ((focus (focus ui))
+        (selection (selection-at-focus ui)))
+    (if selection
+        (multiple-value-bind (low high) (selection-range selection)
+          (let ((forms (selection-forms selection))
+                (slot (selection-parent-id selection)))
+            (save-history ui)
+            (ast-replace (selection-list-location selection)
+                         (lambda (body)
+                           (let ((elts (elements body)))
+                             `(,@(subseq elts 0 low)
+                               ,(fill-zipper zipper forms)
+                               ,@(subseq elts (1+ high)))))
+                         ui)
+            (refocus ui (append-id slot low))))
+        (when (eq 'parse:eval-form (locsort focus))
+          (swap-node focus (fill-zipper zipper (list (getloc focus))) ui)))
+    t))
 
 (setf (gethash (tui-sys:make-event :kind #\v :controlp t) *default-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
-        ;; XXX more generic compatibility check for e.g. copying let bindings
-        (let ((focus (focus ui))
-              (cutbuffer (cutbuffer ui)))
-          (when (and (eq (locsort focus) (locsort (location cutbuffer))))
-            (swap-node focus (parse:copy-node (content cutbuffer)) ui))
-          t)))
+        ;; these are mutually exclusive as cutting a zipper nulls the cutbuffer
+        (cond ((zipper ui) (paste-zipper ui (zipper ui)))
+              ((cutbuffer ui)
+               (let ((content (content (cutbuffer ui))))
+                 (if (listp content)
+                     (paste-forms ui content)
+                     (when (equal (locsort (focus ui))
+                                  (locsort (location (cutbuffer ui))))
+                       (swap-node (focus ui) (parse:copy-node content) ui))))))
+        t))
 
 ;;; completions
 

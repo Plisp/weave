@@ -336,7 +336,10 @@ They are specific to the `node' type."
 (defun id-index (id)
   (lastcar id))
 
-(defgeneric location-sort (node id))
+(defgeneric location-sort (node id)
+  (:documentation "The sort of whatever `id' names in `node'. Sort lookups are total:
+an invalid id gives NIL rather than signalling so that users may probe locations.")
+  (:method (node id) (declare (ignore node id)) nil))
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'."))
 (defun getloc (location)
@@ -684,31 +687,33 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
                                 (&optional (val nil val-p) (supplied-p nil supplied)
                                  &rest extra)
                                 tail
-                              (if (or extra
-                                      (not (and (typep var '(or symbol-like cons
-                                                             ref-list))
-                                                (elements var))))
-                                  (funcall value-mapper elt)
-                                  (let* ((new-var
-                                           (if (typep var 'symbol-like)
-                                               (funcall on-binder var)
-                                               (let ((inner
-                                                       (with-elements
-                                                         var
-                                                         `(,(funcall on-name (ref-car var))
-                                                           ,(bind-var (ref-nth 1 var))))))
-                                                 (when alter-identity
-                                                   (funcall alter-identity var inner))
-                                                 inner)))
-                                         (new (with-elements elt
-                                                `(,new-var
-                                                  ,@(when val-p
-                                                      `(,(funcall value-mapper val)))
-                                                  ,@(when supplied
-                                                      `(,(funcall on-binder supplied-p)))))))
-                                    (when alter-identity
-                                      (funcall alter-identity elt new))
-                                    new))))
+                              ;; a hole may stand in for the parameter name
+                              (let ((namedp (or (typep var 'symbol-like) (is-atom var))))
+                                (if (or extra
+                                        (not (or namedp
+                                                 (and (typep var '(or cons ref-list))
+                                                      (elements var)))))
+                                    (funcall value-mapper elt)
+                                    (let* ((new-var
+                                             (if namedp
+                                                 (funcall on-binder var)
+                                                 (let ((inner
+                                                         (with-elements
+                                                           var
+                                                           `(,(funcall on-name (ref-car var))
+                                                             ,(bind-var (ref-nth 1 var))))))
+                                                   (when alter-identity
+                                                     (funcall alter-identity var inner))
+                                                   inner)))
+                                           (new (with-elements elt
+                                                  `(,new-var
+                                                    ,@(when val-p
+                                                        `(,(funcall value-mapper val)))
+                                                    ,@(when supplied
+                                                        `(,(funcall on-binder supplied-p)))))))
+                                      (when alter-identity
+                                        (funcall alter-identity elt new))
+                                      new)))))
                            (_ (if (is-atom elt)
                                   (funcall on-binder elt)
                                   (funcall value-mapper elt)))))
@@ -789,15 +794,22 @@ pair. `destructure-p' allows &optional/&rest/&body vars, and &key vars as a
     (when alter-identity (funcall alter-identity list new))
     new))
 
+(defun plain-tree (tree)
+  "Strip all ref-list wrappers"
+  (cond ((typep tree 'ref-list) (mapcar #'plain-tree (elements tree)))
+        ((consp tree) (cons (plain-tree (car tree)) (plain-tree (cdr tree))))
+        (t tree)))
+
 (defun lambda-list-sorts (node)
   "A tree isomorphic to (lambda-list `node') whose leaves are location sorts.
 `lambda-list-kind' selects which grammar to walk it with.
 The specializer-list-p argument is always NIL so we can classify specializers."
-  (if (eq (lambda-list-kind node) '&macro-lambda)
-      (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form)
-                        (constantly 'unevaluated) (constantly 'symbol-ref))
-      (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form)
-                       (constantly 'unevaluated) (constantly 'symbol-ref) nil)))
+  (plain-tree
+   (if (eq (lambda-list-kind node) '&macro-lambda)
+       (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form)
+                         (constantly 'unevaluated) (constantly 'symbol-ref))
+       (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form)
+                        (constantly 'unevaluated) (constantly 'symbol-ref) nil))))
 
 (defmethod get-location ((node function-code) id)
   (trivia:cmatch id
@@ -1662,7 +1674,8 @@ other atom."
 
 (defun quasiquote-sorts (node)
   "See lambda-list-sorts"
-  (map-quasiquote (thing node) (constantly 'eval-form) (constantly 'unevaluated)))
+  (plain-tree
+   (map-quasiquote (thing node) (constantly 'eval-form) (constantly 'unevaluated))))
 
 (defmethod location-sort ((node quasiquote-form) id)
   (trivia:match id
@@ -2023,7 +2036,6 @@ Walks subforms of the call using WALKER during analysis."
             eval->binders))))))
 
 (defun lambda-expression-p (x)
-  "((lambda (v) v) 1) is a call whose operator is written out rather than named."
   (and (ref-form-p x)
        (let ((head (ref-car x)))
          (and (typep head 'symbol-ref) (eq (resolve head) 'lambda)))))
