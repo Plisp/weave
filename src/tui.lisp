@@ -12,7 +12,7 @@
                 #:location #:make-location #:location-node #:location-id #:location=
                 #:locsort #:getloc #:update
                 #:append-id #:parent-id #:bodylike-id #:id-index
-                #:ref-list #:elements)
+                #:ref-list #:elements #:hole #:text)
   (:local-nicknames (#:parse #:weave-parser)
                     (#:tui #:uncursed)
                     (#:tui-sys #:uncursed-sys))
@@ -180,19 +180,14 @@ If this returns NIL, propagate up the cursor stack.")
           :accessor stack ; stack is always non-empty
           :type list)
    ;; recomputed on every redisplay
+   (binder-cache :initform nil
+                 :accessor binder-cache
+                 :type list)
    (focus-rect :initform nil
                :accessor focus-rect
                :type (or null tui:rect))
    (node-views :initform (make-hash-table)
                :accessor node-views)))
-
-(defclass hole ()
-  ((text :initarg :text
-         :initform (error "hole text not provided")
-         :accessor text
-         :type simple-string)))
-(defun hole (&optional (text "")) (make-instance 'hole :text text))
-(defmethod parse:name ((o hole)) "hole")
 
 (defun ui-rect (ui)
   (tui:make-rect :x 0 :y 0 :rows (tui:rows ui) :cols (tui:cols ui)))
@@ -308,6 +303,38 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 
 (defgeneric render-node (node stack context rect &key &allow-other-keys))
 
+(defun bindings-at (loc)
+  "What the location-node of `loc' binds at the location, nothing if unevaluated."
+  (when (member (locsort loc) '(parse:eval-form parse:function-code))
+    (parse:location-bindings (location-node loc) (location-id loc))))
+
+(defun function-position-p (loc)
+  "Whether a symbol-ref at `loc' names a function rather than a variable."
+  (let ((node (location-node loc))
+        (id (location-id loc)))
+    (or (and (typep node 'parse:function-call) (eq id 'parse:name))
+        (and (typep node 'parse:function-form) (eq id 'parse:fun-designator)))))
+
+(defun compute-focus-binder (ui)
+  (let ((node (getloc (focus ui))))
+    (when (typep node 'parse:symbol-ref)
+      (let ((kind (if (function-position-p (focus ui)) :function :variable))
+            (name (parse:name node)))
+        (loop for loc in (stack ui)
+              do (loop for (k . binder) in (bindings-at loc)
+                       do (when (and (eq k kind)
+                                     (typep binder 'parse:binder)
+                                     (string= name (parse:name binder)))
+                            (return-from compute-focus-binder binder))))))))
+
+(defun focus-binder (ui)
+  "The binder the symbol-ref under the cursor refers to, innermost binding first."
+  (let ((cache (binder-cache ui)))
+    (if (eq (car cache) (stack ui))
+        (cdr cache)
+        (cdr (setf (binder-cache ui)
+                   (cons (stack ui) (compute-focus-binder ui)))))))
+
 (defmethod render-node :around (node stack context rect &key)
   (let* ((vals (multiple-value-list (call-next-method)))
          (view (first vals))
@@ -318,6 +345,10 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
         (tui:fill-rect (tui:make-style :bg (tui:color i i i))
                        (tui:copy-rect rect :x 0 :y 0) rect
                        :blend 0.1)))
+    (when (eq node (focus-binder context))
+      (tui:fill-rect (tui:make-style :bg (tui:color #x85 #x99 #x00))
+                     (tui:copy-rect rect :x 0 :y 0) rect
+                     :blend 0.4))
     (when (location-selected-p context stack)
       (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
                      (tui:copy-rect rect :x 0 :y 0) rect
@@ -695,7 +726,6 @@ if none, surround current atom"
 ;;; hole
 ;; note: holes only replace symbols or evaluation contexts
 
-(defmethod parse:is-atom ((node hole)) t)
 (defmethod render-node ((node hole) stack context rect &key)
   (with-accessors ((text text)) node
     (let* ((location (car stack))
@@ -851,7 +881,7 @@ if none, surround current atom"
       (cond ((symbol-char-p c)
              (swap-node location
                         (make-instance 'parse:binder
-                                       :name (format nil "~a~a" s c)
+                                       :name (format nil "~a~a" s (string-upcase c))
                                        :home-package (parse:home-package node))
                         ui)
              t)
@@ -1598,8 +1628,9 @@ if none, surround current atom"
                                      ,@(subseq elts (1+ index)))))
                                ui stack)
                   (refocus ui (append-id slot index))))
-              (progn (save-history ui)
-                     (ast-replace hole (constantly (first forms)) ui stack))))
+              (progn
+                (save-history ui)
+                (ast-replace hole (constantly (first forms)) ui stack))))
         (multiple-value-bind (low high) (selection-range selection)
           (save-history ui)
           (let ((slot (selection-parent-id selection)))
