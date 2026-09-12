@@ -317,7 +317,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 
 (defun compute-focus-binder (ui)
   (let ((node (getloc (focus ui))))
-    (when (typep node 'parse:symbol-ref)
+    (when (and (typep node 'parse:symbol-ref) (not (typep node 'parse:binder)))
       (let ((kind (if (function-position-p (focus ui)) :function :variable))
             (name (parse:name node)))
         (loop for loc in (stack ui)
