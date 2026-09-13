@@ -1,4 +1,4 @@
-# WIP lisp structural editor and gradual typechecker
+# WIP lisp structural editor
 
 Currently mainly testing on sbcl due to non-standard macroexpansions.
 The purpose of structural editing is partially proven ergonomics (see: vim, paredit)

@@ -155,6 +155,8 @@ binder once parsed) in the reader representation, or a hole in edited code."
          :type (or null integer)
          :documentation "of an :array, which cannot be told from its contents")))
 
+(defmethod elements ((x list)) x)
+
 (defclass function-code (anchor)
   ((lambda-list :initarg :lambda-list
                 :reader lambda-list
@@ -488,28 +490,31 @@ copy-env can exploit structure sharing, remember to PUSH!"
   (loop for entry in (variable-bindings env)
         do (when (eq name entry)
              (return (values name nil)))
-           (when (and (consp entry) (eq name (car entry)))
-             (return (values (car entry) (cdr entry))))))
+           (when (and (consp entry) (eq name (first entry)))
+             (return (values (first entry) (second entry))))))
 (defun env-function-info (name env)
   (loop for entry in (function-bindings env)
         do (when (eq name entry)
              (return (values name nil)))
-           (when (and (consp entry) (eq name (car entry)))
+           (when (and (consp entry) (eq name (first entry)))
              (return (values (car entry) (cdr entry))))))
 
 (defun env-with-variables (env bindings)
-  "Expects entry names to be strictly SYMBOLS."
+  "Expects entry names to be `binding-name's."
+  (assert (listp bindings))
   (let ((new-env (copy-env env)))
     (setf (%variable-bindings new-env)
           ;; note: constants are possible in intermediate editing states
-          (nconc (remove-if (lambda (s) (constantp (ensure-car s))) bindings)
-                 (%variable-bindings new-env)))
+          (append (remove-if (lambda (s) (constantp (ref-coerce-symbol (gen-ensure-car s))))
+                             bindings)
+                  (%variable-bindings new-env)))
     new-env))
 
 (defun env-with-functions (env bindings)
-  "Expects entry names to be strictly SYMBOLS."
+  "Expects entry names to be `binding-name's."
   ;; note: CL names are kept - a local binding shadowing one is needed to expand
   ;; macrolets like pprint-exit-if-list-exhausted
+  (assert (listp bindings))
   (let ((new-env (copy-env env)))
     (setf (%function-bindings new-env)
           (append bindings (%function-bindings new-env)))
@@ -626,11 +631,6 @@ does not touch hardwired operators."
          :format-control (concatenate 'string "parse failed: " control)
          :format-arguments args))
 
-(defmethod elements ((x t))
-  "Anything which isn't a ref list is its own elements, so a plain list and the raw sexps
-the walker sees read the same way. In particular an empty list -> nil."
-  x)
-
 (defun with-elements (list elements)
   "Replaces a ref-list `list's elements with `elements', copying anchored data.
 Otherwise in the walker just returns elements."
@@ -645,37 +645,41 @@ Otherwise in the walker just returns elements."
 (defun ref-list (&rest elements)
   (make-instance 'ref-list :elements elements))
 
-(defun ref-list-p (x)
+(defun gen-list-p (x)
   (or (typep x 'ref-list) (listp x)))
 
-(defun ref-form-p (x)
+(defun gen-form-p (x)
   "Whether `x' is a list read as a form, rather than a literal vector or array"
-  (and (ref-list-p x)
+  (and (gen-list-p x)
        (or (not (typep x 'ref-list)) (eq (kind x) :list))))
 
-(defun ref-atom-p (x)
-  (or (not (ref-list-p x)) (null (elements x))))
+(defun gen-atom-p (x)
+  (or (not (gen-list-p x)) (null (elements x))))
 
-(defun ref-car (x) (car (elements x)))
-(defun ref-cdr (x) (cdr (elements x)))
-(defun ref-nth (n x) (nth n (elements x)))
+(defun gen-car (x) (car (elements x)))
+(defun gen-cdr (x) (cdr (elements x)))
+(defun gen-nth (n x) (nth n (elements x)))
 
-(defun ref-tree-ref (tree path)
-  "tree-ref but for syntax lists"
+(defun gen-ensure-car (x)
+  "The head of a generalized list, or `x' itself."
+  (if (gen-list-p x) (gen-car x) x))
+
+(defun gen-tree-ref (tree path)
+  "tree-ref but for generalized lists"
   (cond ((null path) tree)
-        ((ref-list-p tree) (ref-tree-ref (ref-nth (car path) tree) (cdr path)))
+        ((gen-list-p tree) (gen-tree-ref (gen-nth (car path) tree) (cdr path)))
         (t nil)))
 
-(defun ref-tree-update (tree path new-value)
-  "tree-update through syntax lists, keeping the anchors."
+(defun gen-tree-update (tree path new-value)
+  "tree-update through generalized lists, keeping the anchors."
   (cond ((null path)
          (if (and (listp new-value) (typep tree 'ref-list))
              (with-elements tree new-value)
              new-value))
-        ((ref-list-p tree)
+        ((gen-list-p tree)
          (with-elements tree
            (list-update (elements tree)
-                        (ref-tree-update (ref-nth (car path) tree) (cdr path) new-value)
+                        (gen-tree-update (gen-nth (car path) tree) (cdr path) new-value)
                         (car path))))
         (t (tree-update tree path new-value))))
 
@@ -719,7 +723,7 @@ symbol when it has no home package. Always returns a symbol."
       for keyword := (ref-find-kw elt lambda-list-keywords)
       do (labels ((bind-var (v)
                     (cond ((typep v 'symbol-like) (funcall on-binder v))
-                          ((and destructure-p (ref-list-p v))
+                          ((and destructure-p (gen-list-p v))
                            (map-macro-lambda v on-binder value-mapper on-syntax
                                              on-name))
                           ((is-atom v) (funcall on-binder v))
@@ -733,11 +737,11 @@ symbol when it has no home package. Always returns a symbol."
                (progn (setf current-keyword keyword)
                       (push (funcall on-syntax elt) res))
                (push
-                (case current-keyword
-                  ((&rest &body) (bind-var elt))
-                  (&key
+                (cond
+                  ((or (not (gen-list-p elt)) (member current-keyword '(&rest &body)))
+                   (bind-var elt))
+                  ((eq current-keyword '&key)
                    (trivia:match (elements elt)
-                     ((and (type symbol-like) v) (funcall on-binder v))
                      ((list* var tail)
                       (destructuring-bind
                           (&optional (val nil val-p) (supplied-p nil supplied)
@@ -753,20 +757,17 @@ symbol when it has no home package. Always returns a symbol."
                                       (if namedp
                                           (funcall on-binder var)
                                           (with-elements var
-                                            `(,(funcall on-name (ref-car var))
-                                              ,(bind-var (ref-nth 1 var)))))))
+                                            `(,(funcall on-name (gen-car var))
+                                              ,(bind-var (gen-nth 1 var)))))))
                                 (with-elements elt
                                   `(,new-var
                                     ,@(when val-p
                                         `(,(funcall value-mapper val)))
                                     ,@(when supplied
                                         `(,(funcall on-binder supplied-p))))))))))
-                     (_ (if (is-atom elt)
-                            (funcall on-binder elt)
-                            (funcall value-mapper elt)))))
-                  (&optional
+                     (_ (funcall value-mapper elt))))
+                  ((eq current-keyword '&optional)
                    (trivia:match (elements elt)
-                     ((and (type symbol-like) v) (funcall on-binder v))
                      ((list* var (and (type list) tail))
                       (destructuring-bind
                           (&optional (val nil val-p) (supplied-p nil supplied)
@@ -780,14 +781,11 @@ symbol when it has no home package. Always returns a symbol."
                                     `(,(funcall value-mapper val)))
                                 ,@(when supplied
                                     `(,(funcall on-binder supplied-p))))))))
-                     (_ (if (is-atom elt)
-                            (funcall on-binder elt)
-                            (funcall value-mapper elt)))))
+                     (_ (funcall value-mapper elt))))
                   (t
                    (trivia:match (elements elt)
-                     ((or (and (type binding-name) v)
-                          ;; keyword or method-like
-                          (list (and (type binding-name) v)))
+                     ;; keyword or method-like
+                     ((list (and (type binding-name) v))
                       (funcall on-binder v))
                      ;; default value or specializer
                      ((list (and (type binding-name) v) val)
@@ -798,9 +796,7 @@ symbol when it has no home package. Always returns a symbol."
                       (with-elements elt
                         `(,(funcall on-binder v) ,(maybe-default val)
                           ,(funcall on-binder supplied-p))))
-                     (_ (if (is-atom elt)
-                            (funcall on-binder elt)
-                            (funcall value-mapper elt))))))
+                     (_ (funcall value-mapper elt)))))
                 res)))
       finally (return (with-elements list (nreverse res)))))
 
@@ -817,11 +813,11 @@ symbol when it has no home package. Always returns a symbol."
                   (push (funcall on-syntax this) res))
                  ;; reader dot, or a literal nil placeholder
                  ((or (typep this 'dot-marker)
-                      (null (elements this))
+                      (and (gen-list-p this) (null (elements this)))
                       (and (typep this 'symbol-ref)
                            (string= (name this) "NIL")))
                   (push (funcall on-syntax this) res))
-                 ((ref-list-p this)
+                 ((gen-list-p this)
                   (push (map-macro-lambda this on-binder value-mapper on-syntax on-name)
                         res))
                  ((typep this 'binding-name)
@@ -881,7 +877,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
     ((eql 'lambda-list) (lambda-list node))
     ((list* (eql 'lambda-list) path)
      (when-let (l (elements (lambda-list node)))
-       (ref-tree-ref l path)))
+       (gen-tree-ref l path)))
     ((eql 'docstring) (docstring node))
     ((eql 'declarations) (declarations node))
     ((eql 'body) (body node))
@@ -897,7 +893,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
       ((eql 'lambda-list)
        (rebuild :lambda-list (with-elements (lambda-list node) new-value)))
       ((list* (eql 'lambda-list) path)
-       (rebuild :lambda-list (ref-tree-update (lambda-list node) path new-value)))
+       (rebuild :lambda-list (gen-tree-update (lambda-list node) path new-value)))
       ((eql 'docstring) (rebuild :docstring new-value))
       ((eql 'declarations) (rebuild :declarations new-value))
       ((eql 'body) (rebuild :body new-value))
@@ -910,20 +906,19 @@ The specializer-list-p argument is always NIL so we can classify specializers."
     ((list (eql 'body) (type integer)) 'eval-form)
     ((list* (eql 'lambda-list) path)
      (when-let (sorts (elements (lambda-list-sorts node)))
-       (ref-tree-ref sorts path)))))
+       (gen-tree-ref sorts path)))))
 
-(defun ref-declaration-p (form)
-  (and (ref-list-p form)
-       (let ((head (ref-car form)))
+(defun gen-declaration-p (form)
+  (and (gen-list-p form)
+       (let ((head (gen-car form)))
          (or (eq head 'declare)
              (and (typep head 'symbol-ref)
                   (eq (resolve head) 'cl:declare))))))
 
 (defun ref-string-p (form)
-  (or (stringp form)
-      (and (typep form 'literal)
-           (plusp (length (str form)))
-           (char= #\" (char (str form) 0)))))
+  (and (typep form 'literal)
+       (plusp (length (str form)))
+       (char= #\" (char (str form) 0))))
 
 (defun parse-body-declarations (body documentation)
   "Splits `body' into the forms, declarations and documentation string it begins with.
@@ -933,11 +928,11 @@ last position is a return value rather than documentation."
   (let ((doc nil)
         (decls (list)))
     (loop for form := (car body)
-          do (cond ((and documentation (ref-string-p form) (cdr body))
+          do (cond ((and documentation (or (stringp form) (ref-string-p form)) (cdr body))
                     (when doc
                       (form-parse-error "two documentation strings"))
                     (setf doc (pop body)))
-                   ((ref-declaration-p form) (push (pop body) decls))
+                   ((gen-declaration-p form) (push (pop body) decls))
                    (t (return))))
     (values body (nreverse decls) doc)))
 
@@ -1136,17 +1131,17 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                         ,(rebuild part `(list-update (,part node) new-value i)))
                       update-clauses))
                (&tree
-                (push `((list* (eql ',part) path) (ref-tree-ref (,part node) path))
+                (push `((list* (eql ',part) path) (gen-tree-ref (,part node) path))
                       get-clauses)
                 (push `((list* (eql ',part) path)
-                        ,(rebuild part `(ref-tree-update (,part node) path new-value)))
+                        ,(rebuild part `(gen-tree-update (,part node) path new-value)))
                       update-clauses)))
              ;; rest-patterns address a further index within each &rest element
              (when (eq kind '&rest)
                (when-let (pattern (cdr (assoc part rest-patterns)))
                  (push `((list (eql ',part) (and (type integer) i)
                                (and (type integer) j))
-                         (ref-nth j (nth i (elements (,part node)))))
+                         (gen-nth j (nth i (elements (,part node)))))
                        get-clauses)
                  (push `((list (eql ',part) (and (type integer) i)
                                (and (type integer) j))
@@ -1282,7 +1277,7 @@ our reader representation or ordinary sexps."
       (cond
         ((null spec) ; no more entries in current list, not forced by spec keyword
          `(lambda (,form)
-            (unless (null (elements ,form))
+            (unless (and (gen-list-p ,form) (null (elements ,form)))
               (form-parse-error "expected null, got ~a" ,form))))
         ((atom spec)
          `(lambda (,form)
@@ -1296,18 +1291,19 @@ our reader representation or ordinary sexps."
         ;; note: catches list nil before car recursion
         ((listp (car spec))
          `(lambda (,form)
-            (if (and (ref-list-p ,form)
-                     (ref-list-p (ref-car ,form)))
+            (if (and (gen-list-p ,form)
+                     (gen-list-p (gen-car ,form)))
                 (progn (funcall (spec-parser ,(car spec) ,binds ,rest-patterns ,ref-p)
-                                (ref-car ,form))
+                                (gen-car ,form))
                        (funcall (spec-parser ,(cdr spec) ,binds ,rest-patterns ,ref-p)
-                                (ref-cdr ,form)))
+                                (gen-cdr ,form)))
                 (form-parse-error "list expected, got ~a, context ~a" ,form ',spec))))
         (t ; (atom (car spec))
          (case (car spec)
            (&declarations
             `(lambda (,form)
                ;; note: literal () is irrelevant to parse-body-declarations
+               (expect-general-list ,form)
                (multiple-value-bind (,body ,decls)
                    (parse-body-declarations (elements ,form) nil)
                  (push ,decls ,(second spec))
@@ -1326,33 +1322,37 @@ our reader representation or ordinary sexps."
                  (form-parse-error "expected one of ~a got ~a" ',(cdr spec) ,form))))
            ((&method-lambda &lambda &macro-lambda)
             `(lambda (,form)
-               (when (null (elements ,form))
+               (when (gen-atom-p ,form)
                  (form-parse-error "missing lambda list"))
                (multiple-value-bind (,body ,decls ,doc)
-                   (parse-body-declarations (ref-cdr ,form) t)
-                 (push (make-function-info :arglist (ref-car ,form)
+                   (parse-body-declarations (gen-cdr ,form) t)
+                 (push (make-function-info :arglist (gen-car ,form)
                                            :documentation ,doc
                                            :decls ,decls
                                            :body ,body)
                        ,(second spec)))))
            (&body
             `(lambda (,form)
+               (expect-general-list ,form)
                (push (elements ,form) ,(second spec))))
            (&tree
             `(lambda (,form)
-               (push (ref-car ,form) ,(second spec))
+               (expect-general-list ,form)
+               (push (gen-car ,form) ,(second spec))
                (funcall (spec-parser ,(cddr spec) ,binds ,rest-patterns ,ref-p)
-                        (ref-cdr ,form))))
+                        (gen-cdr ,form))))
            (&rest
             `(lambda (,form)
                ,(if-let (pattern (cdr (assoc (second spec) rest-patterns)))
                   `(progn
+                     (expect-general-list ,form)
                      (mapc (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
                            (elements ,form))
                      (push ,form ,(second spec)))
                   (error "no pattern for rest"))))
            (&rest-qualifiers
             `(lambda (,form)
+               (expect-general-list ,form)
                (let* ((,form (elements ,form))
                       (,qualifiers
                         (loop for v := (car ,form)
@@ -1367,11 +1367,11 @@ our reader representation or ordinary sexps."
                  (funcall (spec-parser ,(cddr spec) ,binds ,rest-patterns ,ref-p) ,form))))
            (t ; symbol match car... against e....
             `(lambda (,form)
-               (if (and (ref-list-p ,form) (elements ,form))
+               (if (and (gen-list-p ,form) (elements ,form))
                    (progn (funcall (spec-parser ,(car spec) ,binds ,rest-patterns ,ref-p)
-                                   (ref-car ,form))
+                                   (gen-car ,form))
                           (funcall (spec-parser ,(cdr spec) ,binds ,rest-patterns ,ref-p)
-                                   (ref-cdr ,form)))
+                                   (gen-cdr ,form)))
                    (form-parse-error "expected non-nil car: ~a" ,form))))))))))
 
 (defmacro defform ((name &rest spec) &key binds rest-patterns)
@@ -1428,8 +1428,12 @@ Any binding forces a symbol match.
        ;; this merely does validation and preserves identity of all checked lists
        (defmacro ,(symbolicate "WITH-PARSED-" name) ((form &optional ref-p) &body body)
          `(let (,@',(remove-duplicates (mapcar #'car tag-kinds)))
-            (funcall (spec-parser ,',spec ,',binds ,',rest-patterns ,ref-p)
-                     (ref-cdr ,form))
+            (flet ((expect-general-list (form)
+                     (unless (gen-list-p form)
+                       (form-parse-error "list expected, got ~a" form))))
+              (declare (ignorable #'expect-general-list))
+              (funcall (spec-parser ,',spec ,',binds ,',rest-patterns ,ref-p)
+                       (gen-cdr ,form)))
             nil ; don't leak
             ,@body))
 
@@ -1448,9 +1452,7 @@ Any binding forces a symbol match.
                                    ,env-exp
                                    ,(trivia:ematch record
                                       ((list (type symbol) whole-tag)
-                                       `(mapcar (lambda (r) (ref-coerce-symbol (ref-car r)))
-                                                (apply #'append
-                                                       (mapcar #'elements ,whole-tag))))
+                                       `(apply #'append (mapcar #'elements ,whole-tag)))
                                       ;; binding records may SHARE STRUCTURE
                                       ((type symbol)
                                        `(mapcar #'ref-coerce-symbol ,record)))))
@@ -1584,7 +1586,7 @@ Any binding forces a symbol match.
                (declare (ignorable env walker alter-identity))
                (,(symbolicate "WITH-PARSED-" name) (rawform t)
                 (let ((ast (make-instance ',classname
-                                          :op (if (typep (ref-car rawform) 'reader-marker)
+                                          :op (if (typep (gen-car rawform) 'reader-marker)
                                                   ',(symbolicate "READ-" name)
                                                   ',name))))
                   ,@
@@ -1648,13 +1650,13 @@ Any binding forces a symbol match.
                                        for ,whole in (elements (first ,tag))
                                        do (if (typep ,whole 'symbol-ref)
                                               (push (change-class ,whole 'binder) ,res)
-                                              (let* ((,b (ref-car ,whole))
+                                              (let* ((,b (gen-car ,whole))
                                                      (,new-whole
                                                        (with-elements ,whole
                                                          `(,(change-class ,b 'binder)
                                                            ,@(mapcar
                                                               (rcurry walker ,newenv)
-                                                              (ref-cdr ,whole))))))
+                                                              (gen-cdr ,whole))))))
                                                 (push ,new-whole ,res)))
                                        finally (setf (,tag ast)
                                                      (when (first ,tag)
@@ -1671,13 +1673,13 @@ Any binding forces a symbol match.
                                           (if (typep ,whole 'symbol-ref)
                                               (change-class ,whole 'binder)
                                               (with-elements ,whole
-                                                `(,(change-class (ref-car ,whole) 'binder)
+                                                `(,(change-class (gen-car ,whole) 'binder)
                                                   ,@,(if (cdr (assoc value-tag tag-kinds))
                                                          ;;(b &body)
                                                          `(mapcar (rcurry walker env)
-                                                                  (ref-cdr ,whole))
+                                                                  (gen-cdr ,whole))
                                                          `(list (funcall walker
-                                                                         (ref-nth 1 ,whole)
+                                                                         (gen-nth 1 ,whole)
                                                                          env)))))))
                                         (elements (first ,tag))))))))))
                            ;; function-like bindings
@@ -1763,23 +1765,23 @@ Any binding forces a symbol match.
 `on-eval' applied to every subform an unquote actually evaluates and `on-data' to every
 other atom."
   (labels ((rec (form depth)
-             (if (ref-atom-p form)
+             (if (gen-atom-p form)
                  (funcall on-data form)
                  ;; only a READER-MARKER is syntax, so source naming one of these symbols is
                  ;; data. Raw symbols come from the walker since STRIP-WRAPPERS erases types
-                 (case (typecase (ref-car form)
-                         (symbol (ref-car form))
-                         (reader-marker (resolve (ref-car form))))
+                 (case (typecase (gen-car form)
+                         (symbol (gen-car form))
+                         (reader-marker (resolve (gen-car form))))
                    (eclector.reader:quasiquote
                     (with-elements form
-                      (list (funcall on-data (ref-car form))
-                            (rec (ref-nth 1 form) (1+ depth)))))
+                      (list (funcall on-data (gen-car form))
+                            (rec (gen-nth 1 form) (1+ depth)))))
                    ((eclector.reader:unquote eclector.reader:unquote-splicing)
                     (with-elements form
-                      (list (funcall on-data (ref-car form))
+                      (list (funcall on-data (gen-car form))
                             (if (= 1 depth) ; 0 depth underneath
-                                (funcall on-eval (ref-nth 1 form))
-                                (rec (ref-nth 1 form) (1- depth))))))
+                                (funcall on-eval (gen-nth 1 form))
+                                (rec (gen-nth 1 form) (1- depth))))))
                    ;; note: raw sexps from the walker are still built cons by cons, which
                    ;; is also how a dotted tail keeps its shape
                    (t
@@ -1799,10 +1801,10 @@ other atom."
   (declare (ignore alter-identity))
   (make-instance
    'quasiquote-form
-   :op (if (typep (ref-car rawform) 'reader-marker)
+   :op (if (typep (gen-car rawform) 'reader-marker)
            'read-quasiquote
            'eclector.reader:quasiquote)
-   :thing (map-quasiquote (ref-nth 1 rawform)
+   :thing (map-quasiquote (gen-nth 1 rawform)
                           (lambda (subform) (funcall walker subform env))
                           #'identity)))
 
@@ -1814,7 +1816,7 @@ other atom."
 (defmethod location-sort ((node quasiquote-form) id)
   (trivia:match id
     ((eql 'thing) 'unevaluated)
-    ((list* (eql 'thing) path) (ref-tree-ref (quasiquote-sorts node) path))))
+    ((list* (eql 'thing) path) (gen-tree-ref (quasiquote-sorts node) path))))
 
 (setf (gethash 'eclector.reader:quasiquote *special-walkers*) #'walk-quasiquote)
 (setf (gethash 'eclector.reader:quasiquote *special-parsers*) #'parse-quasiquote)
@@ -1838,7 +1840,7 @@ other atom."
 (defun rest-binders (list)
   "The binder each element of a &rest slot begins with."
   (loop for elt in (elements list)
-        collect (if (ref-list-p elt) (ref-car elt) elt)))
+        collect (gen-ensure-car elt)))
 
 (defun let-like-binders (node &optional limit)
   (let ((binders (rest-binders (vars node))))
@@ -2041,13 +2043,13 @@ other atom."
 (defun read-eval-p (form)
   "Whether `form' is the syntax list representing read evaluation."
   (and (typep form 'ref-list)
-       (typep (ref-car form) 'reader-marker)
-       (eq (resolve (ref-car form)) 'read-eval)))
+       (typep (gen-car form) 'reader-marker)
+       (eq (resolve (gen-car form)) 'read-eval)))
 
 (defun strip-wrappers (form interned)
   "`interned' is a vector of symbols for temporary internment during macro analysis.
 XXX performs unguarded read-evaluation."
-  (cond ((read-eval-p form) (eval (strip-wrappers (ref-nth 1 form) interned)))
+  (cond ((read-eval-p form) (eval (strip-wrappers (gen-nth 1 form) interned)))
         ((typep form 'ref-list)
          (let* ((elts (elements form))
                 (dot (position-if (lambda (e) (typep e 'dot-marker)) elts))
@@ -2279,7 +2281,7 @@ Walks subforms of the call using WALKER during analysis."
     ((eql 'op) (op node))
     ((eql 'body) (body node))
     ((list* (eql 'body) indices)
-     (ref-tree-ref (body node) indices))))
+     (gen-tree-ref (body node) indices))))
 
 (defun copy-syntax (node)
   "Copy syntax, retaining anchors and restoring binders to unparsed symbol-refs."
@@ -2331,13 +2333,13 @@ Returns NIL when the call is unparseable."
       ((eql 'op) (rebuild (copy-anchors (op node) new-value) (body node)))
       ((eql 'body) (rebuild (op node) new-value))
       ((list* (eql 'body) (type integer) _)
-       (rebuild (op node) (ref-tree-update (body node) (rest id) new-value))))))
+       (rebuild (op node) (gen-tree-update (body node) (rest id) new-value))))))
 
 (defmethod location-sort ((node macro-call) id)
   (trivia:match id
     ((eql 'op) 'symbol-ref)
     ((list* (eql 'body) (type integer) _)
-     (let ((thing (ref-tree-ref (body node) (rest id))))
+     (let ((thing (gen-tree-ref (body node) (rest id))))
        (cond ((typep thing 'binder) 'binder)
              ((nth-value 1 (gethash thing (subform-binders node))) 'eval-form)
              (thing 'unevaluated))))))
@@ -2354,34 +2356,34 @@ Returns NIL when the call is unparseable."
   (bindings-of :variable (gethash (get-location node id) (subform-binders node))))
 
 (defun lambda-expression-p (x)
-  (and (ref-form-p x)
-       (let ((head (ref-car x)))
+  (and (gen-form-p x)
+       (let ((head (gen-car x)))
          (and (typep head 'symbol-ref)
               (eq (resolve head) 'lambda)))))
 
 (defun parse-call (form env alter-identity)
   (funcall alter-identity form
            (make-instance 'function-call
-                          :name (parse (ref-car form) env alter-identity)
+                          :name (parse (gen-car form) env alter-identity)
                           :body (mapcar (rcurry #'parse env alter-identity)
-                                        (ref-cdr form)))))
+                                        (gen-cdr form)))))
 
 (defun parse (form env alter-identity)
   (cond
-    ((or (not (ref-form-p form)) (ref-atom-p form))
+    ((or (not (gen-form-p form)) (gen-atom-p form))
      ;; note: a LABEL-DEF is atomic here because in practice only literals are labelled
      (assert (typep form '(or symbol-ref literal label-def ref-list)))
      form)
-    ((lambda-expression-p (ref-car form)) (parse-call form env alter-identity))
-    ((not (typep (ref-car form) 'symbol-ref))
+    ((lambda-expression-p (gen-car form)) (parse-call form env alter-identity))
+    ((not (typep (gen-car form) 'symbol-ref))
      (error 'ast-parse-error :format-control "non-operator ~a in car"
-                             :format-arguments (list (ref-car form))))
+                             :format-arguments (list (gen-car form))))
     (t
-     (if-let (parser (gethash (resolve (ref-car form)) *special-parsers*))
+     (if-let (parser (gethash (resolve (gen-car form)) *special-parsers*))
        (funcall alter-identity form
                 (funcall parser form env (rcurry #'parse alter-identity) alter-identity))
        (multiple-value-bind (result local-expansion)
-           (env-function-info (resolve (ref-car form)) env)
+           (env-function-info (resolve (gen-car form)) env)
          (flet ((parse-function (form) (parse-call form env alter-identity))
                 ;; don't expand explicitly, we only care about explicit call subforms
                 (parse-macro (form)
@@ -2389,7 +2391,7 @@ Returns NIL when the call is unparseable."
                     (funcall alter-identity form
                              (make-instance
                               'macro-call
-                              :op (ref-car form) :body (ref-cdr form)
+                              :op (gen-car form) :body (gen-cdr form)
                               :call-env env
                               :subform-asts macro-subforms
                               :subform-binders
@@ -2399,7 +2401,7 @@ Returns NIL when the call is unparseable."
                                  (setf (gethash form macro-subforms)
                                        (parse form env alter-identity)))))))))
            (cond ((null result) ; global
-                  (let ((sym (resolve (ref-car form))))
+                  (let ((sym (resolve (gen-car form))))
                     (if (and sym (macro-function sym) (not (hardwired-p sym)))
                         (parse-macro form)
                         (parse-function form))))

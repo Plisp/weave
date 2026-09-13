@@ -1580,18 +1580,6 @@ if none, surround current atom"
 ;;         (when (typep (getloc (focus ui)) 'parse:eval-form)
 ;;           (swap-node (focus ui) (hole) ui))))
 
-(defun fill-zipper (zipper forms)
-  "Fills the zipper hole with forms and returns a complete node."
-  (multiple-value-bind (low high) (selection-range zipper)
-    (parse:copy-node
-     (nth-value 1 (rebuild-spine (selection-list-location zipper)
-                                 (lambda (body)
-                                   (let ((elts (elements body)))
-                                     `(,@(subseq elts 0 low)
-                                       ,@forms
-                                       ,@(subseq elts (1+ high)))))
-                                 (zipper-stack zipper))))))
-
 (defun take-selection (ui selection)
   "Reifies selection state into the cutbuffer without editing."
   (if (typep selection 'zipper)
@@ -1686,6 +1674,18 @@ if none, surround current atom"
                      ui)
         (refocus ui (append-id slot index))
         t))))
+
+(defun fill-zipper (zipper forms)
+  "Fills the zipper hole with forms and returns a complete node."
+  (multiple-value-bind (low high) (selection-range zipper)
+    (parse:copy-node
+     (nth-value 1 (rebuild-spine (selection-list-location zipper)
+                                 (lambda (body)
+                                   (let ((elts (elements body)))
+                                     `(,@(subseq elts 0 low)
+                                       ,@forms
+                                       ,@(subseq elts (1+ high)))))
+                                 (zipper-stack zipper))))))
 
 (defun paste-zipper (ui zipper)
   "Pastes from (zipper ui) around the current selection using fill-zipper,
