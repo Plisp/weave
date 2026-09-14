@@ -6,7 +6,7 @@
 (uiop:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
   (:export #:make-env
-           #:parse #:ast-parse-error
+           #:parse-from-string #:ast-parse-error
            #:is-atom #:get-body
            #:copy-node
 
@@ -14,14 +14,18 @@
            #:get-location #:getloc
 
            #:location-sort #:locsort #:location-bindings
+           #:form-slot-kinds
 
            #:eval-form #:symbol-ref #:binder
            #:function-call #:literal
+           #:function-code #:lambda-list
            #:unevaluated
            #:body #:name #:str #:vars #:op
            #:hole #:text
-           #:ref-list #:elements #:with-elements
-           #:function-code #:lambda-list
+
+           #:ref-list #:gen-list-p
+           #:elements #:with-elements
+
            #:home-package
            ))
 (in-package #:weave-parser)
@@ -163,11 +167,13 @@ binder once parsed) in the reader representation, or a hole in edited code."
                 :type ref-list)
    (lambda-list-kind :initarg :lambda-list-kind
                      :reader lambda-list-kind
-                     :type (member &lambda &macro-lambda &method-lambda))
+                     :type (member :lambda :macro-lambda :method-lambda))
    (docstring :initarg :docstring
+              :initform nil
               :reader docstring
               :type (or null literal string))
    (declarations :initarg :declarations
+                 :initform nil
                  :reader declarations)
    (body :initarg :body
          :reader body
@@ -836,7 +842,7 @@ symbol when it has no home package. Always returns a symbol."
 `lambda-list-kind' selects which grammar to walk it with.
 The specializer-list-p argument is always NIL so we can classify specializers."
   (plain-tree
-   (if (eq (lambda-list-kind node) '&macro-lambda)
+   (if (eq (lambda-list-kind node) :macro-lambda)
        (map-macro-lambda (lambda-list node) (constantly 'binder) (constantly 'eval-form)
                          (constantly 'unevaluated) (constantly 'symbol-ref))
        (map-lambda-list (lambda-list node) (constantly 'binder) (constantly 'eval-form)
@@ -857,7 +863,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
          (list (if limit (subseq elts 0 (min limit (length elts))) elts))
          (binders (list)))
     (flet ((note (binder) (push binder binders)))
-      (if (eq (lambda-list-kind node) '&macro-lambda)
+      (if (eq (lambda-list-kind node) :macro-lambda)
           (map-macro-lambda list #'note #'identity #'identity #'identity)
           (map-lambda-list list #'note #'identity #'identity #'identity nil)))
     (nreverse binders)))
@@ -1100,9 +1106,10 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
           do (push `((eql ',part) (,part node)) get-clauses)
              ;; note: a whole &rest slot may be replaced by its elements
              (push `((eql ',part)
-                     ,(rebuild part (if (eq kind '&rest)
-                                        `(with-elements (,part node) new-value)
-                                        'new-value)))
+                     ,(rebuild part (case kind
+                                      (&rest `(with-elements (,part node) new-value))
+                                      (&tree `(gen-tree-update (,part node) nil new-value))
+                                      (t 'new-value))))
                    update-clauses)
              (case kind
                (&rest
@@ -1124,7 +1131,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                                         i)))))
                       update-clauses))
                ;; a &body slot is an ordinary list of the forms it holds
-               (&body
+               ((&body &rest-qualifiers)
                 (push `((list (eql ',part) (and (type integer) i)) (nth i (,part node)))
                       get-clauses)
                 (push `((list (eql ',part) (and (type integer) i))
@@ -1162,6 +1169,8 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                do (case kind
                     (&body
                      (push `((list (eql ',part) (type integer)) 'eval-form) sort-clauses))
+                    (&rest-qualifiers
+                     (push `((list (eql ',part) (type integer)) 'unevaluated) sort-clauses))
                     ;; note: nothing inside quoted data is ever a binder or eval-form
                     ;; TODO refine sorts by value type (symbol/string/number/...)
                     (&tree
@@ -1374,6 +1383,12 @@ our reader representation or ordinary sexps."
                                    (gen-cdr ,form)))
                    (form-parse-error "expected non-nil car: ~a" ,form))))))))))
 
+(defvar *form-slot-kinds* (make-hash-table :test #'eq))
+
+(defun form-slot-kinds (classname)
+  "The spec kind of each slot of the defform class `classname', as (slot . kind)."
+  (gethash classname *form-slot-kinds*))
+
 (defmacro defform ((name &rest spec) &key binds rest-patterns)
   "Generates an AST type and scope parser associated with a macro or
 special operator NAME. The generated parser performs checking and signals form-parse-error
@@ -1386,7 +1401,7 @@ indicates specially interpreted bindings or such, destructuring via REST-PATTERN
 
 Every entry (ctx . entries) in BINDS denotes an evaluation context 'ctx' in which the
 corresponding lexical entries are bound. ctx is a symbol and entries is a plist (see below)
-Binding tag names **must not** be (member NIL < = WALKER AST).
+Binding tag names **must not** be (member NIL < = WALKER AST OP).
 For each ctx, may have either:
 `<` for sequential variable binding
 `=` to indicate a rest entry in which parallel block bindings occur
@@ -1407,6 +1422,7 @@ Any binding forces a symbol match.
                   collect `(,name :initarg ,(make-keyword name)
                                   :initform nil
                                   :accessor ,name))))
+       (setf (gethash ',classname *form-slot-kinds*) ',(spec-kinds spec))
        ;; methods
        ,(when (member 'body slots)
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
@@ -1625,7 +1641,7 @@ Any binding forces a symbol match.
                                    (return
                                      (make-instance
                                       'function-code
-                                      :lambda-list-kind ',kind
+                                      :lambda-list-kind ',(make-keyword (subseq (string kind) 1))
                                       :docstring (function-info-documentation ,info)
                                       :declarations (function-info-decls ,info)
                                       :body (nreverse body)
@@ -1822,7 +1838,7 @@ other atom."
 (setf (gethash 'eclector.reader:quasiquote *special-parsers*) #'parse-quasiquote)
 
 (defform (defmethod &or (name &rest-qualifiers qualifiers &method-lambda fun-code)
-                    ((setf-op name) &rest-qualifiers qualifiers &method-lambda fun-code))
+                        ((setf-op name) &rest-qualifiers qualifiers &method-lambda fun-code))
   :binds ((fun-code :function name :block name)))
 
 (defmethod location-bindings ((node defmethod-form) id)
@@ -2002,8 +2018,8 @@ other atom."
 
 (defform (multiple-value-call fun arg &body body)
   :binds ((fun) (arg) (body)))
-(defform (multiple-value-prog1 &body body)
-  :binds ((body)))
+(defform (multiple-value-prog1 values-form &body body)
+  :binds ((values-form) (body)))
 
 (defform (progn &body forms)
   :binds ((forms)))

@@ -12,11 +12,13 @@
                 #:location #:make-location #:location-node #:location-id #:location=
                 #:locsort #:getloc #:update
                 #:append-id #:parent-id #:bodylike-id #:id-index
-                #:ref-list #:elements #:hole #:text)
+                #:ref-list #:elements #:gen-list-p
+                #:hole
+                #:text)
   (:local-nicknames (#:parse #:weave-parser)
                     (#:tui #:uncursed)
                     (#:tui-sys #:uncursed-sys))
-  (:export))
+  (:export #:main))
 (in-package #:weave-tui)
 
 ;; dynamic vars for debugging, should not be used
@@ -34,7 +36,26 @@
        (sb-concurrency:send-message *log* (cons nil ,res))
        ,res)))
 
-(defclass ast-view (tui:view)
+(defun reading-order-p (views)
+  "Does each of `views' start no earlier than the one before it, by line then column?"
+  (loop for (a b) on views
+        while b
+        always (let ((ra (tui:rect a))
+                     (rb (tui:rect b)))
+                 (or (< (tui:rect-y ra) (tui:rect-y rb))
+                     (and (= (tui:rect-y ra) (tui:rect-y rb))
+                          (<= (tui:rect-x ra) (tui:rect-x rb)))))))
+
+(defclass ordered-view (tui:view)
+  ()
+  (:documentation "A mixin view whose children must be in reading order. Checked at
+construction, do not modify."))
+
+(defmethod initialize-instance :after ((view ordered-view) &key)
+  (assert (reading-order-p (tui:children view)) ()
+          "Children of ~a are not in reading order: ~a" view (tui:children view)))
+
+(defclass ast-view (ordered-view)
   ((location :initarg :location
              :initform (error "ast view must correspond to a location")
              :accessor location
@@ -371,8 +392,8 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
       (setf (focus-rect context) rect))
     (values-list vals)))
 
-(defparameter *default-key-handlers* (make-hash-table :test 'equal))
-(defparameter *global-key-handlers* (make-hash-table :test 'equal))
+(defparameter *default-key-handlers* (make-hash-table :test #'equal))
+(defparameter *global-key-handlers* (make-hash-table :test #'equal))
 (defun global-key-handler (node location ui)
   "handler may return t to stop propagation up the stack"
   (lambda (view event)
@@ -601,7 +622,8 @@ if none, surround current atom"
 (defun extend-selection (ui delta)
   (when-let (selection (or (current-selection ui) (begin-selection ui)))
     (let ((point (+ (selection-point selection) delta)))
-      (when (<= 0 point (1- (length (elements (getloc (selection-list-location selection))))))
+      (when (<= 0 point (1- (length (elements
+                                     (getloc (selection-list-location selection))))))
         ;; when the underlying range is reselected, forget the zipper
         (when (typep selection 'zipper)
           (change-class selection 'selection))
@@ -834,7 +856,7 @@ if none, surround current atom"
                (swap-node location newnode ui)
                (if-let (state (completion-state ui))
                  (setf (anchor state) newnode)
-                 (when (< 1 (length s))
+                 (when (plusp (length s)) ; now length 2, completion for if
                    (setf (completion-state ui)
                          (make-instance 'completion-state
                                         :anchor newnode
@@ -855,14 +877,17 @@ if none, surround current atom"
                    (swap-node location (hole) ui)))
              t)))))
 
-(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (* . #\⋅) (/= . #\≠)))
+(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (* . #\⋅) (/= . #\≠) (lambda . #\λ)
+                                  (read-quote . #\') (read-function . "#'")))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect &key)
   (let* ((location (car stack))
          (name (parse:name node))
-         (str (if-let (exp (assoc-value *symbol-mappings* name :test #'string-equal))
-                (string exp)
-                (string-downcase name)))
+         (str (if (eq (parse:home-package node) (find-package :keyword))
+                  (format nil ":~(~a~)" name)
+                  (if-let (exp (assoc-value *symbol-mappings* name :test #'string=))
+                    (string exp)
+                    (string-downcase name))))
          (focused (location= location (focus context))))
     (tui:puts str 1 1 rect)
     (make-instance 'ast-view
@@ -911,7 +936,9 @@ if none, surround current atom"
 
 (defun render-symbol (op loc stack context rect)
   "Renders `loc' as a bare focusable token for `op', a string designator."
-  (let* ((text (string-downcase op))
+  (let* ((text (if-let (exp (assoc-value *symbol-mappings* op :test #'string=))
+                 (string exp)
+                 (string-downcase op)))
          (focused (location= loc (focus context)))
          (view
            (make-instance 'ast-view
@@ -926,45 +953,109 @@ if none, surround current atom"
     view))
 
 ;;; list
-(defun flat-list-renderer (list loc-mapper stack context)
-  (let ((index 0)
-        (pad nil))
-    (lambda (rect)
-      (when list
-        (if pad
-            (progn
-              (setf pad nil)
-              (make-instance 'tui:view :rect (tui:copy-rect rect :rows 1 :cols 1)))
-            (multiple-value-prog1
-                (render-node (car list)
-                             (cons (funcall loc-mapper index) stack)
-                             context rect)
-              (setf list (cdr list)
-                    index (+ 1 index)
-                    pad t)))))))
-
 ;; a list as written, drawn as the elements it holds
-(defmethod render-node ((l parse:ref-list) stack context rect &key (direction :horizontal))
+(defparameter *list-delimiters* '("(" . ")"))
+
+(defun render-delimiter (text loc stack rect &key hoverable)
+  (let ((view
+          (make-instance 'ast-view
+                         :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                         :location loc
+                         :hoverable hoverable)))
+    (tui:puts text 1 1 rect)
+    (setf (view-stack view) stack)
+    view))
+
+(defparameter *horizontal* '((0 . nil)))
+(defparameter *vertical* '((0 . t)))
+
+(defun render-elements (elements spec location stack context keys rect)
+  "Splits `count' elements into rows of (indent . n) following `spec', a list of
+(indent . count) pairs where count is a number of elements or NIL for all remaining
+elements on a single line. The last pair repeats, e.g. setq is (2 . 2),
+T is a synonym for 1. `spec' is such a spec or a function from `elements' to specs."
+  (let ((pairs (if (listp spec) spec (funcall spec elements)))
+        (remaining elements)
+        (index 0))
+    (tui:with-vertical (rect)
+      (loop while (and remaining (not (tui:full)))
+            do (destructuring-bind (indent . n) (car pairs)
+                 (setf pairs (or (cdr pairs) pairs))
+                 (tui:place (r)
+                   (tui:with-horizontal (r)
+                     (when (plusp indent)
+                       (tui:pad indent))
+                     (loop
+                       with count = (case n
+                                      ((t) 1)
+                                      ((nil) (length remaining))
+                                      (otherwise (max 1 n)))
+                       for i from 0 below count
+                       while remaining
+                       do (let ((element (pop remaining))
+                                (loc (make-location :node (location-node location)
+                                                    :id (append-id (location-id location)
+                                                                   index))))
+                            (incf index)
+                            (unless (zerop i)
+                              (tui:pad 1))
+                            (tui:place (r) (apply #'render-node element (cons loc stack)
+                                                  context r keys)))))))))))
+
+(defun view-end (view)
+  "The column after and the line of the last cell `view' draws, following its last child.
+Relies on children being in reading order, which `ordered-view' checks."
+  (if-let (children (tui:children view))
+    (view-end (lastcar children))
+    (let ((r (tui:rect view)))
+      (values (tui:rect-x2 r) (tui:rect-y r)))))
+
+(defmethod render-node ((l parse:ref-list) stack context rect
+                        &key (indent *horizontal*) delimited)
+  "A `delimited' list is drawn with `*list-delimiters*' around it, recursively.
+It's opening parens is selectable."
   (let* ((location (car stack))
-         (elements
-           (funcall (ecase direction
-                      (:horizontal #'flat-list-renderer)
-                      (:vertical #'list-renderer))
-                    (elements l)
-                    (lambda (index)
-                      (make-location :node (location-node location)
-                                     :id (append-id (location-id location) index)))
-                    (cdr stack) context))
-         (view (ecase direction
-                 (:horizontal (tui:horizontal-container rect elements))
-                 (:vertical (tui:vertical-container rect elements)))))
-    ;;
+         (focused (location= location (focus context))))
+    (flet ((contents (rect)
+             (render-elements (elements l) indent location (cdr stack) context
+                              (when delimited '(:delimited t)) rect)))
+      (if delimited
+          (let* ((open (render-delimiter (car *list-delimiters*) location stack rect
+                                         :hoverable t))
+                 (inner (contents (tui:clamp-rect
+                                   (tui:copy-rect rect :x (tui:rect-x2 (tui:rect open)))
+                                   rect)))
+                 (close (multiple-value-bind (end-x end-y) (view-end inner)
+                          (render-delimiter (cdr *list-delimiters*) location stack
+                                            (tui:clamp-rect
+                                             (tui:copy-rect rect :x end-x :y end-y)
+                                             rect)))))
+            (when focused
+              (setf (tui:key-handler open) (global-key-handler l location context)
+                    (tui:focused open) t))
+            (make-instance 'ordered-view
+                           :rect (tui:copy-rect
+                                  rect
+                                  :rows (max 1 (tui:rect-rows (tui:rect inner)))
+                                  :cols (- (max (tui:rect-x2 (tui:rect inner))
+                                                (tui:rect-x2 (tui:rect close)))
+                                           (tui:rect-x rect)))
+                           :children (list open inner close)))
+          (let ((view (contents rect)))
+            (setf (tui:key-handler view) (global-key-handler l location context)
+                  (tui:focused view) focused)
+            view)))))
+
+;; for body lists
+(defmethod render-node ((l list) stack context rect &key (indent *horizontal*))
+  (let* ((location (car stack))
+         (view (render-elements l indent location (cdr stack) context nil rect)))
     (setf (tui:key-handler view) (global-key-handler l location context)
           (tui:focused view) (location= location (focus context)))
     view))
 
 ;;; function call
-(defparameter *fun-key-handlers* (make-hash-table :test 'equal))
+(defparameter *fun-key-handlers* (make-hash-table :test #'equal))
 
 (defmethod handle-key ((node parse:function-call) view location ui event)
   ;; I don't expect function calls to have any special binds percolated up the tree
@@ -996,21 +1087,11 @@ if none, surround current atom"
                       (if (bodylike-id id) (1+ (id-index id)) 0)
                       ui))))
 
-(defun list-renderer (list loc-mapper stack context)
-  (let ((index 0))
-    (lambda (rect)
-      (when list
-        (multiple-value-prog1
-            (render-node (car list)
-                         (cons (funcall loc-mapper index) stack)
-                         context rect)
-          (setf list (cdr list)
-                index (+ 1 index)))))))
 
-(define-constant +top-left+ (name-char "U1CE16") :test #'equal)
-(define-constant +bot-left+ (name-char "U1CE17") :test #'equal)
-(define-constant +top-right+ (name-char "U1CE18") :test #'equal)
-(define-constant +bot-right+ (name-char "U1CE19") :test #'equal)
+;; (define-constant +top-left+ (name-char "U1CE16") :test #'equal)
+;; (define-constant +bot-left+ (name-char "U1CE17") :test #'equal)
+;; (define-constant +top-right+ (name-char "U1CE18") :test #'equal)
+;; (define-constant +bot-right+ (name-char "U1CE19") :test #'equal)
 ;; - unary operators have space removed
 ;; - for 2 arguments, draw *arb-arity-binops* infix
 ;;   - higher arity duplicated op views break invariant: always a single focused view
@@ -1057,7 +1138,7 @@ if none, surround current atom"
                       :rect (tui:copy-rect rect :cols width
                                                 :rows (+ (tui:rect-rows arg1-rect)
                                                          1 (tui:rect-rows arg2-rect)))
-                      :children (list arg1-view arg2-view line-view)
+                      :children (list arg1-view line-view arg2-view)
                       :key-handler (global-key-handler node location context)
                       :focused (location= location (focus context)))))
     ;; need wrapper for args
@@ -1145,7 +1226,7 @@ if none, surround current atom"
                                                       2 (tui:rect-cols op-rect)
                                                       (tui:rect-cols arg2-rect)
                                                       (if arg2-bracketed 1 0)))
-                        :children (list arg1-view arg2-view op-view)
+                        :children (list arg1-view op-view arg2-view)
                         :key-handler (global-key-handler node location context)
                         :focused (location= location (focus context))))))
     (t
@@ -1154,14 +1235,12 @@ if none, surround current atom"
                                     (cons (make-location :node node :id 'parse:name) stack)
                                     context rect))
             (name-rect (tui:rect name-view))
-            (args-view (tui:vertical-container
-                        (tui:clamp-rect
-                         (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
-                         rect)
-                        (list-renderer (parse:body node)
-                                       (lambda (i) (make-location :node node
-                                                             :id (list 'parse:body i)))
-                                       stack context)))
+            (args-view (render-elements (parse:body node) *vertical*
+                                        (make-location :node node :id 'parse:body)
+                                        stack context nil
+                                        (tui:clamp-rect
+                                         (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
+                                         rect)))
             (args-rect (tui:rect args-view))
             (fun-rect (tui:clamp-rect
                        (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
@@ -1175,99 +1254,414 @@ if none, surround current atom"
                       :key-handler (global-key-handler node location context)
                       :focused (location= location (focus context)))))))
 
-;;; let form
-(defparameter *let-key-handlers* (make-hash-table :test 'equal))
-(defmethod handle-key ((node parse:let*-form) view location ui event)
-  (when-let ((handler (gethash event *let-key-handlers*)))
-    (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
-      (unless (zerop i)
-        (funcall handler (nthcdr (1- i) (slog (stack ui))) ui)))))
+;;
+;;; layout generation
+;;
+(defvar *default-expansions* (make-hash-table :test #'eq)
+  "Operator symbol -> closure constructing a default node for that form.")
 
-(setf
- (gethash (tui-sys:make-event :kind #\rubout) *let-key-handlers*)
- (lambda (stack ui)
-   (let* ((letloc (car stack))
-          (letnode (location-node letloc))
-          (vars-loc (make-location :node letnode :id 'parse:vars)))
-     (trivia:match (slog (location-id letloc))
-       ((list (eql 'parse:vars) (and (type integer) bi))
-        (if (= 1 (length (elements (getloc vars-loc))))
-            (swap-node vars-loc (ref-list (ref-list (hole) (hole))) ui)
-            (progn
-              (save-history ui)
-              (ast-delete vars-loc bi ui stack))))
-       ((eql 'parse:vars)
-        (save-history ui)
-        (swap-node vars-loc (ref-list (ref-list (hole) (hole))) ui))))))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun default-slot-form (slot kind rest-templates)
+    (let ((template (cdr (assoc slot rest-templates))))
+      (case kind
+        ((&rest) `(ref-list ,@(when template (list template))))
+        ((&body parse::&declarations parse::&rest-qualifiers)
+         (when template `(list ,template)))
+        ((parse::&lambda parse::&macro-lambda parse::&method-lambda)
+         `(make-instance 'parse:function-code
+                         :lambda-list-kind ,(make-keyword (subseq (string kind) 1))
+                         :lambda-list (ref-list)
+                         :body (list (hole))))
+        (t '(hole)))))
 
-(setf
- (gethash (tui-sys:make-event :kind #\newline) *let-key-handlers*)
- (lambda (stack ui)
-   (let* ((letloc (car stack))
-          (letnode (location-node letloc)))
-     (save-history ui)
-     (flet ((insert-binding (index)
-              ;; focus the binder of the pair just inserted
-              (let ((bindloc (ast-insert (ref-list (hole) (hole))
-                                         (make-location :node letnode :id 'parse:vars)
-                                         index ui stack)))
-                (refocus ui `(,@(location-id bindloc) 0)))))
-       (trivia:cmatch (slog (location-id letloc))
-         ((list (eql 'parse:body) (and (type integer) body-i))
-          (ast-insert (hole)
-                      (make-location :node letnode :id 'parse:body)
-                      (1+ body-i) ui stack))
-         ((eql 'parse:vars)
-          (ast-insert (hole)
-                      (make-location :node letnode :id 'parse:body)
-                      0 ui stack))
-         ((eql 'parse:op) (insert-binding 0))
-         ((list (eql 'parse:vars) (and (type integer) bi)) (insert-binding (1+ bi)))
-         ;; structural editing within binding
-         ((list (eql 'parse:vars) (and (type integer) bi) (and (type integer) i))
-          (ast-insert (hole)
-                      (make-location :node letnode :id `(parse:vars ,bi))
-                      (1+ i) ui stack)))))))
+  (defun layout-slots (layout)
+    (loop for row in layout
+          append (typecase row
+                   (cons (loop for item in row
+                               when (symbolp item) collect item
+                               when (consp item) collect (car item)))
+                   (symbol (list row))))))
 
-(defparameter *let-indent* 2)
+(defun hole-path (value id)
+  "The `descend' ids leading from the node holding `value' at `id' to its first hole."
+  (cond ((typep value 'hole) (list id))
+        ((typep value 'parse:function-code)
+         (when-let (path (or (hole-path (parse:lambda-list value) 'parse:lambda-list)
+                             (hole-path (parse:body value) 'parse:body)))
+           (cons id path)))
+        ((gen-list-p value)
+         (loop for element in (elements value)
+               for i from 0
+               do (when-let (path (hole-path element (append-id id i)))
+                    (return path))))))
 
-(defmethod render-node ((letnode parse:let*-form) stack context rect &key)
-  (let* ((op 'let*)
-         (location (car stack))
-         (bindings
-           (render-node
-            (parse:vars letnode)
-            (cons (make-location :node letnode :id 'parse:vars) stack)
-            context
-            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) (length "let*") 1))
-                            rect)
-            :direction :vertical))
-         (bind-rect (tui:rect bindings))
-         (body-view
-           (tui:vertical-container
-            (tui:clamp-rect (tui:copy-rect rect :x (+ *let-indent* (tui:rect-x rect))
-                                                :y (tui:rect-y2 bind-rect))
-                            rect)
-            (list-renderer (parse:body letnode)
-                           (lambda (i) (make-location :node letnode :id (list 'parse:body i)))
-                           stack context)))
-         (body-rect (tui:rect body-view))
-         (let-view (render-symbol op (make-location :node letnode :id 'parse:op)
-                                 stack context rect)))
-    (make-instance 'ast-view
-                   :location location
-                   :children (list let-view bindings body-view)
-                   :rect (tui:copy-rect rect
-                                        :rows (+ (tui:rect-rows bind-rect)
-                                                 (tui:rect-rows body-rect))
-                                        :cols (max (+ (length "let*")
-                                                      1 (tui:rect-cols bind-rect))
-                                                   (+ 2 (tui:rect-cols body-rect))))
-                   :key-handler (global-key-handler letnode location context)
-                   :focused (location= location (focus context)))))
+(defun focus-first-hole (ui)
+  (let ((node (getloc (focus ui))))
+    (loop for (slot) in (parse:form-slot-kinds (type-of node))
+          do (when-let (path (hole-path (funcall slot node) slot))
+               (dolist (id path)
+                 (descend ui id))
+               (return)))))
 
-;;; lambda list
-(defparameter *fun-code-key-handlers* (make-hash-table :test 'equal))
+(defun slot-render-keys (node slot)
+  (if (eq 'parse::&tree (cdr (assoc slot (parse:form-slot-kinds (type-of node)))))
+      '(:delimited t)
+      (list :indent *vertical*)))
+
+(defun render-layout-slot (node item stack context rect)
+  (cond
+    ((consp item)
+     (destructuring-bind (slot spec) item
+       (apply #'render-node (funcall slot node)
+              (cons (make-location :node node :id slot) stack)
+              context rect
+              :indent spec
+              (slot-render-keys node slot))))
+    ((eq item 'parse:op)
+     (render-symbol (funcall item node)
+                    (make-location :node node :id 'parse:op)
+                    stack context rect))
+    ((symbolp item)
+     (apply #'render-node (funcall item node)
+            (cons (make-location :node node :id item) stack)
+            context rect
+            (slot-render-keys node item)))
+    (t
+     (cerror "unexpected layout element ~a" item))))
+
+(defun render-horizontal-layout (node across-layout stack context rect)
+  (tui:with-horizontal (rect)
+    (dolist (item across-layout)
+      (if (integerp item)
+          (tui:pad item)
+          (tui:place (r) (render-layout-slot node item stack context r))))))
+
+(defun render-vertical-layout (node down-layout stack context rect)
+  (tui:with-vertical (rect)
+    (dolist (item down-layout)
+      (cond ((integerp item)
+             (tui:pad item))
+            ((consp item)
+             (tui:place (r) (render-horizontal-layout node item stack context r)))
+            (t
+             (tui:place (r) (render-layout-slot node item stack context r)))))))
+
+(defmacro deflayout (type rest-templates layout)
+  "Defines rendering functions for `type'. This isn't really performance sensitive
+so just parse layout dynamically instead of doing serious codegen.
+ASSUMES that &rest slots accept (slot i j) even if the list is optional like let.
+ASSUMES we never focus a plain list body."
+  (let* ((keymap (symbolicate "*" type "-KEY-HANDLERS*"))
+         (tree-slots (loop for (slot . kind) in (parse:form-slot-kinds type)
+                           when (eq kind 'parse::&tree)
+                             collect slot))
+         (tree-rubout-clauses
+           (loop
+             for slot in tree-slots
+             append
+             `(((list* (eql ',slot) (and path (type cons)))
+                (let ((parent (make-location :node node :id (parent-id (location-id loc)))))
+                  (save-history ui)
+                  (if (= 1 (length (elements (getloc parent))))
+                      (progn
+                        (ast-replace parent (constantly nil) ui stack)
+                        (refocus ui (location-id parent)))
+                      (ast-delete parent (lastcar path) ui stack))))
+               ((eql ',slot)
+                (let ((tree-loc (make-location :node node :id ',slot)))
+                  (save-history ui)
+                  (if (and (gen-list-p (,slot node)) (elements (,slot node)))
+                      (ast-replace tree-loc (constantly nil) ui stack)
+                      (swap-node tree-loc (hole) ui)))))))
+         (tree-newline-clauses
+           (loop
+             for slot in tree-slots
+             append
+             `(((list* (eql ',slot) (and path (type cons)))
+                (ast-insert (hole)
+                            (make-location :node node :id (parent-id (location-id loc)))
+                            (1+ (lastcar path)) ui stack))
+               ((eql ',slot)
+                (when (gen-list-p (,slot node))
+                  (ast-insert (hole) (make-location :node node :id ',slot) 0 ui stack))))))
+         (slot-order (layout-slots layout))
+         (rubout-clauses
+           (loop
+             for (lloc . template) in rest-templates
+             append
+             `(((eql ',lloc)
+                (save-history ui)
+                (let ((rest-loc (make-location :node node :id ',lloc)))
+                  (swap-node rest-loc (if (listp (getloc rest-loc))
+                                          (list ,template)
+                                          (ref-list ,template))
+                             ui)))
+               ((list (eql ',lloc) (and (type integer) i))
+                (let ((rest-loc (make-location :node node :id ',lloc)))
+                  (if (= 1 (length (elements (getloc rest-loc))))
+                      (swap-node rest-loc (if (listp (getloc rest-loc))
+                                              (list ,template)
+                                              (ref-list ,template))
+                                 ui)
+                      (progn
+                        (save-history ui)
+                        (ast-delete rest-loc i ui stack))))))))
+         (newline-clauses
+           (labels ((next-slot (slot) (cadr (member slot slot-order))))
+             (append
+              ;; non-&rest/&body slots
+              (loop
+                for slot in (remove-if (lambda (slot)
+                                         (member slot (mapcar #'car rest-templates)))
+                                       slot-order)
+                when (next-slot slot)
+                  collect
+                `((eql ',slot)
+                  (if (gen-list-p (,(next-slot slot) node))
+                      (let ((rest-loc (ast-insert
+                                       ,(or (cdr (assoc (next-slot slot) rest-templates))
+                                            `(hole))
+                                       (make-location :node node :id ',(next-slot slot))
+                                       0 ui stack)))
+                        (refocus ui (location-id rest-loc)))
+                      (refocus ui ',(next-slot slot)))))
+              (loop
+                for (lslot . template) in rest-templates
+                for dimension := (if (eq 'ref-list (car template)) 2 1)
+                when (next-slot lslot)
+                  append
+                `(((eql ',lslot)
+                   (if (gen-list-p (,(next-slot lslot) node))
+                       (ast-insert ,(or (cdr (assoc (next-slot lslot) rest-templates))
+                                        `(hole))
+                                   (make-location :node node :id ',(next-slot lslot))
+                                   0 ui stack)
+                       (refocus ui ',(next-slot lslot)))))
+                append
+                (if (= dimension 1)
+                    `(((list (eql ',lslot) (and (type integer) body-i))
+                       (ast-insert (hole)
+                                   (make-location :node node :id ',lslot)
+                                   (1+ body-i) ui stack)))
+                    `(((list (eql ',lslot) (and (type integer) bi))
+                       (let ((rest-loc (ast-insert
+                                        ,template
+                                        (make-location :node node :id ',lslot)
+                                        (1+ bi) ui stack)))
+                         ;; 0 slot exists since this is is a &rest slot
+                         (refocus ui `(,@(location-id rest-loc) 0))))
+                      ((list (eql ',lslot)
+                             (and (type integer) bi) (and (type integer) i))
+                       (ast-insert (hole)
+                                   (make-location :node node :id `(,',lslot ,bi))
+                                   (1+ i) ui stack)))))))))
+    `(progn
+       (defmethod render-node ((node ,type) stack context rect &key)
+         (let ((vertical (render-vertical-layout node ',layout stack context rect))
+               (location (car stack)))
+           (make-instance 'ast-view
+                          :location location
+                          :children (list vertical)
+                          :rect (tui:rect vertical)
+                          :key-handler (global-key-handler node location context)
+                          :focused (location= location (focus context)))))
+
+       (setf (gethash (parse:op (make-instance ',type)) *default-expansions*)
+             (lambda ()
+               (make-instance
+                ',type
+                ,@(loop for slot in slot-order
+                        for kind := (cdr (assoc slot (parse:form-slot-kinds type)))
+                        unless (eq slot 'parse:op)
+                          append (list (make-keyword slot)
+                                       (default-slot-form slot kind rest-templates))))))
+
+       (defparameter ,keymap (make-hash-table :test #'equal))
+       (defmethod handle-key ((node ,type) view location ui event)
+         (when-let ((handler (gethash event ,keymap)))
+           (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
+             (unless (zerop i)
+               (funcall handler (nthcdr (1- i) (stack ui)) ui)))))
+
+       (setf (gethash (tui-sys:make-event :kind #\rubout) ,keymap)
+             (lambda (stack ui)
+               (declare (ignorable ui))
+               (block nil
+                 (let* ((loc (car stack))
+                        (node (location-node loc)))
+                   (declare (ignorable node))
+                   (trivia:match (location-id loc)
+                     ,@rubout-clauses
+                     ,@tree-rubout-clauses)))))
+       (setf (gethash (tui-sys:make-event :kind #\newline) ,keymap)
+             (lambda (stack ui)
+               (declare (ignorable ui))
+               (block nil
+                 (let* ((loc (car stack))
+                        (node (location-node loc)))
+                   (declare (ignorable node))
+                   (save-history ui)
+                   (trivia:match (location-id loc)
+                     ,@newline-clauses
+                     ,@tree-newline-clauses)))))
+       ,@(when tree-slots
+           `((setf (gethash (tui-sys:make-event :kind #\() ,keymap)
+                   (lambda (stack ui)
+                     (let ((loc (car stack)))
+                       (trivia:match (location-id loc)
+                         ((or ,@(loop for slot in tree-slots
+                                      collect `(eql ',slot)
+                                      collect `(list* (eql ',slot) _)))
+                          (save-history ui)
+                          (ast-replace loc (lambda (thing) (ref-list thing (hole))) ui stack)
+                          (refocus ui (append-id (location-id loc) 1))
+                          t))))))))))
+
+(deflayout parse:let*-form ((parse:vars . (ref-list (hole) (hole)))
+                            (parse:body . (hole)))
+  ((parse:op 1 parse:vars)
+   ;; parse:decls
+   (1 parse:body)))
+
+(deflayout parse:let-form ((parse:vars . (ref-list (hole) (hole)))
+                           (parse:body . (hole)))
+  ((parse:op 1 parse:vars)
+   (1 parse:body)))
+
+(deflayout parse:flet-form
+    ((parse:funs
+      . (ref-list (hole)
+                  (make-instance 'parse:function-code
+                                 :lambda-list-kind :lambda
+                                 :lambda-list (ref-list)
+                                 :body (list (hole)))))
+     (parse:body . (hole)))
+  ((parse:op 1 parse:funs)
+   (1 parse:body)))
+
+(deflayout parse:labels-form
+    ((parse:funs
+      . (ref-list (hole)
+                  (make-instance 'parse:function-code
+                                 :lambda-list-kind :lambda
+                                 :lambda-list (ref-list)
+                                 :body (list (hole)))))
+     (parse:body . (hole)))
+  ((parse:op 1 parse:funs)
+   (1 parse:body)))
+
+(deflayout parse:macrolet-form
+    ((parse:macro-defs
+      . (ref-list (hole)
+                  (make-instance 'parse:function-code
+                                 :lambda-list-kind :macro-lambda
+                                 :lambda-list (ref-list)
+                                 :body (list (hole)))))
+     (parse:body . (hole)))
+  ((parse:op 1 parse:macro-defs)
+   (1 parse:body)))
+
+(deflayout parse:symbol-macrolet-form ((parse:macro-code . (ref-list (hole) (hole)))
+                                       (parse:body . (hole)))
+  ((parse:op 1 parse:macro-code)
+   (1 parse:body)))
+
+(deflayout parse:block-form ((parse:body . (hole)))
+  ((parse:op 1 parse:name)
+   (1 parse:body)))
+
+(deflayout parse:catch-form ((parse:body . (hole)))
+  ((parse:op 1 parse:tag)
+   (1 parse:body)))
+
+(deflayout parse:throw-form ()
+  ((parse:op 1 parse:tag 1 parse:result)))
+
+(deflayout parse:return-from-form ((parse:value . (hole)))
+  ((parse:op 1 parse:name 1 parse:value)))
+
+(deflayout parse:if-form ((parse:then-else . (hole)))
+  ((parse:op 1 parse:test)
+   (3 parse:then-else)))
+
+(deflayout parse:setq-form ((parse:forms . (hole)))
+  ((parse:op 1 (parse:forms ((0 . 2))))))
+
+(deflayout parse:progn-form ((parse:forms . (hole)))
+  (parse:op
+   (1 parse:forms)))
+
+(deflayout parse:tagbody-form ((parse:body . (hole)))
+  (parse:op
+   (1 parse:body)))
+
+(deflayout parse:go-form ()
+  ((parse:op 1 parse:tag)))
+
+(deflayout parse:the-form ()
+  ((parse:op 1 parse:type-specifier 1 parse:form)))
+
+(deflayout parse:unwind-protect-form ((parse:cleanup . (hole)))
+  ((parse:op)
+   (3 parse:protected)
+   (1 parse:cleanup)))
+
+(deflayout parse:multiple-value-prog1-form ((parse:body . (hole)))
+  ((parse:op 1 parse:values-form)
+   (1 parse:body)))
+
+(deflayout parse:multiple-value-call-form ((parse:body . (hole)))
+  ((parse:op 1 parse:fun 1 parse:arg 1 parse:body)))
+
+(deflayout parse:progv-form ((parse:body . (hole)))
+  ((parse:op 1 parse:var-list 1 parse:val-list)
+   (1 parse:body)))
+
+(deflayout parse:locally-form ((parse:body . (hole)))
+  (parse:op
+   (1 parse:body)))
+
+(deflayout parse:eval-when-form ((parse:body . (hole)))
+  ((parse:op 1 parse:situations)
+   (1 parse:body)))
+
+(deflayout parse:load-time-value-form ()
+  ((parse:op 1 parse:form 1 parse:read-only-p)))
+
+(deflayout parse:function-form ()
+  ((parse:op 1 parse:fun-designator)))
+
+(deflayout parse:quote-form ()
+  ((parse:op 1 parse:thing)))
+
+(deflayout parse:defmacro-form ()
+  ((parse:op 1 parse:name)
+   (1 parse:macro-code)))
+
+;; TODO (setf f) printing
+(deflayout parse:defun-form ()
+  ((parse:op 1 parse:name)
+   (1 parse:fun-code)))
+
+(deflayout parse:defmethod-form ()
+  ((parse:op 1 parse:name 1 parse:qualifiers)
+   (1 parse:fun-code)))
+
+(deflayout parse:lambda-form ()
+  ((parse:op 1 parse:fun-code)))
+;; override for nonempty lambda list
+(setf (gethash 'lambda *default-expansions*)
+      (lambda ()
+        (make-instance 'parse:lambda-form
+                       :fun-code (make-instance 'parse:function-code
+                                                :lambda-list-kind :lambda
+                                                :lambda-list (ref-list (hole))
+                                                :body (list (hole))))))
+
+;;
+;;; function-code
+;;
+(defparameter *fun-code-key-handlers* (make-hash-table :test #'equal))
 
 (defmethod handle-key ((node parse:function-code) view location ui event)
   (declare (ignore view))
@@ -1275,6 +1669,12 @@ if none, surround current atom"
     (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
       (unless (zerop i)
         (funcall handler (nthcdr (1- i) (stack ui)) ui)))))
+
+(setf
+ (gethash (tui-sys:make-event :kind #\rubout) *fun-code-key-handlers*)
+ (lambda (stack ui)
+   (declare (ignore stack ui))
+   t))
 
 (setf
  (gethash (tui-sys:make-event :kind #\newline) *fun-code-key-handlers*)
@@ -1340,23 +1740,21 @@ if none, surround current atom"
 
 ;;; function-code (lambda-list and body, shared by defun/defmacro/defmethod/
 ;;; lambda/flet/labels). TODO docstring/declarations
-(defparameter *lambda-body-indent* 2)
 (defmethod render-node ((node parse:function-code) stack context rect &key)
   (let* ((location (car stack))
          (lambda-list-view
-           (render-node
-            (parse:lambda-list node)
-            (cons (make-location :node node :id 'parse:lambda-list) stack)
-            context rect))
+           (render-node (parse:lambda-list node)
+                        (cons (make-location :node node :id 'parse:lambda-list) stack)
+                        context rect :delimited t))
          (ll-rect (tui:rect lambda-list-view))
          (body-view
-           (tui:vertical-container
-            (tui:clamp-rect (tui:copy-rect rect :x (+ *lambda-body-indent* (tui:rect-x rect))
-                                                :y (tui:rect-y2 ll-rect))
-                            rect)
-            (list-renderer (parse:body node)
-                           (lambda (i) (make-location :node node :id (list 'parse:body i)))
-                           stack context)))
+           (render-elements (parse:body node) *vertical*
+                            (make-location :node node :id 'parse:body)
+                            stack context nil
+                            (tui:clamp-rect
+                             (tui:copy-rect rect :x (tui:rect-x rect)
+                                                 :y (tui:rect-y2 ll-rect))
+                             rect)))
          (body-rect (tui:rect body-view)))
     (make-instance 'ast-view
                    :location location
@@ -1365,8 +1763,7 @@ if none, surround current atom"
                                         :rows (+ (tui:rect-rows ll-rect)
                                                  (tui:rect-rows body-rect))
                                         :cols (max (tui:rect-cols ll-rect)
-                                                   (+ *lambda-body-indent*
-                                                      (tui:rect-cols body-rect))))
+                                                   (tui:rect-cols body-rect)))
                    :key-handler (global-key-handler node location context)
                    :focused (location= location (focus context)))))
 
@@ -1374,28 +1771,6 @@ if none, surround current atom"
   (trivia:cmatch id
     ((list (eql 'parse:body) (and (type integer) i))
      (if (< 0 i) (list 'parse:body (1- i)) 'parse:lambda-list))))
-
-(defmethod render-node ((node parse:lambda-form) stack context rect &key)
-  (let* ((op "λ")
-         (location (car stack))
-         (fc-view
-           (render-node
-            (parse:fun-code node)
-            (cons (make-location :node node :id 'parse:fun-code) stack)
-            context
-            (tui:clamp-rect (tui:copy-rect rect :x (+ (tui:rect-x rect) 1 1))
-                            rect)))
-         (fc-rect (tui:rect fc-view))
-         (op-view (render-symbol op (make-location :node node :id 'parse:op)
-                                stack context rect)))
-    (make-instance 'ast-view
-                   :location location
-                   :children (list op-view fc-view)
-                   :rect (tui:copy-rect rect
-                                        :rows (tui:rect-rows fc-rect)
-                                        :cols (+ 1 1 (tui:rect-cols fc-rect)))
-                   :key-handler (global-key-handler node location context)
-                   :focused (location= location (focus context)))))
 
 ;;; global key handlers
 (setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
@@ -1432,13 +1807,9 @@ if none, surround current atom"
                                             (loop for i below (- args (length oldbody))
                                                   collect (hole))))))
                       (swap-node (second (stack ui)) function-node ui))))))
-              ((eq s 'cl:let*)
-               (swap-node (focus ui)
-                          (make-instance 'parse:let*-form
-                                          :body (list (hole))
-                                          :decls ()
-                                          :vars (ref-list (ref-list (hole) (hole))))
-                          ui))
+              ((gethash s *default-expansions*)
+               (swap-node (focus ui) (funcall (gethash s *default-expansions*)) ui)
+               (focus-first-hole ui))
               (t
                (swap-node (focus ui)
                           (make-instance 'parse:symbol-ref
@@ -1746,19 +2117,15 @@ modifying the ast."
     (let* ((anchor (anchor state))
            (anchor-rect (tui:rect (gethash anchor (node-views ui))))
            (maxlen (loop for c in (candidates state) maximize (tui:display-width c))))
-      (tui:vertical-container
-       (tui:clamp-rect (tui:make-rect :x (tui:rect-x anchor-rect)
-                                      :y (tui:rect-y2 anchor-rect)
-                                      :rows (tui:rows ui)
-                                      :cols (max maxlen (tui:cols ui)))
-                       (ui-rect ui))
-       (let ((remaining (candidates state))
-             (index 0))
-         (lambda (rect)
-           (when remaining
-             (multiple-value-prog1 (render-completion (car remaining) index state rect)
-               (setf remaining (cdr remaining)
-                     index (+ 1 index))))))))))
+      (tui:with-vertical ((tui:clamp-rect (tui:make-rect :x (tui:rect-x anchor-rect)
+                                                         :y (tui:rect-y2 anchor-rect)
+                                                         :rows (tui:rows ui)
+                                                         :cols (max maxlen (tui:cols ui)))
+                                          (ui-rect ui)))
+        (loop for candidate in (candidates state)
+              for index from 0
+              until (tui:full)
+              do (tui:place (r) (render-completion candidate index state r)))))))
 
 ;;
 ;;; main loop
@@ -1779,7 +2146,7 @@ modifying the ast."
                      (tui:copy-rect focus-rect :x 0 :y 0) focus-rect
                      :blend t))
     (make-instance
-     'tui:view
+     'ordered-view
      :rect (ui-rect ui)
      :children (delete nil toplevel-views))))
 
@@ -1802,9 +2169,9 @@ modifying the ast."
     (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled))))
 
 (defun tui-main ()
-  (let* ((ast (parse::parse-from-string
+  (let* ((ast (parse:parse-from-string
                "(lambda (a &key (b a supplied-p))
-                  (1- b) :test)"))
+                  (quote a))"))
          (root-loc (make-location :node 'undefined))
          (tui (make-instance 'ui :ast ast :stack (list root-loc))))
     (setf *state* tui)
