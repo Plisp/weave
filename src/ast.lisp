@@ -6,12 +6,12 @@
 (uiop:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
   (:export #:make-env
-           #:parse-from-string #:ast-parse-error
+           #:parse-from-string #:parse-syntax #:ast-parse-error
            #:is-atom #:get-body
            #:copy-node
 
            #:update
-           #:get-location #:getloc
+           #:get-location #:node-at
 
            #:location-sort #:locsort #:location-bindings
            #:form-slot-kinds
@@ -21,14 +21,14 @@
 
            #:function-call
 
-           #:macro-call #:subform-asts #:subform-binders
+           #:macro-call #:subforms #:path-at
 
            #:function-code #:lambda-list
            #:unevaluated
            #:body #:name #:str #:vars #:op
            #:hole #:text
 
-           #:ref-list #:gen-list-p
+           #:ref-list #:gen-list-p #:gen-tree-ref
            #:elements #:with-elements
 
            #:home-package
@@ -143,10 +143,9 @@ binder once parsed) in the reader representation, or a hole in edited code."
    (call-env :initarg :call-env
              :initform nil
              :reader call-env)
-   (subform-binders :initarg :subform-binders
-                    :reader subform-binders)
-   (subform-asts :initarg :subform-asts
-                 :reader subform-asts)))
+   (subforms :initarg :subforms
+             :reader subforms
+             :documentation "Evaluated syntax in the body -> (parsed . binders in scope)")))
 
 (defclass ref-list (anchor)
   ((elements :initarg :elements
@@ -297,19 +296,19 @@ so a name test alone can't distinguish #:|.| from a dot."))
          :op (copy-node (op o))
          :body new-body
          :call-env (call-env o)
-         :subform-binders (let ((table (make-hash-table :test #'eq)))
-                            (maphash (lambda (form binders)
-                                       (setf (gethash (gethash form form-pairs) table)
-                                             (mapcar (lambda (b) (gethash b form-pairs))
-                                                     binders)))
-                                     (subform-binders o))
-                            table)
-         :subform-asts (let ((table (make-hash-table :test #'eq)))
-                         (maphash (lambda (form ast)
-                                    (setf (gethash (gethash form form-pairs) table)
-                                          (copy-node ast)))
-                                  (subform-asts o))
-                         table)))))
+         :subforms (let ((table (make-hash-table :test #'eq)))
+                     (maphash (lambda (form entry)
+                                (let ((copy (gethash form form-pairs)))
+                                  (setf (gethash copy table)
+                                        ;; check if the parsed copy (car entry) differs
+                                        ;; otherwise key under the call copy
+                                        (cons (if (eq (car entry) form)
+                                                  copy
+                                                  (copy-node (car entry)))
+                                              (mapcar (lambda (b) (gethash b form-pairs))
+                                                      (cdr entry))))))
+                              (subforms o))
+                     table)))))
   (:method ((o ref-list))
     (make-instance 'ref-list :elements (mapcar #'copy-node (elements o))
                              :kind (kind o) :rank (rank o)))
@@ -399,12 +398,21 @@ They are specific to the `node' type."
   (:documentation "Sort lookups are total: an invalid id gives NIL.
 A method may return the contents at `id' as a second value, NIL when absent.")
   (:method (node id) (declare (ignore node id)) nil))
-(defgeneric get-location (node id)
-  (:documentation "Returns the current value at `id'."))
-(defun getloc (location)
-  (get-location (location-node location) (location-id location)))
+
 (defun locsort (location)
   (location-sort (location-node location) (location-id location)))
+
+(defgeneric get-location (node id)
+  (:documentation "Returns the current value at `id'."))
+
+(defun node-at (loc)
+  "The node at `loc', but parsed parts of a macro call are taken instead."
+  (let ((value (get-location (location-node loc) (location-id loc)))
+        (node (location-node loc)))
+    (if-let (entry (and (typep node 'macro-call)
+                        (gethash value (subforms node))))
+      (car entry)
+      value)))
 
 (defun check-evaluated (node id)
   (multiple-value-bind (sort contents) (location-sort node id)
@@ -640,10 +648,21 @@ does not touch hardwired operators."
   (:documentation "A form did not match the syntax of its operator."))
 
 (declaim (notinline form-parse-error))
+
 (defun form-parse-error (control &rest args)
   (error 'form-parse-error
          :format-control (concatenate 'string "parse failed: " control)
          :format-arguments args))
+
+(define-condition analysis-invariant-error (simple-error)
+  ()
+  (:documentation "Analysis reached a state it assumes impossible, as opposed to an error
+signalled by the code under analysis."))
+
+(defmacro invariant (form)
+  `(unless ,form
+     (error 'analysis-invariant-error :format-control "invariant ~s violated"
+                                      :format-arguments '(,form))))
 
 (defun with-elements (list elements)
   "Replaces a ref-list `list's elements with `elements', copying anchored data.
@@ -1214,7 +1233,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
         (defmethod update ((node ,classname) id new-value)
           (trivia:cmatch id ,@(nreverse update-clauses)))
         (defmethod location-sort ((node ,classname) id)
-          (trivia:match id ,@(nreverse sort-clauses))))))
+          (trivia:match id ((eql 'op) 'symbol-ref) ,@(nreverse sort-clauses))))))
 
   ;;; syntax methods
   (defun pattern-tags (pattern)
@@ -1286,7 +1305,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                 (append ,@(spec-syntax spec 'node rest-patterns)))))))
   )
 
-(defgeneric suffix-ids (node suffix)
+(defgeneric suffix-path (node suffix)
   (:documentation "Translates the syntax list indices `suffix' (going downwards) into the
 path of ids leading down from `node'. Stops early where no id addresses the position
 more precisely.")
@@ -1295,14 +1314,14 @@ more precisely.")
     nil))
 
 (defun suffix-step (node id rest)
-  (cons id (when rest (suffix-ids (get-location node id) rest))))
+  (cons id (when rest (suffix-path (get-location node id) rest))))
 
 (defun alternative-taken-p (node alternatives rest-patterns)
   "Did the parse of `node' take the second of `alternatives'?"
   (some (lambda (tag) (funcall tag node))
         (second-unique-tags alternatives rest-patterns)))
 
-(defun rest-suffix-ids (node tag rest-patterns rest)
+(defun rest-suffix-path (node tag rest-patterns rest)
   (if (null rest)
       (list tag)
       (destructuring-bind (i . more) rest
@@ -1315,39 +1334,39 @@ more precisely.")
                                                (cdr (assoc tag rest-patterns))))
                                  '(&lambda &macro-lambda &method-lambda)))
                     (cons (list tag i 1)
-                          (suffix-ids (gen-nth 1 element) (cons (1- j) deeper)))
+                          (suffix-path (gen-nth 1 element) (cons (1- j) deeper)))
                     (suffix-step node (list tag i j) deeper))))))))
 
-(defun element-suffix-ids (node pattern rest-patterns rest)
+(defun element-suffix-path (node pattern rest-patterns rest)
   (case (first pattern)
-    (&rest (rest-suffix-ids node (second pattern) rest-patterns rest))
-    (&or (element-suffix-ids node
+    (&rest (rest-suffix-path node (second pattern) rest-patterns rest))
+    (&or (element-suffix-path node
                              (if (alternative-taken-p node (rest pattern) rest-patterns)
                                  (third pattern)
                                  (second pattern))
                              rest-patterns rest))
     (t (if (null rest)
            (list (first (pattern-tags pattern)))
-           (spec-suffix-ids node pattern rest-patterns (first rest) (rest rest))))))
+           (spec-suffix-path node pattern rest-patterns (first rest) (rest rest))))))
 
-(defun spec-suffix-ids (node spec rest-patterns index rest)
-  "Emits the suffix-ids method for a defform class. Spec interpreted at runtime."
+(defun spec-suffix-path (node spec rest-patterns index rest)
+  "Emits the suffix-path method for a defform class. Spec interpreted at runtime."
   (flet ((spec-step (nspec n)
-           (spec-suffix-ids node (nthcdr nspec spec) rest-patterns (- index n) rest)))
+           (spec-suffix-path node (nthcdr nspec spec) rest-patterns (- index n) rest)))
     (let ((part (first spec)))
       (cond ((null spec) nil)
             ((consp part)
              (if (zerop index)
-                 (element-suffix-ids node part rest-patterns rest)
+                 (element-suffix-path node part rest-patterns rest)
                  (spec-step 1 1)))
             ((eq part '&or)
-             (spec-suffix-ids node (if (alternative-taken-p node (rest spec) rest-patterns)
+             (spec-suffix-path node (if (alternative-taken-p node (rest spec) rest-patterns)
                                        (third spec)
                                        (second spec))
                               rest-patterns index rest))
             ((member part '(&lambda &macro-lambda &method-lambda))
              (cons (second spec)
-                   (suffix-ids (funcall (second spec) node) (cons index rest))))
+                   (suffix-path (funcall (second spec) node) (cons index rest))))
             ((member part '(&body &rest-qualifiers &declarations))
              (let* ((tag (second spec))
                     (count (length (funcall tag node))))
@@ -1474,6 +1493,8 @@ our reader representation or ordinary sexps."
 (defun form-slot-kinds (classname)
   "The spec kind of each slot of the defform class `classname', as (slot . kind)."
   (gethash classname *form-slot-kinds*))
+(setf (gethash 'function-call *form-slot-kinds*) '((body . &body))
+      (gethash 'macro-call *form-slot-kinds*) '((body . &tree)))
 
 (defmacro defform ((name &rest spec) &key binds rest-patterns)
   "Generates an AST type and scope parser associated with a macro or
@@ -1522,11 +1543,11 @@ Any binding forces a symbol match.
            new))
        ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
        ,@(syntax-methods name classname spec rest-patterns)
-       (defmethod suffix-ids ((node ,classname) suffix)
+       (defmethod suffix-path ((node ,classname) suffix)
          (when suffix
            (if (zerop (first suffix))
                (list 'op)
-               (spec-suffix-ids node ',spec ',rest-patterns
+               (spec-suffix-path node ',spec ',rest-patterns
                                 (1- (first suffix)) (rest suffix)))))
        ;; exports
        (export ',classname)
@@ -2076,6 +2097,10 @@ other atom."
     (bindings-of :block (list (name node)))))
 
 (defform (function fun-designator))
+(defmethod location-sort ((node function-form) id)
+  (case id
+    (op 'symbol-ref)
+    (fun-designator (if (typep (fun-designator node) 'symbol-ref) 'fun-designator 'unevaluated))))
 (defform (quote &tree thing))
 
 (defform (setq &body forms)
@@ -2228,9 +2253,10 @@ XXX performs unguarded read-evaluation."
 ;;; macro analysis via perturbation
 ;; XXX muffle warnings
 ;;
-(defun macro-call-envmap (call env &optional (walker (constantly nil)))
-  "Identifies body forms and binding scopes to return a map of {sexp -> binding env}.
-Walks subforms of the call using WALKER during analysis."
+(defun macro-call-envmap (call env walker)
+  "Identifies body forms and binding scopes to return a map of {sexp -> (parsed binder-env)}.
+Walks subforms of the call using WALKER during analysis, which should return the
+parsed entry to be keyed in the map."
   (with-temporary-interning (interned)
     (handler-case
       (labels ((call-nth (i form)
@@ -2247,7 +2273,7 @@ Walks subforms of the call using WALKER during analysis."
         (let* ((raw-form->loc (make-hash-table :test #'eq))
                (raw-form->form (make-hash-table :test #'eq))
                (possible-identifiers (make-hash-table :test #'eq))
-               (eval->binders (make-hash-table :test #'eq))
+               (subforms (make-hash-table :test #'eq))
                (raw (strip-wrappers call interned))
                (env (strip-env env interned)))
           ;; identify all forms in the original call for classification
@@ -2284,9 +2310,10 @@ Walks subforms of the call using WALKER during analysis."
                          (if (and (consp form) path)
                              ;; recurse known eval'd subforms from the ORIGINAL tree
                              (let ((call-form (lookup-path (car path) call)))
-                               (setf (gethash form raw-form->form) call-form)
-                               (ensure-gethash call-form eval->binders)
-                               (funcall walker call-form env)
+                               ;; parse of the child must succeed, or assume coincidence
+                               (when-let (parsed (funcall walker call-form env))
+                                 (setf (gethash form raw-form->form) call-form
+                                       (gethash call-form subforms) (list parsed)))
                                nil)
                              t)))
                      ;; binder currently may be unused TODO block analysis
@@ -2334,7 +2361,7 @@ Walks subforms of the call using WALKER during analysis."
                                                               (eq kind :variable))
                                                      (setf ident-kind :variable)
                                                      (return-from walk)))))
-                                  (error () nil))))
+                                  ((and error (not analysis-invariant-error)) () nil))))
                             ;; an actual reference will be independent of the binding name
                             ;; counter: spec-step forms may have spurious refs generated
                             (if ident-kind
@@ -2364,25 +2391,28 @@ Walks subforms of the call using WALKER during analysis."
                                        (let ((binder (lookup-path path call)))
                                          ;; note: on-binder idempotent callback, may see the
                                          ;; same binder again via ldiff at deeper nesting
-                                         (assert (typep binder 'symbol-ref))
-                                         (unless (typep binder 'binder)
-                                           (change-class binder 'binder))
-                                         (push binder res)))
+                                         (invariant (typep binder '(or symbol-ref hole)))
+                                         (when (typep binder 'symbol-ref)
+                                           (unless (typep binder 'binder)
+                                             (change-class binder 'binder))
+                                           (push binder res))))
                                   finally (return res))))
                          (if (and (consp form) (gethash form raw-form->loc))
-                             (progn
-                               (setf (gethash (gethash form raw-form->form) eval->binders)
-                                     (calc-bindings))
+                             (when-let (call-form (gethash form raw-form->form))
+                               (setf (gethash call-form subforms)
+                                     (cons (car (gethash call-form subforms))
+                                           (calc-bindings)))
                                nil)
                              ;; t -> continue recursion until known
                              (with-lookup (path (gethash form gensym->refpath) t)
-                               (setf (gethash (lookup-path path call) eval->binders)
-                                     (calc-bindings))
+                               (let ((ref (lookup-path path call)))
+                                 (invariant (typep ref '(or symbol-ref hole)))
+                                 (setf (gethash ref subforms) (cons ref (calc-bindings))))
                                nil)))))
-                    (error () nil))))
-              ;; (disp (hash-table-plist eval->binders))
-              eval->binders))))
-      ((and error (not ast-parse-error)) ()
+                    ((and error (not analysis-invariant-error)) () nil))))
+              ;; (disp (hash-table-plist subforms))
+              subforms))))
+      ((and error (not (or ast-parse-error analysis-invariant-error))) ()
         (make-hash-table :test #'eq)))))
 
 (defmethod get-location ((node macro-call) id)
@@ -2391,6 +2421,12 @@ Walks subforms of the call using WALKER during analysis."
     ((eql 'body) (body node))
     ((list* (eql 'body) indices)
      (gen-tree-ref (body node) indices))))
+
+(defun path-at (call id)
+  "Ids from the macro call `call' to the syntax at `id', descending into parsed subforms."
+  (trivia:ematch id
+    ((eql 'op) (suffix-path call '(0)))
+    ((list* (eql 'body) index more) (suffix-path call (list* (1+ index) more)))))
 
 (defun copy-syntax (node)
   "Copy syntax, retaining anchors and restoring binders to unparsed symbol-refs."
@@ -2406,8 +2442,8 @@ Walks subforms of the call using WALKER during analysis."
 
 (defun unparse-syntax (form table)
   "`form' with unparsed entries in `table' taking precedence over subforms."
-  (if-let (parsed (gethash form table))
-    (to-syntax parsed)
+  (if-let (entry (gethash form table))
+    (to-syntax (car entry))
     (typecase form
       (ref-list (with-elements form
                   (mapcar (rcurry #'unparse-syntax table)
@@ -2420,7 +2456,7 @@ Returns NIL when the call is unparseable."
   (let ((syntax (copy-syntax
                   (apply #'ref-list
                            op
-                           (mapcar (rcurry #'unparse-syntax (subform-asts call)) body)))))
+                           (mapcar (rcurry #'unparse-syntax (subforms call)) body)))))
     (handler-case
         (copy-anchors
          call (parse syntax (or (call-env call) +nullenv+) #'copy-anchors))
@@ -2433,34 +2469,30 @@ Returns NIL when the call is unparseable."
                (make-instance 'macro-call
                               :op op :body body
                               :call-env (call-env node)
-                              :subform-binders (subform-binders node)
-                              :subform-asts (subform-asts node)))))
+                              :subforms (subforms node)))))
     (trivia:cmatch id
       ((eql 'op)
        (let ((call (rebuild (copy-anchors (op node) new-value) (body node))))
          ;; we may reparse into a different kind of call, but try to preserve position
-         (values call (suffix-ids call '(0)))))
+         (values call (path-at call 'op))))
       ((list* (eql 'body) indices)
        (multiple-value-bind (sort old) (location-sort node id)
          (if (and (eq sort 'eval-form) (typep new-value 'eval-form))
              (make-instance
               'macro-call
               :op (op node) :body (body node) :call-env (call-env node)
-              :subform-binders (subform-binders node)
-              :subform-asts (let ((new (copy-hash-table (subform-asts node) :test #'eq)))
-                              (setf (gethash old new) new-value)
-                              new))
+              :subforms (let ((new (copy-hash-table (subforms node) :test #'eq)))
+                          (setf (gethash old new) (cons new-value (cdr (gethash old new))))
+                          new))
              ;; syntax change, reparse. Binder names included e.g. loop
              (let* ((body (if indices
                               (list-update (body node)
                                            (unparse-syntax (nth (first indices) (body node))
-                                                           (subform-asts node))
+                                                           (subforms node))
                                            (first indices))
                               (body node)))
                     (call (rebuild (op node) (gen-tree-update body indices new-value))))
-               (values call
-                       (when indices
-                         (suffix-ids call (cons (1+ (first indices)) (rest indices)))))))))
+               (values call (when indices (path-at call id)))))))
       ;; insertion or deletion, reparse
       ((eql 'body) (rebuild (op node) new-value)))))
 
@@ -2470,11 +2502,11 @@ Returns NIL when the call is unparseable."
     ((list* (eql 'body) indices)
      (let ((thing (gen-tree-ref (body node) indices)))
        (values (cond ((typep thing 'binder) 'binder)
-                     ((nth-value 1 (gethash thing (subform-binders node))) 'eval-form)
+                     ((gethash thing (subforms node)) 'eval-form)
                      (thing 'unevaluated))
                thing)))))
 
-(defmethod suffix-ids ((node function-code) suffix)
+(defmethod suffix-path ((node function-code) suffix)
   (when suffix
     (destructuring-bind (index . rest) suffix
       (let ((docs (if (docstring node) 1 0))
@@ -2484,16 +2516,16 @@ Returns NIL when the call is unparseable."
               ((<= index (+ docs decls)) (list 'declarations))
               (t (suffix-step node (list 'body (- index 1 docs decls)) rest)))))))
 
-(defmethod suffix-ids ((node macro-call) suffix)
+(defmethod suffix-path ((node macro-call) suffix)
   (when suffix
     (if (zerop (first suffix))
         (list 'op)
         (loop for path = (list (1- (first suffix))) then (append path (list (first more)))
               for more = (rest suffix) then (rest more)
-              for form = (gethash (gen-tree-ref (body node) path) (subform-asts node))
+              for form = (car (gethash (gen-tree-ref (body node) path) (subforms node)))
               when (or form (null more))
                 return (cons (cons 'body path)
-                             (when (and form more) (suffix-ids form more)))))))
+                             (when (and form more) (suffix-path form more)))))))
 
 (defmethod to-syntax ((node function-call))
   (copy-anchors node (apply #'ref-list (to-syntax (name node))
@@ -2501,11 +2533,11 @@ Returns NIL when the call is unparseable."
 
 (defmethod to-syntax ((node macro-call))
   (copy-anchors node (apply #'ref-list (op node)
-                            (mapcar (rcurry #'unparse-syntax (subform-asts node))
+                            (mapcar (rcurry #'unparse-syntax (subforms node))
                                     (body node)))))
 
 (defmethod location-bindings ((node macro-call) id)
-  (bindings-of :variable (gethash (check-evaluated node id) (subform-binders node))))
+  (bindings-of :variable (cdr (gethash (check-evaluated node id) (subforms node)))))
 
 (defun lambda-expression-p (x)
   (and (gen-form-p x)
@@ -2524,7 +2556,7 @@ Returns NIL when the call is unparseable."
   (cond
     ((or (not (gen-form-p form)) (gen-atom-p form))
      ;; note: a LABEL-DEF is atomic here because in practice only literals are labelled
-     (assert (typep form '(or symbol-ref literal label-def ref-list)))
+     (invariant (typep form '(or symbol-ref literal label-def ref-list hole)))
      form)
     ((lambda-expression-p (gen-car form)) (parse-call form env alter-identity))
     ((not (typep (gen-car form) 'symbol-ref))
@@ -2539,19 +2571,19 @@ Returns NIL when the call is unparseable."
          (flet ((parse-function (form) (parse-call form env alter-identity))
                 ;; don't expand explicitly, we only care about explicit call subforms
                 (parse-macro (form)
-                  (let ((macro-subforms (make-hash-table :test #'eq)))
-                    (funcall alter-identity form
-                             (make-instance
-                              'macro-call
-                              :op (gen-car form) :body (gen-cdr form)
-                              :call-env env
-                              :subform-asts macro-subforms
-                              :subform-binders
-                              (macro-call-envmap
-                               form env
-                               (lambda (form env)
-                                 (setf (gethash form macro-subforms)
-                                       (parse form env alter-identity)))))))))
+                  (funcall alter-identity form
+                           (make-instance
+                            'macro-call
+                            :op (gen-car form) :body (gen-cdr form)
+                            :call-env env
+                            :subforms
+                            (macro-call-envmap
+                             form env
+                             (lambda (form env)
+                               ;; one subform parsing failure e.g. (3)
+                               ;; should not invalidate other parsed forms
+                               (handler-case (parse form env alter-identity)
+                                 (ast-parse-error () nil))))))))
            (cond ((null result) ; global
                   (let ((sym (resolve (gen-car form))))
                     (if (and sym (macro-function sym) (not (hardwired-p sym)))
@@ -2565,10 +2597,10 @@ Returns NIL when the call is unparseable."
 (defmethod name ((node lambda-form)) "lambda")
 (defmethod location-sort ((node function-call) id)
   (trivia:match id
-    ((eql 'name) 'symbol-ref)
+    ((eql 'name) 'fun-designator)
     ((list (eql 'body) (type integer)) 'eval-form)))
 
-(defmethod suffix-ids ((node function-call) suffix)
+(defmethod suffix-path ((node function-call) suffix)
   (when suffix
     (suffix-step node
                  (if (zerop (first suffix)) 'name (list 'body (1- (first suffix))))
@@ -2859,13 +2891,16 @@ passed with dynamic extent."
   "This is a tree editor not a graph editor."
   nil)
 
+(defun parse-syntax (syntax)
+  "Parses `syntax' as toplevel code, keeping anchors."
+  (parse syntax (make-env :%function-bindings '(read-eval)) #'copy-anchors))
+
 (defun parse-from-string (s)
   (let ((client (make-instance 'my-client :source s)))
     (multiple-value-bind (form len leading-comments)
         (eclector.parse-result:read-from-string client s)
       (declare (ignore len))
-      (let ((res (parse form (make-env :%function-bindings '(read-eval))
-                        #'copy-anchors)))
+      (let ((res (parse-syntax form)))
         ;; note res can be a toplevel atom
         (setf (leading res) (append leading-comments (leading res)))
         res))))
