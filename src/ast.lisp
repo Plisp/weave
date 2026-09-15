@@ -16,8 +16,13 @@
            #:location-sort #:locsort #:location-bindings
            #:form-slot-kinds
 
-           #:eval-form #:symbol-ref #:binder
-           #:function-call #:literal
+           #:eval-form #:symbol-ref #:binder #:literal
+           #:resolve
+
+           #:function-call
+
+           #:macro-call #:subform-asts #:subform-binders
+
            #:function-code #:lambda-list
            #:unevaluated
            #:body #:name #:str #:vars #:op
@@ -325,10 +330,11 @@ so a name test alone can't distinguish #:|.| from a dot."))
 
 (defmethod update :around ((node anchor) id new-value)
   (declare (ignore id new-value))
-  (let ((new (call-next-method)))
-    (if (and (typep new 'anchor) (not (eq new node)))
-        (copy-anchors node new)
-        new)))
+  (let* ((results (multiple-value-list (call-next-method)))
+         (new (first results)))
+    (when (and (typep new 'anchor) (not (eq new node)))
+      (copy-anchors node new))
+    (values-list results)))
 
 (defgeneric is-atom (node)
   (:method (node) nil))
@@ -388,9 +394,10 @@ They are specific to the `node' type."
 (defun id-slot (id)
   (if (consp id) (car id) id))
 
+;; don't error so that a user may probe locations prior to there being something there.
 (defgeneric location-sort (node id)
-  (:documentation "Sort lookups are total: an invalid id gives NIL rather than
-signalling so that a user may probe locations prior to there being something there.")
+  (:documentation "Sort lookups are total: an invalid id gives NIL.
+A method may return the contents at `id' as a second value, NIL when absent.")
   (:method (node id) (declare (ignore node id)) nil))
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'."))
@@ -400,11 +407,12 @@ signalling so that a user may probe locations prior to there being something the
   (location-sort (location-node location) (location-id location)))
 
 (defun check-evaluated (node id)
-  (let ((sort (location-sort node id)))
+  (multiple-value-bind (sort contents) (location-sort node id)
     (unless (member sort '(eval-form function-code))
       (cerror "Return no bindings."
               "~a names ~:[nothing~;a ~:*~a~] in ~a, not an evaluated location"
-              id sort node))))
+              id sort node))
+    contents))
 
 (defgeneric location-bindings (node id)
   (:documentation "The lexical bindings `node' contributes to the form at `id' as a
@@ -1278,6 +1286,84 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                 (append ,@(spec-syntax spec 'node rest-patterns)))))))
   )
 
+(defgeneric suffix-ids (node suffix)
+  (:documentation "Translates the syntax list indices `suffix' (going downwards) into the
+path of ids leading down from `node'. Stops early where no id addresses the position
+more precisely.")
+  (:method (node suffix)
+    (declare (ignore node suffix))
+    nil))
+
+(defun suffix-step (node id rest)
+  (cons id (when rest (suffix-ids (get-location node id) rest))))
+
+(defun alternative-taken-p (node alternatives rest-patterns)
+  "Did the parse of `node' take the second of `alternatives'?"
+  (some (lambda (tag) (funcall tag node))
+        (second-unique-tags alternatives rest-patterns)))
+
+(defun rest-suffix-ids (node tag rest-patterns rest)
+  (if (null rest)
+      (list tag)
+      (destructuring-bind (i . more) rest
+        (let ((element (gen-nth i (funcall tag node))))
+          (if (or (null more) (not (gen-list-p element)))
+              (list (list tag i))
+              (destructuring-bind (j . deeper) more
+                (if (and (plusp j)
+                         (member (nth-value 2 (rest-pattern-tags
+                                               (cdr (assoc tag rest-patterns))))
+                                 '(&lambda &macro-lambda &method-lambda)))
+                    (cons (list tag i 1)
+                          (suffix-ids (gen-nth 1 element) (cons (1- j) deeper)))
+                    (suffix-step node (list tag i j) deeper))))))))
+
+(defun element-suffix-ids (node pattern rest-patterns rest)
+  (case (first pattern)
+    (&rest (rest-suffix-ids node (second pattern) rest-patterns rest))
+    (&or (element-suffix-ids node
+                             (if (alternative-taken-p node (rest pattern) rest-patterns)
+                                 (third pattern)
+                                 (second pattern))
+                             rest-patterns rest))
+    (t (if (null rest)
+           (list (first (pattern-tags pattern)))
+           (spec-suffix-ids node pattern rest-patterns (first rest) (rest rest))))))
+
+(defun spec-suffix-ids (node spec rest-patterns index rest)
+  "Emits the suffix-ids method for a defform class. Spec interpreted at runtime."
+  (flet ((spec-step (nspec n)
+           (spec-suffix-ids node (nthcdr nspec spec) rest-patterns (- index n) rest)))
+    (let ((part (first spec)))
+      (cond ((null spec) nil)
+            ((consp part)
+             (if (zerop index)
+                 (element-suffix-ids node part rest-patterns rest)
+                 (spec-step 1 1)))
+            ((eq part '&or)
+             (spec-suffix-ids node (if (alternative-taken-p node (rest spec) rest-patterns)
+                                       (third spec)
+                                       (second spec))
+                              rest-patterns index rest))
+            ((member part '(&lambda &macro-lambda &method-lambda))
+             (cons (second spec)
+                   (suffix-ids (funcall (second spec) node) (cons index rest))))
+            ((member part '(&body &rest-qualifiers &declarations))
+             (let* ((tag (second spec))
+                    (count (length (funcall tag node))))
+               (cond ((<= count index)
+                      (spec-step 2 count))
+                     ((eq part '&declarations) (list tag))
+                     (t (suffix-step node (list tag index) rest)))))
+            ((eq part '&tree)
+             (if (zerop index)
+                 (list (if (null rest) (second spec) (cons (second spec) rest)))
+                 (spec-step 2 1)))
+            (t
+             (if (zerop index)
+                 (suffix-step node part rest)
+                 (spec-step 1 1)))))))
+
 (defmacro spec-parser (spec binds rest-patterns ref-p)
   "Expects a valid spec, binds and rest-patterns. ref-p controls whether to check
 our reader representation or ordinary sexps."
@@ -1436,6 +1522,12 @@ Any binding forces a symbol match.
            new))
        ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
        ,@(syntax-methods name classname spec rest-patterns)
+       (defmethod suffix-ids ((node ,classname) suffix)
+         (when suffix
+           (if (zerop (first suffix))
+               (list 'op)
+               (spec-suffix-ids node ',spec ',rest-patterns
+                                (1- (first suffix)) (rest suffix)))))
        ;; exports
        (export ',classname)
        ,@(loop for name in slots
@@ -1883,6 +1975,7 @@ other atom."
                  (body (let-like-binders node))
                  (vars (let-like-binders node (second id))))))
 
+;; TODO not editable because of &or ambiguity
 (defform (alexandria:when-let* (&or (name &body init) (&rest vars))
            &body body)
   :rest-patterns ((vars . (name &body init)))
@@ -2243,7 +2336,7 @@ Walks subforms of the call using WALKER during analysis."
                                                      (return-from walk)))))
                                   (error () nil))))
                             ;; an actual reference will be independent of the binding name
-                            ;; counter: step forms may have spurious refs generated
+                            ;; counter: spec-step forms may have spurious refs generated
                             (if ident-kind
                                 (progn
                                   (setf (gethash gensym gensym->path) path)
@@ -2319,7 +2412,7 @@ Walks subforms of the call using WALKER during analysis."
       (ref-list (with-elements form
                   (mapcar (rcurry #'unparse-syntax table)
                           (elements form))))
-      (t form))))
+      (t (to-syntax form)))))
 
 (defun reanalyse-call (call op body)
   "Reanalyse the macro call `call' with `op' as the new head, keeping anchors.
@@ -2333,43 +2426,86 @@ Returns NIL when the call is unparseable."
          call (parse syntax (or (call-env call) +nullenv+) #'copy-anchors))
       (ast-parse-error () nil))))
 
-;; XXX env update needs reparse
 (defmethod update ((node macro-call) id new-value)
-  (labels ((keep (op body)
-             (make-instance 'macro-call
-                            :op op :body body
-                            :call-env (call-env node)
-                            :subform-binders (subform-binders node)
-                            :subform-asts (subform-asts node)))
-           (rebuild (op body)
-             (if (member (location-sort node id) '(binder eval-form))
-                 (keep op body)
-                 (or (reanalyse-call node op body) (keep op body)))))
+  (flet ((rebuild (op body)
+           (or (reanalyse-call node op body)
+               ;; if we fail to reparse, keep the raw form and previously parsed subforms
+               (make-instance 'macro-call
+                              :op op :body body
+                              :call-env (call-env node)
+                              :subform-binders (subform-binders node)
+                              :subform-asts (subform-asts node)))))
     (trivia:cmatch id
-      ((eql 'op) (rebuild (copy-anchors (op node) new-value) (body node)))
-      ((eql 'body) (rebuild (op node) new-value))
-      ((list* (eql 'body) (type integer) _)
-       (rebuild (op node) (gen-tree-update (body node) (rest id) new-value))))))
+      ((eql 'op)
+       (let ((call (rebuild (copy-anchors (op node) new-value) (body node))))
+         ;; we may reparse into a different kind of call, but try to preserve position
+         (values call (suffix-ids call '(0)))))
+      ((list* (eql 'body) indices)
+       (multiple-value-bind (sort old) (location-sort node id)
+         (if (and (eq sort 'eval-form) (typep new-value 'eval-form))
+             (make-instance
+              'macro-call
+              :op (op node) :body (body node) :call-env (call-env node)
+              :subform-binders (subform-binders node)
+              :subform-asts (let ((new (copy-hash-table (subform-asts node) :test #'eq)))
+                              (setf (gethash old new) new-value)
+                              new))
+             ;; syntax change, reparse. Binder names included e.g. loop
+             (let* ((body (if indices
+                              (list-update (body node)
+                                           (unparse-syntax (nth (first indices) (body node))
+                                                           (subform-asts node))
+                                           (first indices))
+                              (body node)))
+                    (call (rebuild (op node) (gen-tree-update body indices new-value))))
+               (values call
+                       (when indices
+                         (suffix-ids call (cons (1+ (first indices)) (rest indices)))))))))
+      ;; insertion or deletion, reparse
+      ((eql 'body) (rebuild (op node) new-value)))))
 
 (defmethod location-sort ((node macro-call) id)
   (trivia:match id
-    ((eql 'op) 'symbol-ref)
-    ((list* (eql 'body) (type integer) _)
-     (let ((thing (gen-tree-ref (body node) (rest id))))
-       (cond ((typep thing 'binder) 'binder)
-             ((nth-value 1 (gethash thing (subform-binders node))) 'eval-form)
-             (thing 'unevaluated))))))
+    ((eql 'op) (values 'symbol-ref (op node)))
+    ((list* (eql 'body) indices)
+     (let ((thing (gen-tree-ref (body node) indices)))
+       (values (cond ((typep thing 'binder) 'binder)
+                     ((nth-value 1 (gethash thing (subform-binders node))) 'eval-form)
+                     (thing 'unevaluated))
+               thing)))))
+
+(defmethod suffix-ids ((node function-code) suffix)
+  (when suffix
+    (destructuring-bind (index . rest) suffix
+      (let ((docs (if (docstring node) 1 0))
+            (decls (length (declarations node))))
+        (cond ((zerop index) (list (if (null rest) 'lambda-list (cons 'lambda-list rest))))
+              ((<= index docs) (list 'docstring))
+              ((<= index (+ docs decls)) (list 'declarations))
+              (t (suffix-step node (list 'body (- index 1 docs decls)) rest)))))))
+
+(defmethod suffix-ids ((node macro-call) suffix)
+  (when suffix
+    (if (zerop (first suffix))
+        (list 'op)
+        (loop for path = (list (1- (first suffix))) then (append path (list (first more)))
+              for more = (rest suffix) then (rest more)
+              for form = (gethash (gen-tree-ref (body node) path) (subform-asts node))
+              when (or form (null more))
+                return (cons (cons 'body path)
+                             (when (and form more) (suffix-ids form more)))))))
 
 (defmethod to-syntax ((node function-call))
   (copy-anchors node (apply #'ref-list (to-syntax (name node))
                             (mapcar #'to-syntax (body node)))))
 
 (defmethod to-syntax ((node macro-call))
-  (copy-anchors node (apply #'ref-list (op node) (body node))))
+  (copy-anchors node (apply #'ref-list (op node)
+                            (mapcar (rcurry #'unparse-syntax (subform-asts node))
+                                    (body node)))))
 
 (defmethod location-bindings ((node macro-call) id)
-  (check-evaluated node id)
-  (bindings-of :variable (gethash (get-location node id) (subform-binders node))))
+  (bindings-of :variable (gethash (check-evaluated node id) (subform-binders node))))
 
 (defun lambda-expression-p (x)
   (and (gen-form-p x)
@@ -2431,6 +2567,12 @@ Returns NIL when the call is unparseable."
   (trivia:match id
     ((eql 'name) 'symbol-ref)
     ((list (eql 'body) (type integer)) 'eval-form)))
+
+(defmethod suffix-ids ((node function-call) suffix)
+  (when suffix
+    (suffix-step node
+                 (if (zerop (first suffix)) 'name (list 'body (1- (first suffix))))
+                 (rest suffix))))
 
 ;;
 ;;; eclector reader
