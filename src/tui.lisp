@@ -128,15 +128,17 @@ If this returns NIL, propagate up the cursor stack.")
 (defun selection-parent-id (selection)
   (parent-id (location-id (selection-location selection))))
 
-(defun selection-forms (selection)
+(defun selection-locations (selection)
   (let ((loc (selection-location selection)))
     (assert (bodylike-id (location-id loc)))
     (multiple-value-bind (low high)
         (selection-range selection)
       (loop for i from low to high
-            collect (node-at
-                     (make-location :node (location-node loc)
-                                    :id (append-id (selection-parent-id selection) i)))))))
+            collect (make-location :node (location-node loc)
+                                   :id (append-id (selection-parent-id selection) i))))))
+
+(defun selection-forms (selection)
+  (mapcar #'node-at (selection-locations selection)))
 
 (defun zipper-top-p (ui stack)
   (when-let (selection (selection ui))
@@ -163,12 +165,17 @@ If this returns NIL, propagate up the cursor stack.")
     (selection ui)))
 
 (defclass cutbuffer ()
-  ((content :initarg :content
-            :initform (error "no content")
-            :reader content)
-   (location :initarg :location
-             :initform (error "no location")
-             :reader location)))
+  ((forms :initarg :forms
+          :initform (error "no forms")
+          :reader cutbuffer-forms)
+   (sorts :initarg :sorts
+          :initform (error "no sorts")
+          :reader cutbuffer-sorts)))
+
+(defun copy-locations (locations)
+  (make-instance 'cutbuffer
+                 :forms (mapcar (lambda (loc) (parse:copy-node (node-at loc))) locations)
+                 :sorts (mapcar #'locsort locations)))
 
 (defclass ui (tui:elemental)
   ((ast :initarg :ast ; this slot exists to cache the back of the stack (root)
@@ -243,10 +250,12 @@ If this returns NIL, propagate up the cursor stack.")
     loc))
 
 (defun parent-stack (stack)
-  "relies on ids being either 'symbol or ('symbol integer*) for list addressing."
+  "relies on ids being either 'symbol or ('symbol integer*) for list addressing.
+Plain list bodies are skipped since they are never focused."
   (let* ((loc (car stack))
          (id (location-id loc)))
-    (cond ((and (listp id) (eq (first id) 'parse:body) (= 2 (length id)))
+    (cond ((and (listp id)
+                (listp (node-at (make-location :node (location-node loc) :id (parent-id id)))))
            (cdr stack))
           ((listp id)
            (cons (make-location :node (location-node loc) :id (parent-id id))
@@ -689,7 +698,7 @@ if none, surround current atom"
 (defun begin-selection (ui)
   (let* ((loc (focus ui))
          (id (location-id loc)))
-    (when (and (bodylike-id id) (eq 'parse:eval-form (locsort loc)))
+    (when (bodylike-id id)
       (setf (selection ui)
             (make-instance 'selection
                            :context (stack ui)
@@ -887,13 +896,15 @@ if none, surround current atom"
            (swap-node location (make-instance 'parse:binder :name (string-upcase c)) ui)))
         ((eql 'parse:eval-form)
          (cond
+           ((and (char= c #\() (not (typep (location-node location) 'parse:macro-call)))
+            (swap-node location (ref-list) ui))
            ((and (symbol-char-p c) (not (digit-char-p c)))
             (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
               (swap-node location newnode ui)))
            ((digit-char-p c)
             (let ((newnode (make-instance 'parse:literal :str (string c))))
               (swap-node location newnode ui)))))
-        ((eql 'parse:fun-designator)
+        ((or (eql 'parse:fun-designator) (eql 'parse:symbol-ref))
          (when (and (symbol-char-p c) (not (digit-char-p c)))
            (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
              (swap-node location newnode ui))))
@@ -1135,14 +1146,14 @@ Relies on children being in reading order, which `ordered-view' checks."
 
 (defmethod render-node ((l parse:ref-list) stack context rect
                         &key (indent *horizontal*) delimited (transform #'identity))
-  "A `delimited' list is drawn with `*list-delimiters*' around it, recursively.
-It's opening parens is selectable."
+  "A `delimited' list is drawn with `*list-delimiters*' around it, recursively unless
+`delimited' is :shallow. It's opening parens is selectable."
   (let* ((location (car stack))
          (focused (location= location (focus context))))
     (flet ((contents (rect)
              (render-elements (elements l) indent (list-locator location)
                               (cdr stack) context
-                              `(,@(when delimited '(:delimited t))
+                              `(,@(when (eq delimited t) '(:delimited t))
                                 ,@(when transform `(:transform ,transform)))
                               rect)))
       (if delimited
@@ -1171,7 +1182,11 @@ It's opening parens is selectable."
                                                 (tui:rect-x2 (tui:rect close)))
                                            (tui:rect-x rect)))
                            :children (list open inner close)))
-          (let ((view (contents rect)))
+          (let ((view (if (elements l)
+                          (contents rect)
+                          (render-delimiter (format nil "~a~a" (car *list-delimiters*)
+                                                    (cdr *list-delimiters*))
+                                            location stack rect :hoverable t))))
             (setf (tui:key-handler view) (global-key-handler l location context)
                   (tui:focused view) focused)
             view)))))
@@ -1426,7 +1441,7 @@ its first are aligned with the first, and a loop without keywords has a line per
 
 (defun macro-call-indentation (op)
   "`loop-indentation' for loop, else TODO ask slynk."
-  (if (eq (parse:resolve op) 'loop)
+  (if (and (typep op 'parse:symbol-ref) (eq (parse:resolve op) 'loop))
       #'loop-indentation
       *horizontal*))
 
@@ -1512,62 +1527,54 @@ already and focuses the hole."
 (defvar *default-expansions* (make-hash-table :test #'eq)
   "Operator symbol -> closure constructing a default node for that form.")
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  (defun default-slot-form (slot kind rest-templates)
-    (let ((template (cdr (assoc slot rest-templates))))
-      (case kind
-        ((&rest) `(ref-list ,@(when template (list template))))
-        ((&body parse::&declarations parse::&rest-qualifiers)
-         (when template `(list ,template)))
-        ((parse::&lambda parse::&macro-lambda parse::&method-lambda)
-         `(make-instance 'parse:function-code
-                         :lambda-list-kind ,(make-keyword (subseq (string kind) 1))
-                         :lambda-list (ref-list)
-                         :body (list (hole))))
-        (t '(hole)))))
+(defstruct (layout (:constructor make-layout (type rows templates)))
+  "Describes the rendered shape of `type'.
+`rows' describe horizontal order and `templates' contains (slot . constructor)
+pairs building new elements for &rest and &body slots."
+  type rows templates)
 
-  (defun layout-slots (layout)
-    (loop for row in layout
-          append (typecase row
-                   (cons (loop for item in row
-                               when (symbolp item) collect item
-                               when (consp item) collect (car item)))
-                   (symbol (list row))))))
+(defvar *layouts* (make-hash-table :test #'eq) "Form class -> its `layout'.")
 
-(defun hole-path (node id)
-  "The path from `node' to the first hole at `id' or below it, entering only lists
-addressed by indices."
-  (let ((value (node-at (make-location :node node :id id))))
-    (cond ((typep value 'hole) (list id))
-          ((typep value 'parse:function-code)
-           (when-let (path (or (list-hole-path value 'parse:lambda-list)
-                               (list-hole-path value 'parse:body)))
-             (cons id path)))
-          ((and (consp id) (gen-list-p value)) (list-hole-path node id)))))
+(defun layout-slots (layout)
+  (loop for row in (layout-rows layout)
+        append (typecase row
+                 (cons (loop for item in row
+                             when (symbolp item) collect item
+                             when (consp item) collect (car (disp item))))
+                 (symbol (list row)))))
 
-(defun list-hole-path (node id)
-  "`hole-path' through the elements of the list at `id' in `node'."
-  (let ((value (node-at (make-location :node node :id id))))
-    (assert (gen-list-p value))
-    (loop for i below (length (elements value))
-          thereis (hole-path node (append-id id i)))))
+(defun layout-template (layout slot)
+  (cdr (assoc slot (layout-templates layout))))
 
-(defun focus-first-hole (ui)
-  (let ((node (node-at (focus ui))))
-    (loop for (slot . kind) in (parse:form-slot-kinds (type-of node))
-          do (when-let (path
-                        (if (and (member kind '(&rest &body parse::&tree))
-                                 (gen-list-p (node-at (make-location :node node :id slot))))
-                            (list-hole-path node slot)
-                            (hole-path node slot)))
-               (dolist (id path)
-                 (descend ui id))
-               (return)))))
+(defun slot-kind (layout slot)
+  (cdr (assoc slot (parse:form-slot-kinds (layout-type layout)))))
+
+(defun default-slot-value (kind template)
+  (case kind
+    ((&rest) (apply #'ref-list (when template (list (funcall template)))))
+    ((&body parse::&declarations parse::&rest-qualifiers)
+     (when template (list (funcall template))))
+    ((parse::&lambda parse::&macro-lambda parse::&method-lambda)
+     (make-instance 'parse:function-code
+                    :lambda-list-kind (make-keyword (subseq (string kind) 1))
+                    :lambda-list (ref-list)
+                    :body (list (hole))))
+    (t (hole))))
+
+(defun default-node (layout)
+  "A form of the class of `layout' with every slot in its default state."
+  (apply #'make-instance (layout-type layout)
+         (loop for slot in (layout-slots layout)
+               unless (eq slot 'parse:op)
+                 append (list (make-keyword slot)
+                              (default-slot-value (slot-kind layout slot)
+                                                  (layout-template layout slot))))))
 
 (defun slot-render-keys (node slot)
-  (if (eq 'parse::&tree (cdr (assoc slot (parse:form-slot-kinds (type-of node)))))
-      '(:delimited t)
-      (list :indent *vertical*)))
+  (case (cdr (assoc slot (parse:form-slot-kinds (type-of node))))
+    (parse::&tree '(:delimited t))
+    (&rest (list :indent *vertical* :delimited :shallow))
+    (t (list :indent *vertical*))))
 
 (defun render-layout-slot (node item stack context rect)
   (cond
@@ -1607,170 +1614,123 @@ addressed by indices."
             (t
              (tui:place (r) (render-layout-slot node item stack context r)))))))
 
-(defmacro deflayout (type rest-templates layout)
-  "Defines rendering functions for `type'. This isn't really performance sensitive
-so just parse layout dynamically instead of doing serious codegen.
+(defmethod render-node ((node parse:irregular-form) stack context rect &key)
+  (let* ((layout (gethash (type-of node) *layouts*))
+         (vertical (render-vertical-layout node (layout-rows layout) stack context rect))
+         (location (car stack)))
+    (make-instance 'ast-view
+                   :location location
+                   :children (list vertical)
+                   :rect (tui:rect vertical)
+                   :key-handler (global-key-handler node location context)
+                   :focused (location= location (focus context)))))
+
+(defparameter *layout-key-handlers* (make-hash-table :test #'equal)
+  "Map from event to callbacks (layout, child-stack, ui) -> bool whether to propagate.")
+
+(defmethod handle-key ((node parse:irregular-form) view location ui event)
+  (declare (ignore view))
+  (when-let ((layout (gethash (type-of node) *layouts*))
+             (handler (gethash event *layout-key-handlers*)))
+    (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
+      (unless (zerop i)
+        (funcall handler layout (nthcdr (1- i) (stack ui)) ui)))))
+
+(defun layout-rubout (layout stack ui)
+  "Deletes the focused element of a list slot, or restores the slot to its template."
+  (let* ((loc (car stack))
+         (node (location-node loc))
+         (id (location-id loc))
+         (slot (ensure-car id))
+         (template (layout-template layout slot)))
+    (cond
+      (template
+       (let ((rest-loc (make-location :node node :id slot)))
+         (flet ((reset ()
+                  (swap-node rest-loc ; no return type polymorphism :/
+                             (if (listp (node-at rest-loc))
+                                 (list (funcall template))
+                                 (ref-list (funcall template)))
+                             ui)))
+           (cond ((symbolp id)
+                  (save-history ui)
+                  (reset))
+                 ((or (= 2 (length id)) (= 3 (length id)))
+                  (if (= 1 (length (elements (node-at rest-loc))))
+                      (reset)
+                      (progn (save-history ui)
+                             (ast-delete rest-loc (second id) ui stack))))))))
+      ((eq (slot-kind layout slot) 'parse::&tree)
+       (save-history ui)
+       (if (consp id)
+           (let ((parent (make-location :node node :id (parent-id id))))
+             (if (= 1 (length (elements (node-at parent))))
+                 (edit-list parent (constantly nil) (location-id parent) ui stack)
+                 (ast-delete parent (lastcar id) ui stack)))
+           (swap-node loc (hole) ui))))))
+
+(defun layout-space (layout stack ui)
+  "Graphically inserts after, or jumps to the next adjacent hole."
+  (let* ((loc (car stack))
+         (node (location-node loc))
+         (id (location-id loc))
+         (slot (ensure-car id))
+         (next (when (symbolp id) (cadr (member id (layout-slots layout)))))
+         (template (layout-template layout slot)))
+    (cond
+      ((handle-focus-p ui loc)
+       (let ((item (if template (funcall template) (hole))))
+         (insert-or-jump loc 0 ui stack
+                         :item item :tail (when (typep item 'ref-list) '(0)))))
+      (next
+       (let ((next-loc (make-location :node node :id next))
+             (next-template (layout-template layout next)))
+         (if (and (member (cdr (assoc next (parse:form-slot-kinds (type-of node))))
+                          '(&rest &body parse::&tree))
+                  (gen-list-p (node-at next-loc)))
+             (insert-or-jump next-loc 0 ui stack
+                             :item (if next-template (funcall next-template) (hole)))
+             (refocus ui next))))
+      ((and template (consp id))
+       (let ((rest-loc (make-location :node node :id slot))
+             (nested (typep (funcall template) 'ref-list)))
+         (case (length id)
+           (2 (if nested ; e.g. (body i), or (rest i) which needs traverse
+                  (insert-or-jump rest-loc (1+ (second id)) ui stack
+                                  :item (funcall template) :tail '(0))
+                  (insert-or-jump rest-loc (1+ (second id)) ui stack)))
+           (3 (when nested
+                (insert-or-jump (make-location :node node :id (list slot (second id)))
+                                (1+ (third id)) ui stack))))))
+      ((and (eq (slot-kind layout slot) 'parse::&tree) (consp id))
+       (insert-or-jump (make-location :node node :id (parent-id id))
+                       (1+ (lastcar id)) ui stack)))))
+
+(defun layout-wrap (layout stack ui)
+  "Wraps the focused part of an unevaluated slot in a syntax list."
+  (let ((loc (car stack)))
+    (when (eq (slot-kind layout (ensure-car (location-id loc))) 'parse::&tree)
+      (save-history ui)
+      (wrap-in-list loc ui stack)
+      t)))
+
+(setf (gethash (tui-sys:make-event :kind #\rubout) *layout-key-handlers*) #'layout-rubout
+      (gethash (tui-sys:make-event :kind #\space) *layout-key-handlers*) #'layout-space
+      (gethash (tui-sys:make-event :kind #\() *layout-key-handlers*) #'layout-wrap)
+
+(defun register-layout (layout)
+  (setf (gethash (layout-type layout) *layouts*) layout
+        (gethash (parse:op (make-instance (layout-type layout))) *default-expansions*)
+        (lambda () (default-node layout))))
+
+(defmacro deflayout (type templates rows)
+  "Lays out forms of class `type' in `rows' of slots, where `templates' are forms building
+new elements for its &rest and &body slots.
 ASSUMES that &rest slots accept (slot i j) even if the list is optional like let.
 ASSUMES we never focus a plain list body."
-  (let* ((keymap (symbolicate "*" type "-KEY-HANDLERS*"))
-         (tree-slots (loop for (slot . kind) in (parse:form-slot-kinds type)
-                           when (eq kind 'parse::&tree)
-                             collect slot))
-         (tree-rubout-clauses
-           (loop
-             for slot in tree-slots
-             append
-             `(((list* (eql ',slot) (and path (type cons)))
-                (let ((parent (make-location :node node :id (parent-id (location-id loc)))))
-                  (save-history ui)
-                  (if (= 1 (length (elements (node-at parent))))
-                      (progn
-                        (ast-replace parent (constantly nil) ui stack)
-                        (refocus ui (location-id parent)))
-                      (ast-delete parent (lastcar path) ui stack))))
-               ((eql ',slot)
-                (let ((tree-loc (make-location :node node :id ',slot)))
-                  (save-history ui)
-                  (if (and (gen-list-p (,slot node)) (elements (,slot node)))
-                      (ast-replace tree-loc (constantly nil) ui stack)
-                      (swap-node tree-loc (hole) ui)))))))
-         (tree-insert-clauses
-           (loop
-             for slot in tree-slots
-             append
-             `(((list* (eql ',slot) (and path (type cons)))
-                (if (handle-focus-p ui loc)
-                    (insert-or-jump loc 0 ui stack)
-                    (insert-or-jump
-                     (make-location :node node :id (parent-id (location-id loc)))
-                     (1+ (lastcar path)) ui stack)))
-               ((eql ',slot)
-                (when (gen-list-p (,slot node))
-                  (insert-or-jump (make-location :node node :id ',slot) 0 ui stack))))))
-         (slot-order (layout-slots layout))
-         (rubout-clauses
-           (loop
-             for (lloc . template) in rest-templates
-             append
-             `(((eql ',lloc)
-                (save-history ui)
-                (let ((rest-loc (make-location :node node :id ',lloc)))
-                  (swap-node rest-loc (if (listp (node-at rest-loc))
-                                          (list ,template)
-                                          (ref-list ,template))
-                             ui)))
-               ((list (eql ',lloc) (and (type integer) i))
-                (let ((rest-loc (make-location :node node :id ',lloc)))
-                  (if (= 1 (length (elements (node-at rest-loc))))
-                      (swap-node rest-loc (if (listp (node-at rest-loc))
-                                              (list ,template)
-                                              (ref-list ,template))
-                                 ui)
-                      (progn
-                        (save-history ui)
-                        (ast-delete rest-loc i ui stack))))))))
-         (insert-clauses
-           (labels ((next-slot (slot) (cadr (member slot slot-order))))
-             (append
-              ;; non-&rest/&body slots
-              (loop
-                for slot in (remove-if (lambda (slot)
-                                         (member slot (mapcar #'car rest-templates)))
-                                       slot-order)
-                when (next-slot slot)
-                  collect
-                `((eql ',slot)
-                  (if (gen-list-p (,(next-slot slot) node))
-                      (insert-or-jump
-                       (make-location :node node :id ',(next-slot slot))
-                       0 ui stack
-                       :item ,(or (cdr (assoc (next-slot slot) rest-templates))
-                                  `(hole)))
-                      (refocus ui ',(next-slot slot)))))
-              (loop
-                for (lslot . template) in rest-templates
-                for dimension := (if (eq 'ref-list (car template)) 2 1)
-                when (next-slot lslot)
-                  append
-                `(((eql ',lslot)
-                   (if (gen-list-p (,(next-slot lslot) node))
-                       (insert-or-jump
-                        (make-location :node node :id ',(next-slot lslot))
-                        0 ui stack
-                        :item ,(or (cdr (assoc (next-slot lslot) rest-templates))
-                                   `(hole)))
-                       (refocus ui ',(next-slot lslot)))))
-                append
-                (if (= dimension 1)
-                    `(((list (eql ',lslot) (and (type integer) body-i))
-                       (insert-or-jump (make-location :node node :id ',lslot)
-                                       (1+ body-i) ui stack)))
-                    `(((list (eql ',lslot) (and (type integer) bi))
-                       (insert-or-jump (make-location :node node :id ',lslot)
-                                       (1+ bi) ui stack :item ,template :tail '(0)))
-                      ((list (eql ',lslot)
-                             (and (type integer) bi) (and (type integer) i))
-                       (insert-or-jump (make-location :node node :id `(,',lslot ,bi))
-                                       (1+ i) ui stack)))))))))
-    `(progn
-       (defmethod render-node ((node ,type) stack context rect &key)
-         (let ((vertical (render-vertical-layout node ',layout stack context rect))
-               (location (car stack)))
-           (make-instance 'ast-view
-                          :location location
-                          :children (list vertical)
-                          :rect (tui:rect vertical)
-                          :key-handler (global-key-handler node location context)
-                          :focused (location= location (focus context)))))
-
-       (setf (gethash (parse:op (make-instance ',type)) *default-expansions*)
-             (lambda ()
-               (make-instance
-                ',type
-                ,@(loop for slot in slot-order
-                        for kind := (cdr (assoc slot (parse:form-slot-kinds type)))
-                        unless (eq slot 'parse:op)
-                          append (list (make-keyword slot)
-                                       (default-slot-form slot kind rest-templates))))))
-
-       (defparameter ,keymap (make-hash-table :test #'equal))
-       (defmethod handle-key ((node ,type) view location ui event)
-         (when-let ((handler (gethash event ,keymap)))
-           (let ((i (position-if (lambda (l) (location= location l)) (stack ui))))
-             (unless (zerop i)
-               (funcall handler (nthcdr (1- i) (stack ui)) ui)))))
-
-       (setf (gethash (tui-sys:make-event :kind #\rubout) ,keymap)
-             (lambda (stack ui)
-               (declare (ignorable ui))
-               (block nil
-                 (let* ((loc (car stack))
-                        (node (location-node loc)))
-                   (declare (ignorable node))
-                   (trivia:match (location-id loc)
-                     ,@rubout-clauses
-                     ,@tree-rubout-clauses)))))
-       (setf (gethash (tui-sys:make-event :kind #\space) ,keymap)
-             (lambda (stack ui)
-               (declare (ignorable ui))
-               (block nil
-                 (let* ((loc (car stack))
-                        (node (location-node loc)))
-                   (declare (ignorable node))
-                   (trivia:match (location-id loc)
-                     ,@insert-clauses
-                     ,@tree-insert-clauses)))))
-       ,@(when tree-slots
-           `((setf (gethash (tui-sys:make-event :kind #\() ,keymap)
-                   (lambda (stack ui)
-                     (let ((loc (car stack)))
-                       (trivia:match (location-id loc)
-                         ((or ,@(loop for slot in tree-slots
-                                      collect `(eql ',slot)
-                                      collect `(list* (eql ',slot) _)))
-                          (save-history ui)
-                          (wrap-in-list loc ui stack)
-                          t))))))))))
+  `(register-layout
+    (make-layout ',type ',rows (list ,@(loop for (slot . template) in templates
+                                             collect `(cons ',slot (lambda () ,template)))))))
 
 (deflayout parse:let*-form ((parse:vars . (ref-list (hole) (hole)))
                             (parse:body . (hole)))
@@ -2049,6 +2009,35 @@ ASSUMES we never focus a plain list body."
         (handler-case (slog (parse:parse-syntax syntax))
           (parse:ast-parse-error () nil))))))
 
+(defun hole-path (node id)
+  "The path from `node' to the first hole at `id' or below it, entering only lists
+addressed by indices."
+  (let ((value (node-at (make-location :node node :id id))))
+    (cond ((typep value 'hole) (list id))
+          ((typep value 'parse:function-code)
+           (when-let (path (or (list-hole-path value 'parse:lambda-list)
+                               (list-hole-path value 'parse:body)))
+             (cons id path)))
+          ((and (consp id) (gen-list-p value)) (list-hole-path node id)))))
+
+(defun list-hole-path (node id)
+  (let ((value (node-at (make-location :node node :id id))))
+    (assert (gen-list-p value))
+    (loop for i below (length (elements value))
+          thereis (hole-path node (append-id id i)))))
+
+(defun focus-first-hole (ui)
+  (let ((node (node-at (focus ui))))
+    (loop for (slot . kind) in (parse:form-slot-kinds (type-of node))
+          do (when-let (path
+                        (if (and (member kind '(&rest &body parse::&tree))
+                                 (gen-list-p (node-at (make-location :node node :id slot))))
+                            (list-hole-path node slot)
+                            (hole-path node slot)))
+               (dolist (id path)
+                 (descend ui id))
+               (return)))))
+
 (setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
       (lambda (view ui)
         (declare (ignore view))
@@ -2126,7 +2115,10 @@ ASSUMES we never focus a plain list body."
       (lambda (view ui)
         (declare (ignore view))
         (let ((focused (node-at (focus ui))))
-          (cond ((typep focused 'parse:eval-form)
+          (cond ((or (typep focused 'parse:eval-form)
+                     (and (typep focused 'parse:ref-list)
+                          (null (elements focused))
+                          (eq 'parse:eval-form (locsort (focus ui)))))
                  (swap-node (focus ui) (hole) ui))
                 ;; note: this is not precise
                 ((and (eq 'parse:eval-form (locsort (focus ui)))
@@ -2201,51 +2193,27 @@ ASSUMES we never focus a plain list body."
             (descend ui '(parse:body 0))
             (descend ui '(parse:body 1))))))
 
-;; slurp
-(setf (gethash (tui-sys:make-event :kind #\) :altp t) *default-key-handlers*)
-      (lambda (view ui)
-        (declare (ignore view))
-        (when-let (parent-stack (and (bodylike-id (location-id (focus ui)))
-                                     (parent-stack (stack ui))))
-          (let* ((loc (focus ui))
-                 (node (node-at loc))
-                 (id (location-id loc))
-                 (i (id-index id))
-                 (parent (node-at (car parent-stack)))
-                 (pbody (with-lookup (body (parse:get-body parent) parent)
-                          body)))
-            ;; i *think* these are sufficient
-            (when (and (nth-value 1 (parse:get-body node))
-                       (listp pbody) (< (1+ i) (length pbody))
-                       (typep (nth (1+ i) pbody) 'parse:eval-form))
-              (swap-node
-               (make-location :node (location-node loc) :id (parent-id id))
-               (list-update (list-remove pbody (1+ i))
-                            (update node 'parse:body
-                                    `(,@(node-at (make-location :node node :id 'parse:body))
-                                      ,(nth (1+ i) pbody)))
-                            i)
-               ui))))))
-
-;; barf
-;; (setf (gethash (tui-sys:make-event :kind #\} :altp t) *default-key-handlers*)
-;;       (lambda (view ui)
-;;         (declare (ignore view))
-;;         (when (typep (node-at (focus ui)) 'parse:eval-form)
-;;           (swap-node (focus ui) (hole) ui))))
-
 (defun take-selection (ui selection)
   "Reifies selection state into the cutbuffer without editing."
   (if (typep selection 'zipper)
       (setf (zipper ui) selection
             (cutbuffer ui) nil)
-      (let ((forms (mapcar #'parse:copy-node (selection-forms selection))))
-        (setf (cutbuffer ui)
-              (make-instance 'cutbuffer
-                             :location (selection-location selection)
-                             :content (if (rest forms) forms (first forms)))
-              (zipper ui) nil)))
+      (setf (cutbuffer ui) (copy-locations (selection-locations selection))
+            (zipper ui) nil))
   t)
+
+(defun empty-list-placeholder (loc)
+  (let* ((node (location-node loc))
+         (id (location-id loc))
+         (value (node-at loc))
+         (layout (gethash (type-of node) *layouts*))
+         (template (when (and layout (symbolp id)) (layout-template layout id))))
+    (cond (template (if (listp value)
+                        (list (funcall template))
+                        (ref-list (funcall template))))
+          ((listp value) (list (hole)))
+          (t (assert (typep value 'ref-list))
+             nil))))
 
 (defun cut-selection (ui selection)
   "Cuts the current selection or zipper, modifying the ast."
@@ -2262,27 +2230,26 @@ ASSUMES we never focus a plain list body."
                 (save-history ui)
                 (let ((slot (parent-id id))
                       (index (id-index id)))
-                  (ast-replace (make-location :node (location-node hole) :id slot)
-                               (lambda (body)
-                                 (let ((elts (elements body)))
-                                   `(,@(subseq elts 0 index)
-                                     ,@forms
-                                     ,@(subseq elts (1+ index)))))
-                               ui stack)
-                  (refocus ui (append-id slot index))))
+                  (edit-list (make-location :node (location-node hole) :id slot)
+                             (lambda (body)
+                               (let ((elts (elements body)))
+                                 `(,@(subseq elts 0 index)
+                                   ,@forms
+                                   ,@(subseq elts (1+ index)))))
+                             (append-id slot index) ui stack)))
               (progn
                 (save-history ui)
                 (ast-replace hole (constantly (first forms)) ui stack))))
         (multiple-value-bind (low high) (selection-range selection)
           (save-history ui)
-          (let ((slot (selection-parent-id selection)))
-            (ast-replace (selection-list-location selection)
-                         (lambda (body)
-                           (let ((elts (elements body)))
-                             (or `(,@(subseq elts 0 low) ,@(subseq elts (1+ high)))
-                                 (list (hole)))))
-                         ui)
-            (refocus ui (append-id slot (max 0 (1- low)))))))
+          (let* ((list-loc (selection-list-location selection))
+                 (slot (selection-parent-id selection))
+                 (elts (elements (node-at list-loc)))
+                 (new (or `(,@(subseq elts 0 low) ,@(subseq elts (1+ high)))
+                          (empty-list-placeholder list-loc))))
+            (edit-list list-loc (constantly new)
+                       (if (elements new) (append-id slot (max 0 (1- low))) slot)
+                       ui (stack ui)))))
     t))
 
 (setf (gethash (tui-sys:make-event :kind #\c :controlp t) *default-key-handlers*)
@@ -2292,10 +2259,7 @@ ASSUMES we never focus a plain list body."
           (take-selection ui selection)
           (let ((loc (focus ui)))
             (when (locsort loc)
-              (setf (cutbuffer ui)
-                    (make-instance 'cutbuffer
-                                   :location loc
-                                   :content (parse:copy-node (node-at loc)))
+              (setf (cutbuffer ui) (copy-locations (list loc))
                     (zipper ui) nil))))
         t))
 
@@ -2304,30 +2268,57 @@ ASSUMES we never focus a plain list body."
         (declare (ignore view))
         (if-let (selection (selection-at-focus ui))
           (cut-selection ui selection)
-          (let* ((loc (focus ui))
-                 (node (node-at loc)))
+          (let ((loc (focus ui)))
             (when (locsort loc)
-              (setf (cutbuffer ui)
-                    (make-instance 'cutbuffer :location loc
-                                              :content (parse:copy-node node))
+              (setf (cutbuffer ui) (copy-locations (list loc))
                     (zipper ui) nil)
               (swap-node loc (hole) ui))))
         t))
 
-(defun paste-forms (ui forms)
-  (let ((focus (focus ui)))
-    (when (eval-list-position-p focus)
-      (let ((slot (parent-id (location-id focus)))
-            (index (id-index (location-id focus))))
-        (save-history ui)
-        (edit-list (make-location :node (location-node focus) :id slot)
-                   (lambda (body)
-                     (let ((elts (elements body)))
-                       `(,@(subseq elts 0 index)
-                         ,@(mapcar #'parse:copy-node forms)
-                         ,@(subseq elts index))))
-                   (append-id slot index) ui (stack ui))
-        t))))
+(defun paste-conversion (from to)
+  "Controls copying between location sorts."
+  (cond ((and from (equal from to)) #'parse:copy-node)
+        ((and (eq from 'parse:eval-form) (eq to 'parse:unevaluated))
+         (lambda (form) (parse:to-syntax (parse:copy-node form))))))
+
+(defun paste-forms (ui buffer)
+  "Pastes the forms of `buffer' after the focused list element, over the selection at
+the focus, or over a focused hole.
+Each form is checked for convertibility against the sort of the position it's pasted into,
+forms past the end of a selection taking the sort of its last position."
+  (let* ((focus (focus ui))
+         (id (location-id focus))
+         (selection (when-let (selection (selection-at-focus ui))
+                      (when (= (id-index id) (selection-range selection))
+                        selection)))
+         (targets (if selection
+                      (mapcar #'locsort (selection-locations selection))
+                      (list (locsort focus))))
+         (converts (loop for sort in (slog (cutbuffer-sorts buffer))
+                         for i from 0
+                         collect (paste-conversion
+                                  sort (nth (min i (1- (length targets))) targets)))))
+    (when (every #'identity converts)
+      (let ((forms (mapcar #'funcall converts (cutbuffer-forms buffer))))
+        (cond ((bodylike-id id)
+               (multiple-value-bind (start end)
+                   (cond (selection
+                          (multiple-value-bind (low high) (selection-range selection)
+                            (values low (1+ high))))
+                         ((typep (node-at focus) 'parse:hole)
+                          (values (id-index id) (1+ (id-index id))))
+                         (t
+                          (values (1+ (id-index id)) (1+ (id-index id)))))
+                 (let ((slot (parent-id id)))
+                   (save-history ui)
+                   (setf (selection ui) nil)
+                   (edit-list (make-location :node (location-node focus) :id slot)
+                              (lambda (body)
+                                (let ((elts (elements body)))
+                                  `(,@(subseq elts 0 start) ,@forms ,@(subseq elts end))))
+                              (append-id slot (+ start (length forms) -1)) ui (stack ui)))))
+              ((= 1 (length forms))
+               (swap-node focus (first forms) ui)))))))
 
 (defun fill-zipper (zipper forms)
   "Fills the zipper hole with forms and returns a complete node."
@@ -2351,14 +2342,13 @@ modifying the ast."
           (let ((forms (selection-forms selection))
                 (slot (selection-parent-id selection)))
             (save-history ui)
-            (ast-replace (selection-list-location selection)
-                         (lambda (body)
-                           (let ((elts (elements body)))
-                             `(,@(subseq elts 0 low)
-                               ,(fill-zipper zipper forms)
-                               ,@(subseq elts (1+ high)))))
-                         ui)
-            (refocus ui (append-id slot low))))
+            (edit-list (selection-list-location selection)
+                       (lambda (body)
+                         (let ((elts (elements body)))
+                           `(,@(subseq elts 0 low)
+                             ,(fill-zipper zipper forms)
+                             ,@(subseq elts (1+ high)))))
+                       (append-id slot low) ui (stack ui))))
         (when (eq 'parse:eval-form (locsort focus))
           (swap-node focus (fill-zipper zipper (list (node-at focus))) ui)))
     t))
@@ -2368,13 +2358,7 @@ modifying the ast."
         (declare (ignore view))
         ;; these are mutually exclusive as cutting a zipper nulls the cutbuffer
         (cond ((zipper ui) (paste-zipper ui (zipper ui)))
-              ((cutbuffer ui)
-               (let ((content (content (cutbuffer ui))))
-                 (if (listp content)
-                     (paste-forms ui content)
-                     (when (equal (locsort (focus ui))
-                                  (locsort (location (cutbuffer ui))))
-                       (swap-node (focus ui) (parse:copy-node content) ui))))))
+              ((cutbuffer ui) (paste-forms ui (cutbuffer ui))))
         t))
 
 ;;; completions

@@ -8,7 +8,7 @@
   (:export #:make-env
            #:parse-from-string #:parse-syntax #:ast-parse-error
            #:is-atom #:get-body
-           #:copy-node
+           #:copy-node #:to-syntax
 
            #:update
            #:get-location #:node-at
@@ -21,7 +21,7 @@
 
            #:function-call
 
-           #:macro-call #:subforms #:path-at
+           #:irregular-form #:macro-call #:subforms #:path-at
 
            #:function-code #:lambda-list
            #:unevaluated
@@ -115,9 +115,7 @@
 
 ;; for code shared between the wrapped AST and the real symbols STRIP-WRAPPERS produces
 (deftype symbol-like () '(or symbol symbol-ref))
-(deftype binding-name ()
-  "What can stand in a binding position: a raw symbol in the walker, a symbol-ref (a
-binder once parsed) in the reader representation, or a hole in edited code."
+(deftype binding-name () "Things allowed in binding position"
   '(or symbol-like hole))
 
 (defclass function-call (eval-form)
