@@ -18,4 +18,16 @@
   :components ((:file "util")
                (:file "ast" :depends-on ("util"))
                (:file "tui" :depends-on ("util" "ast"))
-               ))
+               )
+  :in-order-to ((asdf:test-op (asdf:test-op #:weave/tests))))
+
+(asdf:defsystem #:weave/tests
+  :description "Ad-hoc tests for weave's parser and frontend"
+  :depends-on (#:weave #:parachute)
+  :pathname "tests"
+  :components ((:file "package")
+               (:file "util" :depends-on ("package"))
+               (:file "parser" :depends-on ("util"))
+               (:file "editing" :depends-on ("util")))
+  :perform (asdf:test-op (o c)
+             (uiop:symbol-call '#:parachute '#:test '#:weave-tests)))
