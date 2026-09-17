@@ -13,6 +13,18 @@
   (is equal "list () /      x" (draw (ui-for "(list () x)")))
   (is equal "progn /  ()" (draw (ui-for "(progn ())"))))
 
+(define-test unexpanded-macro-name-is-highlighted :parent editing
+  (let ((bad (cell-bgs (ui-for "(loop for i from 1 to 10 (print i))") 6))
+        (good (cell-bgs (ui-for "(loop for i from 1 to 10 do (print i))") 6)))
+    ;; only the four cells of the name differ, and they are orange
+    (is equal (subseq good 4) (subseq bad 4))
+    (is equal t (every (lambda (b) (/= b (first good))) (subseq bad 0 4)))
+    (is equal t (apply #'= (subseq bad 0 4)))
+    (is equal t (> (ldb (byte 8 16) (first bad)) (ldb (byte 8 0) (first bad)))))
+  ;; a call that expands is not highlighted
+  (is equal t (let ((bgs (cell-bgs (ui-for "(dolist (x xs) x)") 6)))
+                (apply #'= bgs))))
+
 (define-test macro-call-with-hole-op-renders :parent editing
   (let ((ui (ui-for (parse:update (parse "(when a)") '(parse:body 0) (parse:ref-list (parse:hole))))))
     (goto ui 'parse:op)
@@ -56,6 +68,31 @@
     (is equal "(PROGN (F 1) _ (G 2))" (code ui))
     (is equal '((parse::forms 1)) (focus-path ui))))
 
+(define-test emptying-a-slot-focuses-its-template :parent editing
+  (flet ((empty (source &rest path)
+           (let ((ui (apply #'goto (ui-for source) path)))
+             (press ui :rubout :rubout)
+             (list (code ui) (focus-path ui)))))
+    (is equal '("(RETURN-FROM B _)" ((parse:value 0)))
+        (empty "(return-from b 1)" '(parse:value 0)))
+    (is equal '("(BLOCK B _)" ((parse:body 0))) (empty "(block b 1)" '(parse:body 0)))
+    (is equal '("(IF A _)" ((parse::then-else 0))) (empty "(if a b)" '(parse::then-else 0)))
+    (is equal '("(PROGN _)" ((parse::forms 0))) (empty "(progn 1)" '(parse::forms 0)))
+    (is equal '("(UNWIND-PROTECT A _)" ((parse::cleanup 0)))
+        (empty "(unwind-protect a b)" '(parse::cleanup 0)))
+    (is equal '("(LOAD-TIME-VALUE X _)" ((parse::read-only-p 0)))
+        (empty "(load-time-value x t)" '(parse::read-only-p 0)))
+    (is equal '("(LET* ((_ _)) 2)" ((parse:vars 0 0)))
+        (empty "(let* ((a 1)) 2)" '(parse:vars 0 1)))
+    (is equal '("(FLET ((_ () _)) 2)" ((parse::funs 0 0)))
+        (empty "(flet ((f () 1)) 2)" '(parse::funs 0 1))))
+  ;; one undo step per emptied slot
+  (let ((ui (goto (ui-for "(block b 1)") '(parse:body 0))))
+    (press ui :rubout :rubout)
+    (is equal 2 (history-length ui))
+    (press ui '(:ctrl #\u) '(:ctrl #\u))
+    (is equal "(BLOCK B 1)" (code ui))))
+
 (define-test quoted-trees :parent editing
   (let ((ui (goto (ui-for "'(a b)") '(parse::thing 0))))
     (press ui :space)
@@ -79,7 +116,13 @@
     (is equal '(parse:fun-code (parse:lambda-list 1)) (focus-path ui))
     (goto ui 'parse:fun-code '(parse:lambda-list 0))
     (press ui :space)
-    (is equal 1 (history-length ui))))
+    (is equal 1 (history-length ui)))
+  (let ((ui (goto (ui-for "(lambda (x) x)") 'parse:fun-code '(parse:lambda-list 0))))
+    (press ui #\()
+    (is equal "(LAMBDA ((X _)) X)" (code ui))
+    (is equal '(parse:fun-code (parse:lambda-list 0 1)) (focus-path ui))
+    (press ui '(:ctrl #\u))
+    (is equal "(LAMBDA (X) X)" (code ui))))
 
 ;;; macro calls
 
@@ -169,6 +212,40 @@
     (press ui '(:alt #\p))
     (is equal '(parse:vars) (focus-path ui))))
 
+(define-test move-back-follows-layout-order :parent editing
+  (flet ((back (source id) (w::move-back (parse source) id)))
+    (is equal 'parse:name (back "(f 1)" '(parse:body 0)))
+    (is equal '(parse:body 0) (back "(f 1 2)" '(parse:body 1)))
+    (is equal 'parse:name (back "(f)" 'parse:name))
+    (is equal 'parse::tag (back "(catch tag 1)" '(parse:body 0)))
+    (is equal 'parse:name (back "(return-from b 1)" '(parse::value 0)))
+    (is equal 'parse:vars (back "(let* ((a 1)) 2)" '(parse:body 0)))
+    (is equal 'parse:op (back "(let* ((a 1)) 2)" '(parse:vars 0)))
+    (is equal '(parse:vars 0 0) (back "(let* ((a 1)) 2)" '(parse:vars 0 1)))
+    (is equal '(parse:vars 0) (back "(let* ((a 1)) 2)" '(parse:vars 0 0)))
+    ;; empty slots are skipped, present ones are entered at their last element
+    (is equal 'parse:op (back "(eval-when () 1)" '(parse:body 0)))
+    (is equal '(parse::situations 0) (back "(eval-when (:execute) 1)" '(parse:body 0)))
+    (is equal 'parse:name (back "(defmethod f ((x t)) 1)" 'parse:fun-code))
+    (is equal '(parse::qualifiers 0) (back "(defmethod f :around ((x t)) 1)" 'parse:fun-code)))
+  (flet ((code-back (source &rest path)
+           (let ((ui (apply #'goto (ui-for source) path)))
+             (press ui :rubout :rubout)
+             (list (code ui) (focus-path ui)))))
+    (is equal '("(F)" (parse:name)) (code-back "(f 1)" '(parse:body 0)))
+    (is equal '("(DEFUN G (X))" (parse:fun-code parse:lambda-list))
+        (code-back "(defun g (x) 1)" 'parse:fun-code '(parse:body 0)))
+    (is equal '("(DEFUN G (X) \"doc\")" (parse:fun-code parse::docstring))
+        (code-back "(defun g (x) \"doc\" 1)" 'parse:fun-code '(parse:body 0)))))
+
+(define-test focusing-a-body-asserts :parent editing
+  (fail (press (goto (ui-for "(block b 1)") 'parse:body) #\z) error)
+  (fail (press (goto (ui-for "(return-from b 1)") 'parse::value) #\z) error)
+  (fail (press (goto (ui-for "(f 1)") 'parse:body) #\z) error)
+  ;; syntax lists are focusable
+  (is equal "(LET ((A 1)) A)" (code (press (goto (ui-for "(let ((a 1)) a)") 'parse:vars) #\z)))
+  (is equal "(QUOTE (A))" (code (press (goto (ui-for "'(a)") 'parse::thing) #\z))))
+
 (define-test first-hole-focus :parent editing
   (flet ((first-hole (syntax)
            (let ((ui (ui-for (parse:parse-syntax syntax))))
@@ -211,7 +288,15 @@
   (is equal '(nil nil) (binder-and-bound "(loop for x in xs collect x)" '(parse:body 0)))
   (is equal '("Y" nil) (binder-and-bound "(dolist (y ys) (print y))" '(parse:body 1) '(parse:body 0)))
   (is equal '("X" nil) (binder-and-bound "(loop for x in xs do (let ((x 2)) (print x)))"
-                                         '(parse:body 5) '(parse:body 0) '(parse:body 0))))
+                                         '(parse:body 5) '(parse:body 0) '(parse:body 0)))
+  (is equal '("NEXT" nil) (binder-and-bound "(with-hash-table-iterator (next h) (next))"
+                                            '(parse:body 1) 'parse:op))
+  (is equal '(nil t) (binder-and-bound "(with-hash-table-iterator (next h) (nosuchfn))"
+                                       '(parse:body 1) 'parse:name))
+  (is equal '("OUTER" nil) (binder-and-bound "(loop named outer for x in xs do (return-from outer x))"
+                                             '(parse:body 7) 'parse:name))
+  (is equal '("B" nil) (binder-and-bound "(block b (return-from b 1))" '(parse:body 0) 'parse:name))
+  (is equal '(nil t) (binder-and-bound "(block b (return-from nope 1))" '(parse:body 0) 'parse:name)))
 
 ;;; selections
 
@@ -392,3 +477,15 @@
     (is equal "(LIST A)" (code ui))
     (press ui '(:ctrl #\r))
     (is equal "(LIST A _)" (code ui))))
+
+(define-test completing-a-macro-name-reparses-arguments :parent editing
+  (let ((ui (goto (ui-for "(dolist (x xs) (print x))") 'parse:op)))
+    (press ui :rubout :rubout #\s :enter)
+    (is equal 'parse:macro-call (type-of (w::ast ui)))
+    (is equal t (parse::expanded (w::ast ui)))
+    (is equal 'parse:ref-list (type-of (first (parse:body (w::ast ui)))))))
+
+(define-test binders-through-expansion-lambdas :parent editing
+  (is equal '("P" nil)
+            (binder-and-bound "(multiple-value-bind (p q) (f) (print p))"
+                              '(parse:body 2) '(parse:body 0))))

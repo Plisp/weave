@@ -35,7 +35,7 @@
   (dolist (id path ui)
     (w::descend ui id)))
 
-(defun lines (ui &key (rows 12) (cols 70))
+(defun render-buffer (ui &key (rows 12) (cols 70))
   (let ((buffer (make-array (list rows cols))))
     (dotimes (i (array-total-size buffer))
       (setf (row-major-aref buffer i) (tui::make-cell)))
@@ -45,6 +45,15 @@
       (setf (w::focus-rect ui) nil)
       (w::render-node (w::ast ui) (last (w::stack ui)) ui
                       (tui:make-rect :x 0 :y 0 :rows rows :cols cols)))
+    buffer))
+
+(defun cell-bgs (ui n &key (row 0))
+  "The background colours of the first `n' cells of `row'."
+  (let ((buffer (render-buffer ui)))
+    (loop for x below n collect (tui-sys:bg (tui::cell-style (aref buffer row x))))))
+
+(defun lines (ui &key (rows 12) (cols 70))
+  (let ((buffer (render-buffer ui :rows rows :cols cols)))
     (loop for y below rows
           for line = (string-right-trim
                       " " (with-output-to-string (s)
@@ -90,3 +99,27 @@
 
 (defun history-length (ui)
   (length (w::history ui)))
+
+(defun binder-names (entry)
+  "Sorted names of the binders in a `subforms' entry."
+  (let ((names (list)))
+    (when (cdr entry)
+      (maphash (lambda (binder kind) (declare (ignore kind)) (push (parse:name binder) names))
+               (cdr entry)))
+    (sort names #'string<)))
+
+(defun binder-kinds (entry)
+  "Sorted (name . kinds) of the binders in a `subforms' entry."
+  (let ((kinds (list)))
+    (when (cdr entry)
+      (maphash (lambda (binder ks)
+                 (push (cons (parse:name binder) (sort (copy-list ks) #'string< :key #'symbol-name))
+                       kinds))
+               (cdr entry)))
+    (sort kinds #'string< :key #'car)))
+
+(defmacro var-and-fn (name &body body)
+  `(let* ((,name 1)) (flet ((,name () 2)) ,@body)))
+
+(defmacro shadowing-vars (a b &body body)
+  `(let* ((,a 1) (,b 2)) ,@body))

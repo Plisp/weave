@@ -8,7 +8,7 @@
   (:export #:make-env
            #:parse-from-string #:parse-syntax #:ast-parse-error
            #:is-atom #:get-body
-           #:copy-node #:to-syntax
+           #:copy-node #:to-syntax #:copy-syntax
 
            #:update
            #:get-location #:node-at
@@ -21,7 +21,7 @@
 
            #:function-call
 
-           #:irregular-form #:macro-call #:subforms #:path-at
+           #:irregular-form #:macro-call #:subforms #:path-at #:expanded
 
            #:function-code #:lambda-list
            #:unevaluated
@@ -143,7 +143,11 @@
              :reader call-env)
    (subforms :initarg :subforms
              :reader subforms
-             :documentation "Evaluated syntax in the body -> (parsed . binders in scope)")))
+             :documentation "Evaluated syntax in the body -> (parsed . binders in scope)")
+   (expanded :initarg :expanded
+             :initform t
+             :reader expanded
+             :documentation "Whether the call's own macroexpansion succeeded")))
 
 (defclass ref-list (anchor)
   ((elements :initarg :elements
@@ -294,6 +298,7 @@ so a name test alone can't distinguish #:|.| from a dot."))
          :op (copy-node (op o))
          :body new-body
          :call-env (call-env o)
+         :expanded (expanded o)
          :subforms (let ((table (make-hash-table :test #'eq)))
                      (maphash (lambda (form entry)
                                 (let ((copy (gethash form form-pairs)))
@@ -303,8 +308,14 @@ so a name test alone can't distinguish #:|.| from a dot."))
                                         (cons (if (eq (car entry) form)
                                                   copy
                                                   (copy-node (car entry)))
-                                              (mapcar (lambda (b) (gethash b form-pairs))
-                                                      (cdr entry))))))
+                                              (when (cdr entry)
+                                                (let ((binders (make-hash-table :test #'eq)))
+                                                  (maphash (lambda (binder kinds)
+                                                             (setf (gethash (gethash binder form-pairs)
+                                                                            binders)
+                                                                   (copy-list kinds)))
+                                                           (cdr entry))
+                                                  binders))))))
                               (subforms o))
                      table)))))
   (:method ((o ref-list))
@@ -584,12 +595,25 @@ copy-env can exploit structure sharing, remember to PUSH!"
 (defmacro macroexpand-in-lispenv (form &environment env)
   `(macroexpand ',form ,env))
 
+(defun env-affects-expansion-p (env)
+  "Whether `env' holds a local/symbol macro or shadows a global one, so that
+expanding in it may differ from expanding in the null environment."
+  ;; XXX not quite complete for macros with &environment
+  (or (some (lambda (entry) (or (consp entry) (and (symbolp entry) (macro-function entry))))
+            (function-bindings env))
+      (some (lambda (entry)
+              (or (consp entry) (and (symbolp entry) (nth-value 1 (macroexpand-1 entry)))))
+            (variable-bindings env))))
+
 (defun macroexpand-with-env (form env)
-  (eval (line-up-first `(macroexpand-in-lispenv ,form)
-                       (wrap-function-like-env (function-bindings env))
-                       (wrap-variable-like-env (variable-bindings env))
-                       (wrap-block-env (blocks env))
-                       (wrap-tag-env (tags env)))))
+  "Expands `form' in `env', reconstructing `env' only when it can affect the expansion."
+  (if (env-affects-expansion-p env)
+      (eval (line-up-first `(macroexpand-in-lispenv ,form)
+                           (wrap-function-like-env (function-bindings env))
+                           (wrap-variable-like-env (variable-bindings env))
+                           (wrap-block-env (blocks env))
+                           (wrap-tag-env (tags env))))
+      (macroexpand form)))
 
 (declaim (type simple-vector *hardwired-operators*))
 (defparameter *hardwired-operators* #(lambda defun defmethod defmacro
@@ -2099,6 +2123,22 @@ other atom."
   (case id
     (op 'symbol-ref)
     (fun-designator (if (typep (fun-designator node) 'symbol-ref) 'fun-designator 'unevaluated))))
+
+(defun walk-function-form (form env walker on-binder)
+  "Macroexpansions tend to bind this, e.g. sbcl's destructuring-bind."
+  (declare (ignore on-binder))
+  (when (lambda-operator-p (second form))
+    (funcall walker (second form) env))
+  nil)
+
+(defun parse-function-form (rawform env walker alter-identity)
+  (let ((node (function-parser rawform env walker alter-identity)))
+    (when (lambda-expression-p (fun-designator node))
+      (setf (slot-value node 'fun-designator) (funcall walker (fun-designator node) env)))
+    node))
+
+(setf (gethash 'function *special-walkers*) #'walk-function-form
+      (gethash 'function *special-parsers*) #'parse-function-form)
 (defform (quote &tree thing))
 
 (defform (setq &body forms)
@@ -2142,35 +2182,46 @@ other atom."
 (defform (progv var-list val-list &body body) ; don't track dynamic bindings
   :binds ((var-list) (val-list) (body)))
 
+(defun lambda-operator-p (x)
+  "Whether the s-expression `x' is a lambda expression, e.g. in operator position."
+  (and (consp x) (eq (car x) 'lambda)))
+
 (defun walk-form (form env on-form &optional (note-binder (constantly nil)))
   "Form and env must consist of ordinary s-expressions, remove wrappers prior to walking."
   (if (atom form)
       (funcall on-form form env)
       (when (funcall on-form form env)
         (let ((name (car form)))
-          (if-let (walker (gethash name *special-walkers*))
-            (funcall walker
-                     form env
-                     (rcurry #'walk-form on-form note-binder)
-                     note-binder)
-            (multiple-value-bind (newform expanded-p)
-                (env-macroexpand form env)
-              (if expanded-p
-                  (if (atom newform)
-                      (funcall on-form newform env)
-                      (let ((newop (car newform)))
-                        (if-let (walker (gethash newop *special-walkers*))
-                          (funcall walker
-                                   newform env
-                                   (rcurry #'walk-form on-form note-binder)
-                                   note-binder)
-                          ;; must be function call
-                          (when (funcall on-form newform env)
-                            (mapcar (rcurry #'walk-form env on-form note-binder)
-                                    (cdr newform))))))
-                  (when (funcall on-form form env)
-                    (mapcar (rcurry #'walk-form env on-form note-binder)
-                            (cdr form))))))))))
+          (cond
+            ((lambda-operator-p name)
+             (walk-form name env on-form note-binder)
+             (mapcar (rcurry #'walk-form env on-form note-binder) (cdr form)))
+            ((gethash name *special-walkers*)
+             (funcall (gethash name *special-walkers*)
+                      form env
+                      (rcurry #'walk-form on-form note-binder)
+                      note-binder))
+            (t
+             (multiple-value-bind (newform expanded-p)
+                 (env-macroexpand form env)
+               (if expanded-p
+                   (if (atom newform)
+                       (funcall on-form newform env)
+                       (let ((newop (car newform)))
+                         (if-let (walker (gethash newop *special-walkers*))
+                           (funcall walker
+                                    newform env
+                                    (rcurry #'walk-form on-form note-binder)
+                                    note-binder)
+                           ;; must be function call
+                           (when (funcall on-form newform env)
+                             (when (lambda-operator-p newop)
+                               (walk-form newop env on-form note-binder))
+                             (mapcar (rcurry #'walk-form env on-form note-binder)
+                                     (cdr newform))))))
+                   (when (funcall on-form form env)
+                     (mapcar (rcurry #'walk-form env on-form note-binder)
+                             (cdr form)))))))))))
 
 (defun read-eval-p (form)
   "Whether `form' is the syntax list representing read evaluation."
@@ -2250,29 +2301,36 @@ XXX performs unguarded read-evaluation."
 ;;
 ;;; macro analysis via perturbation
 ;; XXX muffle warnings
+;; e.g. dolist is non-parametric on sbcl w.r.t constant lists (list 1) folds to '(1),
+;; so we cannot analyze that as an eval-form.
 ;;
 (defun macro-call-envmap (call env walker)
   "Identifies body forms and binding scopes to return a map of {sexp -> (parsed binder-env)}.
 Walks subforms of the call using WALKER during analysis, which should return the
-parsed entry to be keyed in the map."
+parsed entry to be keyed in the map. The second value is NIL when the call fails to expand."
   (with-temporary-interning (interned)
     (handler-case
       (labels ((call-nth (i form)
                  ;; we need to map paths in the raw source back to the parsed
-                 ;; representation with symbolic dot markers
-                 (let ((rest (nthcdr i (elements form))))
-                   (if (typep (car rest) 'dot-marker)
-                       (cadr rest) ; the real elt is one later
-                       (car rest))))
+                 ;; representation with symbolic dot markers. A list tail is spliced
+                 ;; into the stripped form so index into it
+                 (let* ((elts (elements form))
+                        (dot (position-if (lambda (e) (typep e 'dot-marker)) elts)))
+                   (cond ((or (null dot) (< i dot)) (nth i elts))
+                         (t (let ((tail (nth (1+ dot) elts)))
+                              (if (gen-list-p tail)
+                                  (call-nth (- i dot) tail)
+                                  tail))))))
                (lookup-path (path form)
                  (loop for i in (reverse path)
                        do (setf form (call-nth i form))
                        finally (return form))))
-        (let* ((raw-form->loc (make-hash-table :test #'eq))
-               (raw-form->form (make-hash-table :test #'eq))
-               (possible-identifiers (make-hash-table :test #'eq))
+        (let* ((raw-form->loc (make-hash-table :test #'equal))
+               (possible-identifiers (make-hash-table :test #'equal))
                (subforms (make-hash-table :test #'eq))
-               (raw (strip-wrappers call interned))
+               (expanded t)
+               (original (strip-wrappers call interned))
+               (raw (copy-tree original))
                (env (strip-env env interned)))
           ;; identify all forms in the original call for classification
           ;; some may be constants, others are binders and expressions
@@ -2293,35 +2351,29 @@ parsed entry to be keyed in the map."
                               ;; we only care if it's a symbol as ~(consp rest) from while
                            finally (when (and (not (null rest)) (symbolp rest))
                                      (push (cons i path) (gethash rest raw-form->loc))))))
-            (walk-call-collecting-forms raw (list)))
+            (walk-call-collecting-forms original (list)))
           ;; - macroexpand fully up to special (or hardwired macro) forms,
           ;;   record *only* binders and obvious evaluation contexts seen in the output
           ;; - call the walker meanwhile
           (walk-form (handler-case (env-macroexpand raw env)
-                       (error () nil))
+                       (error () (setf expanded nil)))
                      env
                      (lambda (form env)
-                       (when (and (symbolp form) (not (constantp form)))
-                         (setf (gethash form possible-identifiers) :ref))
-                       ;; continue if this isn't an cons, or not part of the call
-                       (let ((path (gethash form raw-form->loc)))
-                         (if (and (consp form) path)
-                             ;; recurse known eval'd subforms from the ORIGINAL tree
-                             (let ((call-form (lookup-path (car path) call)))
-                               ;; parse of the child must succeed, or assume coincidence
-                               (when-let (parsed (funcall walker call-form env))
-                                 (setf (gethash form raw-form->form) call-form
-                                       (gethash call-form subforms) (list parsed)))
-                               nil)
-                             t)))
-                     ;; binder currently may be unused TODO block analysis
+                       (declare (ignore env))
+                       (cond ((and (symbolp form) (not (constantp form)))
+                              (setf (gethash form possible-identifiers) :ref))
+                             ((and (consp form) (gethash form raw-form->loc))
+                              (setf (gethash (copy-tree form) possible-identifiers) :form)))
+                       t)
                      (lambda (sym kind)
                        (unless (constantp sym)
                          (setf (gethash sym possible-identifiers) kind))))
           ;;(disp (hash-table-plist possible-identifiers))
           ;; analysis, first to understand syntax before constructing the returned maps
           (let ((gensym->path (make-hash-table :test #'eq))
-                (gensym->refpath (make-hash-table :test #'eq)))
+                (gensym->refpath (make-hash-table :test #'eq))
+                (gensym->formpath (make-hash-table :test #'eq))
+                (form-paths (make-hash-table :test #'equal)))
             (labels ((substitute-sym (path form sym)
                        (loop for rest on (reverse path)
                              for i := (car rest)
@@ -2332,42 +2384,71 @@ parsed entry to be keyed in the map."
                                           (if (consp (cdr before))
                                               (setf (second before) sym)
                                               (setf (cdr before) sym))))
-                                    (setf form (nth i form))))))
+                                    (setf form (nth i form)))))
+                     (probe (path sym)
+                       (let* ((gensym (gensym "PB"))
+                              (compoundp (consp sym))
+                              (replacement (if compoundp (list gensym) gensym))
+                              (ident-kind nil)
+                              (form-env nil))
+                         (substitute-sym path raw replacement)
+                         (let ((expansion (handler-case (env-macroexpand raw env)
+                                            (error () +fail+))))
+                           (unless (eq expansion +fail+)
+                             (handler-case
+                                 (block walk
+                                   (walk-form expansion env
+                                              (lambda (form env)
+                                                (cond ((and compoundp
+                                                            (consp form)
+                                                            (eq (car form) gensym)
+                                                            (null (cdr form)))
+                                                       (setf ident-kind :form
+                                                             form-env env)
+                                                       (return-from walk))
+                                                      ((and (not compoundp) (eq form gensym))
+                                                       (setf ident-kind :ref)
+                                                       (return-from walk))
+                                                      (t t)))
+                                              (lambda (sym kind)
+                                                (when (and (not compoundp) (eq sym gensym))
+                                                  (setf ident-kind kind)
+                                                  (return-from walk)))))
+                               ((and error (not analysis-invariant-error)) () nil))))
+                         ;; an actual reference will be independent of the binding name
+                         ;; counter: spec-step forms may have spurious refs generated
+                         (when (eq ident-kind :form)
+                           (let* ((call-form (lookup-path path call))
+                                  (parsed (funcall walker call-form form-env)))
+                             (if parsed
+                                 (setf (gethash call-form subforms) (list parsed))
+                                 (setf ident-kind nil))))
+                         (cond ((eq ident-kind :form)
+                                (setf (gethash gensym gensym->formpath) path)
+                                (setf (gethash path form-paths) t))
+                               (ident-kind
+                                (setf (gethash gensym gensym->path) path)
+                                (when (eq ident-kind :ref)
+                                  (setf (gethash gensym gensym->refpath) path)))
+                               (t (substitute-sym path raw (copy-tree sym))))))
+                     (walk-candidate (form path compoundp)
+                       (unless (or (gethash path form-paths)
+                                   (read-eval-p (lookup-path path call)))
+                         (when (and (if compoundp (consp form) (symbolp form))
+                                    (gethash form possible-identifiers))
+                           (probe path form))
+                         (when (and (consp form) (not (gethash path form-paths)))
+                           (walk-candidates form path compoundp))))
+                     (walk-candidates (form path compoundp)
+                       (loop for rest = form then (cdr rest)
+                             for i from 0
+                             while (consp rest)
+                             do (walk-candidate (car rest) (cons i path) compoundp)
+                             finally (when (and rest (symbolp rest))
+                                       (walk-candidate rest (cons i path) compoundp)))))
               ;; we need to know where the refs and binders are first
-              (loop
-                for sym being the hash-keys of possible-identifiers
-                  using (hash-value kind)
-                do (loop for path in (gethash sym raw-form->loc)
-                         for gensym := (gensym "PB")
-                         for ident-kind := nil
-                         do (substitute-sym path raw gensym)
-                            (let ((expansion (handler-case (env-macroexpand raw env)
-                                               (error () +fail+))))
-                              (unless (eq expansion +fail+)
-                                (handler-case
-                                    (block walk
-                                      (walk-form expansion env
-                                                 (lambda (form env)
-                                                   (declare (ignore env))
-                                                   (cond ((gethash form raw-form->loc) nil)
-                                                         ((eq form gensym)
-                                                          (setf ident-kind :ref)
-                                                          (return-from walk))
-                                                         (t t)))
-                                                 (lambda (sym kind)
-                                                   (when (and (eq sym gensym)
-                                                              (eq kind :variable))
-                                                     (setf ident-kind :variable)
-                                                     (return-from walk)))))
-                                  ((and error (not analysis-invariant-error)) () nil))))
-                            ;; an actual reference will be independent of the binding name
-                            ;; counter: spec-step forms may have spurious refs generated
-                            (if ident-kind
-                                (progn
-                                  (setf (gethash gensym gensym->path) path)
-                                  (when (eq ident-kind :ref)
-                                    (setf (gethash gensym gensym->refpath) path)))
-                                (substitute-sym path raw sym))))
+              (walk-candidates original nil t)
+              (walk-candidates original nil nil)
               ;; (disp (hash-table-plist gensym->path))
               ;; (disp (hash-table-plist gensym->refpath))
               ;; - map gensyms back to the call and change class to binder
@@ -2380,23 +2461,38 @@ parsed entry to be keyed in the map."
                      expansion env
                      (lambda (form subenv)
                        (flet ((calc-bindings ()
-                                (loop
-                                  with res := (list)
-                                  for v in (ldiff (variable-bindings subenv)
-                                                  (variable-bindings env))
-                                  do (with-lookup (path (gethash (ensure-car v)
-                                                         gensym->path))
-                                       (let ((binder (lookup-path path call)))
-                                         ;; note: on-binder idempotent callback, may see the
-                                         ;; same binder again via ldiff at deeper nesting
-                                         (invariant (typep binder '(or symbol-ref hole)))
-                                         (when (typep binder 'symbol-ref)
-                                           (unless (typep binder 'binder)
-                                             (change-class binder 'binder))
-                                           (push binder res))))
-                                  finally (return res))))
-                         (if (and (consp form) (gethash form raw-form->loc))
-                             (when-let (call-form (gethash form raw-form->form))
+                                (let ((binders (make-hash-table :test #'eq))
+                                      (seen (make-hash-table :test #'equal)))
+                                  (flet ((note (entry kind)
+                                           (with-lookup (path (gethash (ensure-car entry)
+                                                               gensym->path))
+                                             (let ((binder (lookup-path path call)))
+                                               ;; note: on-binder idempotent callback, may see
+                                               ;; the same binder again at deeper nesting
+                                               (invariant (typep binder '(or symbol-ref hole)))
+                                               (when (typep binder 'symbol-ref)
+                                                 (unless (typep binder 'binder)
+                                                   (change-class binder 'binder))
+                                                 ;; bindings are innermost first, so the first
+                                                 ;; of a name shadows the rest of its kind
+                                                 (let ((key (cons (name binder) kind)))
+                                                   (unless (gethash key seen)
+                                                     (setf (gethash key seen) t)
+                                                     (push kind (gethash binder binders)))))))))
+                                    (loop for v in (ldiff (variable-bindings subenv)
+                                                          (variable-bindings env))
+                                          do (note v :variable))
+                                    (loop for f in (ldiff (function-bindings subenv)
+                                                          (function-bindings env))
+                                          do (note f :function))
+                                    (loop for b in (ldiff (blocks subenv) (blocks env))
+                                          do (note b :block)))
+                                  binders)))
+                         (if (and (consp form)
+                                  (null (cdr form))
+                                  (gethash (car form) gensym->formpath))
+                             (let ((call-form (lookup-path
+                                               (gethash (car form) gensym->formpath) call)))
                                (setf (gethash call-form subforms)
                                      (cons (car (gethash call-form subforms))
                                            (calc-bindings)))
@@ -2409,9 +2505,9 @@ parsed entry to be keyed in the map."
                                nil)))))
                     ((and error (not analysis-invariant-error)) () nil))))
               ;; (disp (hash-table-plist subforms))
-              subforms))))
+              (values subforms expanded)))))
       ((and error (not (or ast-parse-error analysis-invariant-error))) ()
-        (make-hash-table :test #'eq)))))
+        (values (make-hash-table :test #'eq) nil)))))
 
 (defmethod get-location ((node macro-call) id)
   (trivia:cmatch id
@@ -2448,26 +2544,45 @@ parsed entry to be keyed in the map."
                           (elements form))))
       (t (to-syntax form)))))
 
+(defun unparse-along (form path table)
+  "`form' with only the outermost entry in `table' along `path' unparsed so other keyed
+subforms keep their identity"
+  (cond ((gethash form table) (unparse-syntax form table))
+        ((and path (typep form 'ref-list))
+         (with-elements form
+           (list-update (elements form)
+                        (unparse-along (nth (first path) (elements form)) (rest path) table)
+                        (first path))))
+        (t form)))
+
 (defun reanalyse-call (call op body)
   "Reanalyse the macro call `call' with `op' as the new head, keeping anchors.
-Returns NIL when the call is unparseable."
+Returns NIL when the call is unparseable or fails to expand."
   (let ((syntax (copy-syntax
                   (apply #'ref-list
                            op
                            (mapcar (rcurry #'unparse-syntax (subforms call)) body)))))
     (handler-case
-        (copy-anchors
-         call (parse syntax (or (call-env call) +nullenv+) #'copy-anchors))
+        (let ((new (parse syntax (or (call-env call) +nullenv+) #'copy-anchors)))
+          (unless (and (typep new 'macro-call) (not (expanded new)))
+            (copy-anchors call new)))
       (ast-parse-error () nil))))
 
 (defmethod update ((node macro-call) id new-value)
   (flet ((rebuild (op body)
            (or (reanalyse-call node op body)
-               ;; if we fail to reparse, keep the raw form and previously parsed subforms
-               (make-instance 'macro-call
-                              :op op :body body
-                              :call-env (call-env node)
-                              :subforms (subforms node)))))
+               ;; if we fail to reparse, keep the raw form and previously parsed subforms,
+               ;; dropping their binders since the call's scoping is now meaningless
+               (make-instance
+                'macro-call
+                :op op :body body
+                :call-env (call-env node)
+                :expanded nil
+                :subforms (let ((table (make-hash-table :test #'eq)))
+                            (maphash (lambda (form entry)
+                                       (setf (gethash form table) (list (car entry))))
+                                     (subforms node))
+                            table)))))
     (trivia:cmatch id
       ((eql 'op)
        (let ((call (rebuild (copy-anchors (op node) new-value) (body node))))
@@ -2479,14 +2594,15 @@ Returns NIL when the call is unparseable."
              (make-instance
               'macro-call
               :op (op node) :body (body node) :call-env (call-env node)
+              :expanded (expanded node)
               :subforms (let ((new (copy-hash-table (subforms node) :test #'eq)))
                           (setf (gethash old new) (cons new-value (cdr (gethash old new))))
                           new))
              ;; syntax change, reparse. Binder names included e.g. loop
              (let* ((body (if indices
                               (list-update (body node)
-                                           (unparse-syntax (nth (first indices) (body node))
-                                                           (subforms node))
+                                           (unparse-along (nth (first indices) (body node))
+                                                          (rest indices) (subforms node))
                                            (first indices))
                               (body node)))
                     (call (rebuild (op node) (gen-tree-update body indices new-value))))
@@ -2535,7 +2651,13 @@ Returns NIL when the call is unparseable."
                                     (body node)))))
 
 (defmethod location-bindings ((node macro-call) id)
-  (bindings-of :variable (cdr (gethash (check-evaluated node id) (subforms node)))))
+  (let ((binders (cdr (gethash (check-evaluated node id) (subforms node))))
+        (bindings (list)))
+    (when binders
+      (maphash (lambda (binder kinds)
+                 (dolist (kind kinds) (push (cons kind binder) bindings)))
+               binders))
+    bindings))
 
 (defun lambda-expression-p (x)
   (and (gen-form-p x)
@@ -2569,19 +2691,20 @@ Returns NIL when the call is unparseable."
          (flet ((parse-function (form) (parse-call form env alter-identity))
                 ;; don't expand explicitly, we only care about explicit call subforms
                 (parse-macro (form)
-                  (funcall alter-identity form
-                           (make-instance
-                            'macro-call
-                            :op (gen-car form) :body (gen-cdr form)
-                            :call-env env
-                            :subforms
-                            (macro-call-envmap
-                             form env
-                             (lambda (form env)
-                               ;; one subform parsing failure e.g. (3)
-                               ;; should not invalidate other parsed forms
-                               (handler-case (parse form env alter-identity)
-                                 (ast-parse-error () nil))))))))
+                  (multiple-value-bind (subforms expanded)
+                      (macro-call-envmap
+                       form env
+                       (lambda (form env)
+                         ;; one subform parsing failure e.g. (3)
+                         ;; should not invalidate other parsed forms
+                         (handler-case (parse form env alter-identity)
+                           (ast-parse-error () nil))))
+                    (funcall alter-identity form
+                             (make-instance 'macro-call
+                                            :op (gen-car form) :body (gen-cdr form)
+                                            :call-env env
+                                            :subforms subforms
+                                            :expanded expanded)))))
            (cond ((null result) ; global
                   (let ((sym (resolve (gen-car form))))
                     (if (and sym (macro-function sym) (not (hardwired-p sym)))
