@@ -8,6 +8,20 @@
   (is equal 'parse:function-call
             (type-of (parse:parse-syntax (parse:ref-list (sym "LIST") (parse:hole))))))
 
+(define-test parse-from-string-starts-at-index :parent parser
+  (let* ((source (format nil "(f)~%; retained~%(defun g () \"documentation\" 1)"))
+         (client (parse:make-client source)))
+    (multiple-value-bind (first next)
+        (parse:parse-from-string client source)
+      (is equal "(F)" (sx first))
+      (multiple-value-bind (second end)
+          (parse:parse-from-string client source :start next)
+        (let ((code (parse:fun-code second)))
+          (is equal "\"documentation\"" (parse:str (parse::docstring code)))
+          (is equal "1" (parse:str (first (parse:body code)))))
+        (is equal "; retained" (parse:str (first (parse::leading second))))
+        (is = (length source) end)))))
+
 (define-test unparseable-macro-argument-is-left-raw :parent parser
   (let ((ast (parse "(loop for x in (1 2) collect x)")))
     (is equal 'parse:macro-call (type-of ast))

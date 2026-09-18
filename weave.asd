@@ -18,6 +18,7 @@
   :components ((:file "util")
                (:file "ast" :depends-on ("util"))
                (:file "tui" :depends-on ("util" "ast"))
+               (:file "entry-point" :depends-on ("tui"))
                )
   :in-order-to ((asdf:test-op (asdf:test-op #:weave/tests))))
 

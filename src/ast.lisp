@@ -6,7 +6,7 @@
 (uiop:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
   (:export #:make-env
-           #:parse-from-string #:parse-syntax #:ast-parse-error
+           #:make-client #:parse-from-string #:parse-syntax #:ast-parse-error
            #:is-atom #:get-body
            #:copy-node #:to-syntax #:copy-syntax
 
@@ -251,7 +251,10 @@ so a name test alone can't distinguish #:|.| from a dot."))
       (print-object (pprint-pop) stream))))
 
 (defmethod print-object ((object macro-call) stream)
-  (pprint-logical-block (stream (body object))
+  (pprint-logical-block (stream (loop for i from 0
+                                      for o in (body object)
+                                      collect (node-at (make-location :node object
+                                                                      :id `(body ,i)))))
     (write-string "<mc(" stream)
     (write (op object) :stream stream)
     (loop
@@ -442,6 +445,17 @@ or function-code location, otherwise this errors.")
   (:documentation "Functionally updates the location corresponding to `id',
 returns a new node with all child nodes identical except the hole indicated.
 List structure may share conses with the old node."))
+
+;; A file is represented by a list of top-level forms one level above the old root.
+(defmethod get-location ((node list) (id integer))
+  (nth id node))
+
+(defmethod update ((node list) (id integer) new-value)
+  (list-update node new-value id))
+
+(defmethod location-sort ((node list) (id integer))
+  (declare (ignore node id))
+  'eval-form)
 
 (defun location= (n1 n2)
   (and (eq (location-node n1) (location-node n2))
@@ -2733,7 +2747,12 @@ Returns NIL when the call is unparseable or fails to expand."
 (defclass my-client (eclector.parse-result:parse-result-client)
   ((source :initarg :source
            :initform (error "no source")
-           :reader source)))
+           :reader source)
+   (source-offset :initform 0
+                  :accessor source-offset)))
+
+(defun make-client (source)
+  (make-instance 'my-client :source source))
 
 ;; and or not
 (defclass read-cond (eval-form atom-form)
@@ -2815,6 +2834,11 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
 (defmethod eclector.reader:make-structure-instance
     ((client my-client) (name t) (initargs t))
   nil)
+
+(defmethod eclector.base:make-source-range
+    ((client my-client) (start integer) (end integer))
+  (let ((offset (source-offset client)))
+    (cons (+ offset start) (+ offset end))))
 
 (defmethod eclector.parse-result:make-expression-result
     ((client my-client) (result t) (children t) (source t))
@@ -3016,12 +3040,13 @@ passed with dynamic extent."
   "Parses `syntax' as toplevel code, keeping anchors."
   (parse syntax (make-env :%function-bindings '(read-eval)) #'copy-anchors))
 
-(defun parse-from-string (s)
-  (let ((client (make-instance 'my-client :source s)))
-    (multiple-value-bind (form len leading-comments)
-        (eclector.parse-result:read-from-string client s)
-      (declare (ignore len))
-      (let ((res (parse-syntax form)))
-        ;; note res can be a toplevel atom
-        (setf (leading res) (append leading-comments (leading res)))
-        res))))
+(defun parse-from-string (client source &key (start 0))
+  "Parses one top-level form and returns it with the index at which reading stopped."
+  (setf (source-offset client) start)
+  (multiple-value-bind (form end leading-comments)
+      (eclector.parse-result:read-from-string client source nil nil :start start)
+    (if (null form)
+        (values nil end leading-comments)
+        (let ((result (parse-syntax form)))
+          (setf (leading result) (append leading-comments (leading result)))
+          (values result end)))))

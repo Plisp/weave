@@ -17,21 +17,27 @@
     (t (sx (parse:to-syntax x)))))
 
 (defun parse (source)
-  (parse:parse-from-string source))
+  (parse:parse-from-string (parse:make-client source) source))
 
 ;;; ui
 
 (defun ui-for (source)
-  (let* ((ast (if (stringp source) (parse source) source))
+  (let* ((parsed (if (stringp source) (parse source) source))
+         (ast (cond ((null parsed) (list (parse:hole)))
+                    ((listp parsed) parsed)
+                    (t (list parsed))))
          (root (w::make-location :node 'undefined))
          (ui (make-instance 'w::ui :ast ast :stack (list root))))
     (setf (w::location-node root) ui
           (w::stack ui) (list root))
+    (w::descend ui 0)
     ui))
 
 (defun goto (ui &rest path)
-  "Focuses `path' of ids from the root."
+  "Focuses `path' from the first root"
   (setf (w::stack ui) (last (w::stack ui)))
+  (when (= 1 (length (w::ast ui)))
+    (w::descend ui 0))
   (dolist (id path ui)
     (w::descend ui id)))
 
@@ -39,12 +45,9 @@
   (let ((buffer (make-array (list rows cols))))
     (dotimes (i (array-total-size buffer))
       (setf (row-major-aref buffer i) (tui::make-cell)))
+    (setf (slot-value ui 'tui::%canvas) buffer)
     (let ((tui::*put-buffer* buffer))
-      (clrhash (w::node-views ui))
-      (clrhash (w::redisplay-cache ui))
-      (setf (w::focus-rect ui) nil)
-      (w::render-node (w::ast ui) (last (w::stack ui)) ui
-                      (tui:make-rect :x 0 :y 0 :rows rows :cols cols)))
+      (setf (slot-value ui 'tui::%root-view) (tui:render ui)))
     buffer))
 
 (defun cell-bgs (ui n &key (row 0))
@@ -67,7 +70,8 @@
   (format nil "~{~a~^ / ~}" (lines ui)))
 
 (defun code (ui)
-  (sx (w::ast ui)))
+  (let ((forms (w::ast ui)))
+    (sx (if (= 1 (length forms)) (first forms) forms))))
 
 (defun event (key)
   "`key' is a character, :space, :rubout, :enter, or (modifier key) with modifier one of
@@ -92,7 +96,8 @@
              nil (event key))))
 
 (defun focus-path (ui)
-  (reverse (mapcar #'w::location-id (butlast (w::stack ui)))))
+  (let ((path (reverse (mapcar #'w::location-id (butlast (w::stack ui))))))
+    (if (= 1 (length (w::ast ui))) (rest path) path)))
 
 (defun focused (ui)
   (w::node-at (w::focus ui)))

@@ -8,7 +8,7 @@
            #:list-insert #:list-update #:list-remove
            #:tree-ref #:tree-update
            #:with-lookup #:or-f #:+fail+
-           #:string-drop
+           #:string-drop #:split-string
            #:flex-vector
            ))
 (in-package #:weave-utils)
@@ -88,6 +88,12 @@ structure with `tree'."
 
 (defun string-drop (s n)
   (subseq s 0 (- (length s) n)))
+
+(defun split-string (text c)
+  (loop for start = 0 then (1+ end)
+        for end = (position c text :start start)
+        collect (subseq text start end)
+        while end))
 
 (defun flex-vector ()
   (make-array 0 :fill-pointer t :adjustable t))

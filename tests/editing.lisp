@@ -13,6 +13,123 @@
   (is equal "list () /      x" (draw (ui-for "(list () x)")))
   (is equal "progn /  ()" (draw (ui-for "(progn ())"))))
 
+(define-test function-documentation-renders :parent editing
+  (let* ((ui (ui-for "(defun g (x) \"first
+second\" (declare (type fixnum x)) (+ x 1))"))
+         (code (parse:fun-code (first (w::ast ui)))))
+    (is = 1 (length (parse:body code)))
+    (is equal "\"first
+second\"" (parse:str (parse::docstring code)))
+    (is equal "defun g /  (x) /  \"first /  second\" /  x + 1" (draw ui)))
+  (let ((code (make-instance 'parse:function-code
+                             :lambda-list-kind :lambda
+                             :lambda-list (parse:ref-list)
+                             :docstring "raw documentation"
+                             :body nil)))
+    (is equal "() / \"raw documentation\"" (draw (ui-for code)))))
+
+(define-test function-code-space-after-docstring :parent editing
+  (let ((ui (goto (ui-for "(defun f () \"doc\" (print 1))")
+                  'parse:fun-code 'parse::docstring)))
+    (press ui :space)
+    (is equal "(DEFUN F () \"doc\" _ (PRINT 1))" (code ui))
+    (is equal '(parse:fun-code (parse:body 0)) (focus-path ui))))
+
+(define-test entry-point-top-level-is-a-list :parent editing
+  (is equal t (listp (w::demo-ast)))
+  (let ((forms (w::parse-source "")))
+    (is = 1 (length forms))
+    (is equal 'parse:hole (type-of (first forms)))))
+
+(define-test empty-source-renders-a-hole :parent editing
+  (let ((ui (ui-for nil)))
+    (is equal '("hole") (lines ui :rows 3 :cols 5))))
+
+(define-test source-file-root-renders-vertically :parent editing
+  (let ((ui (ui-for (list (parse "(f 1)") (parse "(g 2)")))))
+    (flet ((rendered-line (row)
+             (let ((buffer (render-buffer ui)))
+               (string-right-trim
+                " "
+                (with-output-to-string (stream)
+                  (dotimes (column (array-dimension buffer 1))
+                    (write-string (tui::cell-string (aref buffer row column)) stream)))))))
+      (is equal "f 1" (rendered-line 0))
+      (is equal "" (rendered-line 1))
+      (is equal "g 2" (rendered-line 2))
+      (goto ui 1 '(parse:body 0))
+      (press ui :rubout #\3)
+      (is equal "g 3" (rendered-line 2)))))
+
+(define-test top-level-window-follows-focus :parent editing
+  (let* ((forms (loop for i below 8 collect (parse (format nil "(f ~d)" i))))
+         (ui (ui-for forms)))
+    (is equal '("f 0" "f 1") (lines ui :rows 3 :cols 20))
+    (goto ui 5 '(parse:body 0))
+    (is equal '("f 5" "f 6") (lines ui :rows 3 :cols 20))
+    (is equal '(4 5 6 7)
+        (mapcar #'w::segment-index
+                (w::scroll-state-segments (w::scroll-state ui))))
+    (w::move-down (gethash (w::node-at (w::focus ui)) (w::node-views ui)) ui)
+    (is equal '(6 parse:name) (focus-path ui))
+    (is equal '("f 5" "f 6") (lines ui :rows 3 :cols 20))))
+
+(define-test completion-clips-to-scrolled-viewport :parent editing
+  (let* ((ui (ui-for (loop for i below 8 collect (parse (format nil "(f ~d)" i)))))
+         (anchor (progn (goto ui 5 'parse:name) (focused ui))))
+    (setf (w::completion-state ui)
+          (make-instance 'w::completion-state :anchor anchor
+                         :candidates '("FOO" "FOOBAR" "FOOBAZ")))
+    (is equal '("f 5" "foo" "foobar") (lines ui :rows 3 :cols 20))
+    (setf (w::completion-state ui) nil)
+    (goto ui 5 '(parse:body 0))
+    (w::swap-node (w::focus ui) (parse "9") ui)
+    (is equal '("f 9" "f 6") (lines ui :rows 3 :cols 20))))
+
+(define-test scrolling-down-keeps-focus-at-bottom :parent editing
+  (let ((ui (ui-for (loop for i below 8 collect (parse (format nil "(f ~d)" i))))))
+    (goto ui 1 'parse:name)
+    (lines ui :rows 3 :cols 20)
+    (loop for index from 2 to 4
+          do (w::move-down (gethash (focused ui) (w::node-views ui)) ui)
+             (is equal (list (format nil "f ~d" (1- index))
+                             (format nil "f ~d" index))
+                 (lines ui :rows 3 :cols 20))
+             (is = 2 (- (tui:rect-y (w::focus-rect ui))
+                        (w::scroll-state-viewport-row (w::scroll-state ui)))))))
+
+(define-test segment-focus-survives-redisplay :parent editing
+  (let ((ui (ui-for (list (parse "(f 0)")
+                          (parse (format nil "(defun g () ~s 1)"
+                                         (format nil "first~%second")))
+                          (parse "(f 2)")))))
+    (goto ui 1 'parse:fun-code 'parse::docstring)
+    (let ((first (lines ui :rows 3 :cols 20)))
+      (is equal first (lines ui :rows 3 :cols 20))
+      (is eq (tui:rect (gethash :focus-view (w::redisplay-cache ui)))
+          (w::focus-rect ui))
+      (is = 2 (tui:rect-rows (w::focus-rect ui))))))
+
+(define-test rendering-clips-to-small-windows :parent editing
+  (dolist (case '(("(f a b c)" 1 1)
+                  ("(/ a b)" 1 3)
+                  ("(* a (+ b c))" 1 4)))
+    (destructuring-bind (source rows cols) case
+      (is = (* rows cols)
+          (array-total-size (render-buffer (ui-for source) :rows rows :cols cols))))))
+
+(define-test file-loads-exact-owning-system :parent editing
+  (let ((file (asdf:system-relative-pathname
+               :alexandria "alexandria-1/strings.lisp")))
+    (multiple-value-bind (forms system component end length)
+        (w::parse-file-loading-system file)
+      (is equal "alexandria" (asdf:component-name system))
+      (is equal "strings" (asdf:component-name component))
+      (is = length end)
+      (is = 2 (length forms))
+      (is equal (find-package :alexandria)
+          (parse:home-package (first (parse:body (second forms))))))))
+
 (define-test unexpanded-macro-name-is-highlighted :parent editing
   (let ((bad (cell-bgs (ui-for "(loop for i from 1 to 10 (print i))") 6))
         (good (cell-bgs (ui-for "(loop for i from 1 to 10 do (print i))") 6)))
@@ -223,7 +340,7 @@
     (is equal 'parse:op (back "(let* ((a 1)) 2)" '(parse:vars 0)))
     (is equal '(parse:vars 0 0) (back "(let* ((a 1)) 2)" '(parse:vars 0 1)))
     (is equal '(parse:vars 0) (back "(let* ((a 1)) 2)" '(parse:vars 0 0)))
-    ;; empty slots are skipped, present ones are entered at their last element
+    ;; empty slots are skipped, or enter the last element
     (is equal 'parse:op (back "(eval-when () 1)" '(parse:body 0)))
     (is equal '(parse::situations 0) (back "(eval-when (:execute) 1)" '(parse:body 0)))
     (is equal 'parse:name (back "(defmethod f ((x t)) 1)" 'parse:fun-code))
@@ -236,7 +353,11 @@
     (is equal '("(DEFUN G (X))" (parse:fun-code parse:lambda-list))
         (code-back "(defun g (x) 1)" 'parse:fun-code '(parse:body 0)))
     (is equal '("(DEFUN G (X) \"doc\")" (parse:fun-code parse::docstring))
-        (code-back "(defun g (x) \"doc\" 1)" 'parse:fun-code '(parse:body 0)))))
+        (code-back "(defun g (x) \"doc\" 1)" 'parse:fun-code '(parse:body 0)))
+    (is equal '("(DEFUN G (X) \"doc\" (DECLARE (TYPE FIXNUM X)))"
+                (parse:fun-code parse::docstring))
+        (code-back "(defun g (x) \"doc\" (declare (type fixnum x)) 1)"
+                   'parse:fun-code '(parse:body 0)))))
 
 (define-test focusing-a-body-asserts :parent editing
   (fail (press (goto (ui-for "(block b 1)") 'parse:body) #\z) error)
@@ -481,9 +602,10 @@
 (define-test completing-a-macro-name-reparses-arguments :parent editing
   (let ((ui (goto (ui-for "(dolist (x xs) (print x))") 'parse:op)))
     (press ui :rubout :rubout #\s :enter)
-    (is equal 'parse:macro-call (type-of (w::ast ui)))
-    (is equal t (parse::expanded (w::ast ui)))
-    (is equal 'parse:ref-list (type-of (first (parse:body (w::ast ui)))))))
+    (let ((form (first (w::ast ui))))
+      (is equal 'parse:macro-call (type-of form))
+      (is equal t (parse::expanded form))
+      (is equal 'parse:ref-list (type-of (first (parse:body form)))))))
 
 (define-test binders-through-expansion-lambdas :parent editing
   (is equal '("P" nil)
