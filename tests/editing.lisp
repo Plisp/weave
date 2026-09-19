@@ -9,9 +9,47 @@
   (is equal "let () /  a" (draw (ui-for "(let () a)")))
   (is equal "flet (f (x) /         x) /  f 1" (draw (ui-for "(flet ((f (x) x)) (f 1))")))
   (is equal "symbol-macrolet (s car y) /  s" (draw (ui-for "(symbol-macrolet ((s (car y))) s)")))
-  (is equal "' (a (b c) d)" (draw (ui-for "'(a (b c) d)")))
+  (is equal "'(a (b c) d)" (draw (ui-for "'(a (b c) d)")))
   (is equal "list () /      x" (draw (ui-for "(list () x)")))
   (is equal "progn /  ()" (draw (ui-for "(progn ())"))))
+
+(define-test quasiquote-rendering :parent editing
+  (dolist (source '("`a" "`()" "`((a b) c)" "`(1 2)"
+                    "``(a ,x ,,x ,@(list y))"
+                    "'(quasiquote unquote unquote-splicing)"))
+    (is equal source (draw (ui-for source))))
+  (is equal '("`(when ,x" "   ,y)")
+      (lines (ui-for "`(when ,x ,y)")))
+  (is equal '("`(loop" "   for x in ,xs" "   collect x)")
+      (lines (ui-for "`(loop for x in ,xs collect x)")))
+  (let ((ui (ui-for "`(a ,(+ x 1) ,@(list y z))")))
+    (is equal '("`(a ,x + 1 ,@list y" "                  z)") (lines ui))
+    (is equal (lines ui) (lines ui))))
+
+(define-test quasiquote-evaluated-editing :parent editing
+  (let ((ui (ui-for "`(a ,(+ x 1) ,@(list y z))")))
+    (goto ui '(parse:thing 1 1))
+    (is eq 'parse:eval-form (w::locsort (w::focus ui)))
+    (press ui :rubout)
+    (is equal "(QUASIQUOTE (A (UNQUOTE _) (UNQUOTE-SPLICING (LIST Y Z))))"
+        (code ui))
+    (press ui #\3)
+    (is equal "(QUASIQUOTE (A (UNQUOTE 3) (UNQUOTE-SPLICING (LIST Y Z))))"
+        (code ui))
+    (goto ui '(parse:thing 2 1))
+    (is eq 'parse:eval-form (w::locsort (w::focus ui)))
+    (press ui :rubout #\()
+    (is equal "(QUASIQUOTE (A (UNQUOTE 3) (UNQUOTE-SPLICING ())))" (code ui))
+    (is equal "`(a ,3 ,@())" (draw ui)))
+  (let ((ui (ui-for "``(a ,x ,,x)")))
+    (goto ui '(parse:thing 1 1 1))
+    (is eq 'parse:unevaluated (w::locsort (w::focus ui)))
+    (goto ui '(parse:thing 1 2 1 1))
+    (is eq 'parse:eval-form (w::locsort (w::focus ui)))
+    (press ui :rubout #\7)
+    (is equal "(QUASIQUOTE (QUASIQUOTE (A (UNQUOTE X) (UNQUOTE (UNQUOTE 7)))))"
+        (code ui))
+    (is equal "``(a ,x ,,7)" (draw ui))))
 
 (define-test function-documentation-renders :parent editing
   (let* ((ui (ui-for "(defun g (x) \"first

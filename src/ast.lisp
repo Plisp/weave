@@ -17,13 +17,14 @@
            #:form-slot-kinds
 
            #:eval-form #:symbol-ref #:binder #:literal
+           #:reader-marker #:read-quasiquote #:read-quote #:read-function
            #:resolve
 
            #:function-call
 
            #:irregular-form #:macro-call #:subforms #:path-at #:expanded
 
-           #:function-code #:lambda-list
+           #:function-code #:docstring #:lambda-list
            #:unevaluated
            #:body #:name #:str #:vars #:op
            #:hole #:text
@@ -2928,28 +2929,21 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
                                      children))))))
         (typecase result
           (cons
-           (case (car result)
-             (function
-              (ref-list (if (and (typep (first children) 'symbol-ref)
-                                 (eq (resolve (first children)) 'cl:function))
-                            (first children)
-                            (wrap-marker 'function))
-                        (lastcar children)))
-             (quote
-              (ref-list (if (and (typep (first children) 'symbol-ref)
-                                 (eq (resolve (first children)) 'cl:quote))
-                            (first children)
-                            (wrap-marker 'quote))
-                        (lastcar children)))
-             (eclector.reader:quasiquote
-              (ref-list (wrap-marker 'eclector.reader:quasiquote) (lastcar children)))
-             (eclector.reader:unquote
-              (ref-list (wrap-marker 'eclector.reader:unquote) (lastcar children)))
-             (eclector.reader:unquote-splicing
-              (ref-list (wrap-marker 'eclector.reader:unquote-splicing)
-                        (lastcar children)))
-             (t
-              (frob-cons))))
+           (flet ((maybe-wrap (name)
+                    (if (and (typep (first children) 'symbol-ref)
+                             (eq (resolve (first children)) name))
+                        (frob-cons)
+                        ;; note: no child means dispatch symbol.
+                        ;; eclector ensures there's one thing after the dispatch symbol
+                        (ref-list (wrap-marker name) (lastcar children)))))
+             (case (car result)
+               (function (maybe-wrap 'cl:function))
+               (quote (maybe-wrap 'cl:quote))
+               (eclector.reader:quasiquote (maybe-wrap 'eclector.reader:quasiquote))
+               (eclector.reader:unquote (maybe-wrap 'eclector.reader:unquote))
+               (eclector.reader:unquote-splicing (maybe-wrap
+                                                  'eclector.reader:unquote-splicing))
+               (t (frob-cons)))))
           (read-evaluated
            (let ((form (ref-list (wrap-marker 'read-eval) (lastcar children))))
              ;; as marked by eclector.reader:evaluate-expression below

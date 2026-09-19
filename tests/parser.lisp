@@ -2,6 +2,31 @@
 
 (define-test parser)
 
+(define-test quasiquote-reader-markers :parent parser
+  (flet ((read-syntax (source)
+           (eclector.parse-result:read-from-string
+            (parse:make-client source) source)))
+    (dolist (case '(("'((eclector.reader:quasiquote ()))" nil)
+                    ("'(`())" t)))
+      (destructuring-bind (source markerp) case
+        (let* ((syntax (read-syntax source))
+               (form (parse:gen-tree-ref syntax '(1 0)))
+               (operator (first (parse:elements form))))
+          (is eq 'eclector.reader:quasiquote (parse:resolve operator))
+          (is eq markerp (typep operator 'parse:reader-marker))
+          (is = 2 (length (parse:elements form)))
+          (is equal nil (parse:elements (second (parse:elements form)))))))
+    (let* ((syntax (read-syntax "((eclector.reader:quasiquote a #||#))"))
+           (form (first (parse:elements syntax)))
+           (operator (first (parse:elements form)))
+           (argument (second (parse:elements form))))
+      (is = 1 (length (parse:elements syntax)))
+      (is = 2 (length (parse:elements form)))
+      (is eq 'eclector.reader:quasiquote (parse:resolve operator))
+      (is eq nil (typep operator 'parse:reader-marker))
+      (is equal "A" (parse:name argument))
+      (is equal '("#||#") (mapcar #'parse:str (parse::trailing argument))))))
+
 ;;; parsing and macro analysis
 
 (define-test holes-parse-as-atoms :parent parser
