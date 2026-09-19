@@ -2033,19 +2033,19 @@ other atom."
                  (vars (let-like-binders node (second id))))))
 
 ;; TODO not editable because of &or ambiguity
-(defform (alexandria:when-let* (&or (name &body init) (&rest vars))
-           &body body)
-  :rest-patterns ((vars . (name &body init)))
-  :binds ((init :variable (< name))
-          (body :variable name)))
+;; (defform (alexandria:when-let* (&or (name &body init) (&rest vars))
+;;            &body body)
+;;   :rest-patterns ((vars . (name &body init)))
+;;   :binds ((init :variable (< name))
+;;           (body :variable name)))
 
-(defmethod location-bindings ((node when-let*-form) id)
-  (check-evaluated node id)
-  (let ((binders (or (rest-binders (vars node)) (list (name node)))))
-    (bindings-of :variable
-                 (case (id-slot id)
-                   (body binders)
-                   (vars (subseq binders 0 (min (second id) (length binders))))))))
+;; (defmethod location-bindings ((node when-let*-form) id)
+;;   (check-evaluated node id)
+;;   (let ((binders (or (rest-binders (vars node)) (list (name node)))))
+;;     (bindings-of :variable
+;;                  (case (id-slot id)
+;;                    (body binders)
+;;                    (vars (subseq binders 0 (min (second id) (length binders))))))))
 
 (defform (flet (&rest funs)
            &declarations decls
@@ -2303,11 +2303,12 @@ XXX performs unguarded read-evaluation."
               :%blocks (mapcar #'strip-binding (blocks env))
               :%tags (tags env))))
 
-(defmacro with-temporary-interning ((interned) &body body)
-  "Runs `body', then uninterns all symbols in the vector `interned'."
+(defmacro with-quiet-interning ((interned) &body body)
+  "Runs `body', then uninterns all symbols in the vector `interned'. Warnings are disabled."
   (with-gensyms (sym)
     `(let ((,interned (make-array 0 :adjustable t :fill-pointer t)))
-       (unwind-protect (progn ,@body)
+       (unwind-protect (handler-bind ((warning #'muffle-warning))
+                         (progn ,@body))
          (#+sbcl sb-ext:without-package-locks #-sbcl progn
            (loop for ,sym across ,interned
                  do (unintern ,sym (symbol-package ,sym))))))))
@@ -2322,7 +2323,7 @@ XXX performs unguarded read-evaluation."
   "Identifies body forms and binding scopes to return a map of {sexp -> (parsed binder-env)}.
 Walks subforms of the call using WALKER during analysis, which should return the
 parsed entry to be keyed in the map. The second value is NIL when the call fails to expand."
-  (with-temporary-interning (interned)
+  (with-quiet-interning (interned)
     (handler-case
       (labels ((call-nth (i form)
                  ;; we need to map paths in the raw source back to the parsed

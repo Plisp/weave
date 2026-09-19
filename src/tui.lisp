@@ -82,14 +82,9 @@ If this returns NIL, propagate up the cursor stack.")
    (selection :initform 0
               :accessor selection)))
 
-(defclass state ()
-  ((ast :initarg :ast
-        :initform (error "must provide ast")
-        :reader ast)
-   ;; the focus is (car stack)
-   (stack :initarg :stack
-          :initform (error "must provide insertion stack")
-          :reader stack)))
+(defstruct undo-state
+  (ast (error "must provide ast"))
+  (stack (error "must provide focus stack") :type list))
 
 (defclass selection ()
   (;; tracks the stack during selection-mode, for growing and shrinking zippers
@@ -324,7 +319,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
   (focus ui))
 
 (defun save-history (ui)
-  (push (make-instance 'state :stack (stack ui) :ast (ast ui))
+  (push (make-undo-state :stack (stack ui) :ast (ast ui))
         (history ui)))
 
 (defun ast-replace (loc updater ui &optional (stack (stack ui)))
@@ -484,12 +479,27 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
          (typep (parse:op node) 'parse:symbol-ref)
          (not (parse:expanded node)))))
 
+;; (- (/ (+ 1 0.05) 4.5) 0.05) => 0.183333, white text luminance 4.5 contrast max
+;; (loop for i below 10 collect (y-to-grayscale (* 0.183333 (/ i 10))))
+(defparameter *early-grayramp* #(0.0 28.906054 43.281082))
+(defparameter *grayramp* #(53.828465 66.31714 76.54851 85.37362
+                           93.218895 100.33314 106.87614 112.95752))
+
 (defmethod render-node :around (node stack context rect &key)
   (let* ((vals (multiple-value-list (call-next-method)))
          (view (first vals))
          (rect (tui:rect view)))
-    ;; inverse linear scaling, drawing after children isn't ideal
-    (let ((i (truncate (- 255 (/ 255 (1+ (/ (expt (length stack) 1.5) 20)))))))
+    ;; TODO highlight semantically, only for function calls
+    (let* ((real-stack-len (- (length stack) 2))
+           (i (cond ((<= real-stack-len 2)
+                     (truncate (svref *early-grayramp* (min 2 real-stack-len))))
+                    ((<= 3 (length stack) (1- (length *grayramp*)))
+                     (truncate (svref *grayramp* (min (- (length *grayramp*) 1)
+                                                      real-stack-len))))
+                    (t
+                     (min 255 (truncate (+ (last-elt *grayramp*)
+                                           (* (- real-stack-len (1- (length *grayramp*)))
+                                              10))))))))
       (unless (parse:is-atom node)
         (tui:fill-rect (tui:make-style :bg (tui:color i i i))
                        (tui:copy-rect rect :x 0 :y 0) rect
@@ -899,19 +909,19 @@ if none, surround current atom"
   (unless (null (history ui))
     (let ((prev (pop (history ui))))
       (slog 'undo)
-      (push (make-instance 'state :ast (ast ui) :stack (stack ui))
+      (push (make-undo-state :ast (ast ui) :stack (stack ui))
             (future ui))
-      (setf (ast ui) (ast prev)
-            (stack ui) (stack prev)))))
+      (setf (ast ui) (undo-state-ast prev)
+            (stack ui) (undo-state-stack prev)))))
 
 (defun redo (ui)
   (unless (null (future ui))
     (let ((next (pop (future ui))))
       (slog 'redo)
-      (push (make-instance 'state :ast (ast ui) :stack (stack ui))
+      (push (make-undo-state :ast (ast ui) :stack (stack ui))
             (history ui))
-      (setf (ast ui) (ast next)
-            (stack ui) (stack next)))))
+      (setf (ast ui) (undo-state-ast next)
+            (stack ui) (undo-state-stack next)))))
 
 (setf (gethash (tui-sys:make-event :kind #\u :controlp t) *global-key-handlers*)
       (lambda (view ui) view (undo ui)))
@@ -948,7 +958,7 @@ if none, surround current atom"
   (loop for s being the symbols of (find-package "CL") collect (string s)))
 
 (defun symbol-char-p (c)
-  (or (alphanumericp c) (find c "+-*/=<>!?&%$_~^.@[]{}")))
+  (or (alphanumericp c) (find c "+-*/=<>!?&%$_~^.:@[]{}")))
 
 (defmethod handle-key ((node hole) view location ui event)
   (let ((c (tui:event-kind event)))
@@ -1038,7 +1048,7 @@ if none, surround current atom"
   (when (is-regular-char-event event)
     (let ((s (parse:name node))
           (c (tui:event-kind event)))
-      (cond ((symbol-char-p c)
+      (cond ((and (symbol-char-p c) (not (char= c #\:)))
              (let ((newnode
                      (make-instance 'parse:symbol-ref
                                     :name (format nil "~a~a" s (string-upcase c))
@@ -1096,7 +1106,7 @@ if none, surround current atom"
   (when (is-regular-char-event event)
     (let ((s (parse:name node))
           (c (tui:event-kind event)))
-      (cond ((symbol-char-p c)
+      (cond ((and (symbol-char-p c) (not (char= c #\:)))
              (swap-node location
                         (make-instance 'parse:binder
                                        :name (format nil "~a~a" s (string-upcase c))
@@ -1517,7 +1527,7 @@ Relies on children being in reading order, which `ordered-view' checks."
 for every clause keyword, except those following and/else. Forms of a do-like clause after
 its first are aligned with the first, and a loop without keywords has a line per form."
   (let* ((indent 1)
-         (rows (list (cons 0 1)))
+         (rows (list '(0 . 1)))
          (column indent)
          (body-column nil)
          (body-started nil)
@@ -1549,10 +1559,34 @@ its first are aligned with the first, and a loop without keywords has a line per
     (reverse rows)))
 
 (defun macro-call-indentation (op)
-  "`loop-indentation' for loop, else TODO ask slynk."
-  (if (and (typep op 'parse:symbol-ref) (eq (parse:resolve op) 'loop))
-      #'loop-indentation
-      *horizontal*))
+  "`loop-indentation' for loop. Note `op' can be a hole"
+  (if-let (s (and (typep op 'parse:symbol-ref) (parse:resolve op)))
+    (cond ((eq s 'loop) #'loop-indentation)
+          ((member s '(setf psetf psetq)) `((0 . 3) (,(1+ (length (string s))) . 2)))
+          ((fboundp s)
+           (let* ((arglist (slynk-backend:arglist s)))
+             (when (proper-list-p arglist)
+               (let ((arglist (remove '&optional arglist)))
+                 (if-let (index (position-if (lambda (s) (member s '(&rest &body)))
+                                             arglist))
+                   (progn
+                     (when-let (env-pos (position '&environment arglist))
+                       (when (< env-pos index)
+                         (decf index 2)))
+                     (when (member '&whole arglist)
+                       (decf index 2))
+                     (case index
+                       (0 `((0 . 2) (,(1+ (length (string s))) . t)))
+                       (1 `((0 . ,(1+ index)) (1 . t)))
+                       (2 (if (uiop:string-prefix-p "DEF" (string s))
+                              `((0 . 3) (1 . t)) ; e.g. defgeneric, deftype
+                              `((0 . 2) (3 . 1) (1 . t))))
+                       (3 `((0 . 3) (1 . t))) ; e.g. defclass define-condition
+                       (t `((0 . ,(1+ index)) (1 . t)))))
+                   (progn
+                     *horizontal*))))))
+          (t *horizontal*))
+    *horizontal*))
 
 (defmethod render-node ((node parse:macro-call) stack context rect &key)
   (let* ((location (car stack))
@@ -2140,7 +2174,7 @@ ASSUMES we never focus a plain list body."
 ;;; global key handlers
 (defun build-arglist (fname &optional old-body)
   (let* ((arglist (when (fboundp fname) (slynk-backend:arglist fname)))
-         (argcount (if (listp arglist)
+         (argcount (if (proper-list-p arglist)
                        (loop for a in arglist
                              until (member a lambda-list-keywords)
                              count t)
@@ -2673,7 +2707,7 @@ is a list and never focused."
     (tui::clear-buffer tui::*put-buffer*)
     (tui:fill-rect (tui:make-style :bg #x0) screen-rect screen-rect)
     (let* ((content (render-toplevel-window ui))
-           (offset (slog (scroll-state-viewport-row (scroll-state ui)))))
+           (offset (scroll-state-viewport-row (scroll-state ui))))
       (when-let (focus-rect (focus-rect ui))
         (let* ((y (max 0 (- (tui:rect-y focus-rect) offset)))
                (rect (tui:clamp-rect

@@ -93,7 +93,8 @@
       (setf *state* tui)
       (setf (location-node root-loc) tui)
 
-      ;; set default background to black (xterm extension)
+      ;; set default background to black and fore to pure white (xterm extension)
+      (format *terminal-io* "~c]10;#ffffff~c" #\esc (code-char 7))
       (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))
       (unwind-protect
            (tui:run tui :redisplay-on-input t)
