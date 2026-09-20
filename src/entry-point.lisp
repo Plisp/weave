@@ -30,7 +30,8 @@
   "Returns the ASDF system and source component corresponding to `file'."
   (let ((target (truename file)))
     (dolist (asd (ancestor-asd-files target))
-      (asdf:load-asd asd)
+      (unless (asdf:component-loaded-p (pathname-name asd))
+        (asdf:load-asd asd))
       (let ((matches
               (remove-if-not
                (lambda (entry)

@@ -2817,3 +2817,6 @@ is a list and never focused."
   (setf (redisplayed-since-input ui) nil)
   (tui:redisplay ui)
   (setf (redisplayed-since-input ui) t))
+
+(defmethod tui:handle-resize :after ((ui ui))
+  (setf (redisplayed-since-input ui) nil))

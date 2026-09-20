@@ -1718,7 +1718,7 @@ Any binding forces a symbol match.
                          (ecase ctx-kind
                            ((&body &rest &declarations &rest-qualifiers nil)
                             (error "unimplemented"))
-                           ((&lambda &macro-lambda &method-lambda)
+                           ((&lambda &macro-lambda)
                             (let* ((whole (cdr (assoc par-tag bind-rest-tags)))
                                    (code-tag (lastcar (cdr (assoc whole rest-patterns)))))
                               (with-gensyms (newenv name info)
@@ -1745,8 +1745,13 @@ Any binding forces a symbol match.
                             (with-gensyms (newenv info)
                               `(loop with ,newenv := ,(augment-env `env entries)
                                      for ,info in ,ctx-tag
-                                     do ,(walk-function-body newenv info ; vv CAPTURED
-                                                             `newenv-with-params))))))))))))
+                                     do ,(walk-function-body
+                                          newenv info
+                                          (if (eq ctx-kind '&method-lambda)
+                                              `(env-with-functions newenv-with-params
+                                                                   '(call-next-method
+                                                                     next-method-p))
+                                              `newenv-with-params)))))))))))))
              ;; alter-identity should return the new form
              (defun ,(symbolicate name "-PARSER") (rawform env walker alter-identity)
                (declare (ignorable env walker alter-identity))
@@ -1767,9 +1772,12 @@ Any binding forces a symbol match.
                                 with body := (list)
                                 with lambda-list
                                   := (flet ((note-binder (binder)
-                                              (if (typep binder 'symbol-ref)
-                                                  (change-class binder 'binder)
-                                                  binder)))
+                                              (when (typep binder 'symbol-ref)
+                                                (change-class binder 'binder))
+                                              (setf newenv-with-params
+                                                    (env-with-variables newenv-with-params
+                                                                        `(,binder)))
+                                              binder))
                                        ,(if (eq kind '&macro-lambda)
                                             `(map-macro-lambda
                                               (function-info-arglist ,info)
@@ -1901,8 +1909,15 @@ Any binding forces a symbol match.
                             (with-gensyms (newenv)
                               `(let ((,newenv ,(augment-env `env entries)))
                                  (setf (,tag ast)
-                                       ,(walk-function-body newenv `(first ,tag)
-                                                            `newenv-with-params tag-kind))))))))))
+                                       ,(walk-function-body
+                                         `,newenv
+                                         `(first ,tag)
+                                         (if (eq tag-kind '&method-lambda)
+                                             `(env-with-functions newenv-with-params
+                                                                  '(next-method-p
+                                                                    call-next-method))
+                                             `newenv-with-params)
+                                         tag-kind))))))))))
                   ast)))
              ))
        (setf (gethash ',name *special-walkers*) ',(symbolicate name "-WALKER"))
@@ -1991,10 +2006,14 @@ other atom."
                         ((setf-op name) &rest-qualifiers qualifiers &method-lambda fun-code))
   :binds ((fun-code :function name :block name)))
 
+(defun binderfy (symbol)
+  (make-instance 'binder :name (symbol-name symbol) :home-package (symbol-package symbol)))
 (defmethod location-bindings ((node defmethod-form) id)
   (check-evaluated node id)
   (when (eq 'fun-code (id-slot id))
-    (append (bindings-of :function (list (name node)))
+    (append (bindings-of :function (list (name node)
+                                         (binderfy 'call-next-method)
+                                         (binderfy 'next-method-p)))
             (bindings-of :block (list (name node))))))
 
 (defform (let (&rest vars)
