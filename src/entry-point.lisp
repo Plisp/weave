@@ -60,7 +60,7 @@
         (*package* *package*))
     (loop
       (multiple-value-bind (ast end)
-          (parse:parse-from-string client source :start start)
+          (parse:parse-from-string client :start start)
         (unless ast
           (return (values (or (nreverse forms) (list (hole))) end)))
         (push ast forms)
@@ -88,9 +88,10 @@
   (let ((ast-list (if astp ast (demo-ast))))
     (check-type ast-list cons)
     (let* ((root-loc (make-location :node 'undefined))
-           (tui (make-instance 'ui :ast ast-list :stack (list (make-location :node ast-list
-                                                                             :id 0)
-                                                              root-loc))))
+           (tui (make-instance 'ui :ast ast-list
+                                   :stack (list (make-location :node ast-list
+                                                               :id 0)
+                                                root-loc))))
       (setf *state* tui)
       (setf (location-node root-loc) tui)
 
@@ -106,7 +107,8 @@
     (if (interactive-stream-p *standard-output*)
         (tui-main ast)
         (progn
-          (bt:make-thread (lambda () (tui-main ast)))
+          (bt:make-thread (lambda () (tui-main ast))
+                          :initial-bindings `((*package* . ,*package*)))
           (loop :for (form . value) = (sb-concurrency:receive-message *log*)
                 :until (eq value *log-stop*)
                 :do (if form

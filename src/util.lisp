@@ -10,6 +10,7 @@
            #:with-lookup #:or-f #:+fail+
            #:string-drop #:split-string
            #:flex-vector
+           #:external-symbol-p
            ))
 (in-package #:weave-utils)
 
@@ -97,3 +98,6 @@ structure with `tree'."
 
 (defun flex-vector ()
   (make-array 0 :fill-pointer t :adjustable t))
+
+(defun external-symbol-p (s p)
+  (eq :external (nth-value 1 (find-symbol s p))))

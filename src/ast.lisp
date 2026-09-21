@@ -17,7 +17,7 @@
            #:form-slot-kinds
 
            #:eval-form #:symbol-ref #:binder #:literal
-           #:reader-marker #:read-quasiquote #:read-quote #:read-function
+           #:reader-marker #:read-quasiquote #:read-quote #:read-function #:read-eval
            #:resolve
 
            #:function-call
@@ -757,14 +757,14 @@ Otherwise in the walker just returns elements."
   "Resolves `wrapper' to an actual symbol in its home package or NIL when it is absent
 (indicated by second return value) perhaps as a result of editing, or a fresh uninterned
 symbol when it has no home package. Always returns a symbol."
-  (assert (typep wrapper 'symbol-ref))
+  (check-type wrapper symbol-ref)
   (if-let (p (home-package wrapper))
     (find-symbol (name wrapper) p)
     (values (make-symbol (name wrapper)) '#:uninterned)))
 
 (defun ref-coerce-symbol (s)
   "Converts binding names to an appropriate symbol for storing in an environment."
-  (assert (typep s '(or symbol binder hole)))
+  (check-type s binding-name)
   (cond ((symbolp s) s)
         ((typep s 'hole) (make-symbol "HOLE"))
         (t (resolve s))))
@@ -772,7 +772,8 @@ symbol when it has no home package. Always returns a symbol."
 (labels ((ref-find-kw (elt symbols)
            (typecase elt
              (symbol (find elt symbols))
-             (symbol-ref (find (name elt) symbols :test #'string=)))))
+             (symbol-ref (and (eq (home-package elt) #.(find-package "CL"))
+                              (find (name elt) symbols :test #'string=))))))
   ;; we need to be more permissive for lambda lists. It makes little sense to preserve
   ;; well-formedness when it often breaks with edits due to positional &keyword context
   ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
@@ -885,7 +886,8 @@ symbol when it has no home package. Always returns a symbol."
                  ((or (typep this 'dot-marker)
                       (and (gen-list-p this) (null (elements this)))
                       (and (typep this 'symbol-ref)
-                           (string= (name this) "NIL")))
+                           (string= (name this) "NIL")
+                           (eq (home-package this) #.(find-package "CL"))))
                   (push (funcall on-syntax this) res))
                  ((gen-list-p this)
                   (push (map-macro-lambda this on-binder value-mapper on-syntax on-name)
@@ -3054,11 +3056,11 @@ passed with dynamic extent."
   "Parses `syntax' as toplevel code, keeping anchors."
   (parse syntax (make-env :%function-bindings '(read-eval)) #'copy-anchors))
 
-(defun parse-from-string (client source &key (start 0))
+(defun parse-from-string (client &key (start 0))
   "Parses one top-level form and returns it with the index at which reading stopped."
   (setf (source-offset client) start)
   (multiple-value-bind (form end leading-comments)
-      (eclector.parse-result:read-from-string client source nil nil :start start)
+      (eclector.parse-result:read-from-string client (source client) nil nil :start start)
     (if (null form)
         (values nil end leading-comments)
         (let ((result (parse-syntax form)))

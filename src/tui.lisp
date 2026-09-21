@@ -22,7 +22,7 @@
 (in-package #:weave-tui)
 
 ;; dynamic vars for debugging, should not be used
-(defvar *state*)
+(defvar *state* #.nil)
 (defvar *log* (sb-concurrency:make-mailbox :name "log"))
 (defvar *log-stop* (gensym))
 (defmacro slog (form)
@@ -453,7 +453,9 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
               do (loop for (k . binder) in (bindings-at loc ui)
                        do (when (and (eq k kind)
                                      (typep binder 'parse:binder) ; ignore holes
-                                     (string= name (parse:name binder)))
+                                     (string= name (parse:name binder))
+                                     (eq (parse:home-package node)
+                                         (parse:home-package binder)))
                             (return-from compute-focus-binder binder))))))))
 
 (defun focus-binder (ui)
@@ -480,60 +482,11 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
          (typep (parse:op node) 'parse:symbol-ref)
          (not (parse:expanded node)))))
 
-;; (- (/ (+ 1 0.05) 4.5) 0.05) => 0.183333, white text luminance 4.5 contrast max
-;; (loop for i below 10 collect (y-to-grayscale (* 0.183333 (/ i 10))))
-(defparameter *early-grayramp* #(0.0 28.906054 43.281082))
-(defparameter *grayramp* #(53.828465 66.31714 76.54851 85.37362
-                           93.218895 100.33314 106.87614 112.95752))
-
 (defmethod render-node :around (node stack context rect &key)
   (let* ((vals (multiple-value-list (call-next-method)))
-         (view (first vals))
-         (rect (tui:rect view)))
-    ;; TODO highlight semantically, only for function calls
-    (let* ((real-stack-len (- (length stack) 2))
-           (i (cond ((<= real-stack-len 2)
-                     (truncate (svref *early-grayramp* (min 2 real-stack-len))))
-                    ((<= 3 (length stack) (1- (length *grayramp*)))
-                     (truncate (svref *grayramp* (min (- (length *grayramp*) 1)
-                                                      real-stack-len))))
-                    (t
-                     (min 255 (truncate (+ (last-elt *grayramp*)
-                                           (* (- real-stack-len (1- (length *grayramp*)))
-                                              10))))))))
-      (unless (parse:is-atom node)
-        (tui:fill-rect (tui:make-style :bg (tui:color i i i))
-                       (tui:copy-rect rect :x 0 :y 0) rect
-                       :blend 0.1)))
-    (if (eq node (focus-binder context))
-        (tui:fill-rect (tui:make-style :bg (tui:color #x85 #x99 #x00))
-                       (tui:copy-rect rect :x 0 :y 0) rect
-                       :blend 0.4)
-        (when (and (lexical-symbol-ref node (car stack))
-                   (not (symbol-ref-boundp node stack context)))
-          (tui:fill-rect (tui:make-style :bg (tui:color #xcb #x4b #x16))
-                         (tui:copy-rect rect :x 0 :y 0) rect
-                         :blend 0.4)))
-    (when (unexpanded-macro-op-p (car stack))
-      (tui:fill-rect (tui:make-style :bg (tui:color #xdc #x32 #x2f))
-                     (tui:copy-rect rect :x 0 :y 0) rect
-                     :blend 0.4))
-    (when (location-selected-p context stack)
-      (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
-                     (tui:copy-rect rect :x 0 :y 0) rect
-                     :blend 0.4))
-    (when (zipper-top-p context stack)
-      (dolist (form (selection-forms (selection context)))
-        (when-let (view (gethash form (node-views context)))
-          (let ((form-rect (tui:rect view)))
-            (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
-                           (tui:copy-rect form-rect :x 0 :y 0) form-rect
-                           :blend 0.4))))
-      (tui:fill-rect (tui:make-style :bg (tui:color #xb5 #x89 #x00))
-                     (tui:copy-rect rect :x 0 :y 0) rect
-                     :blend 0.2))
-    ;; save window
+         (view (first vals)))
     (setf (gethash node (node-views context)) view)
+    ;; occasionally draws body lists
     (when (typep view 'ast-view)
       (setf (view-stack view) stack))
     (when (location= (car stack) (focus context))
@@ -577,14 +530,15 @@ since these aren't a proper location."
             (setf (completion-state ui) nil)
             (progn ;; note: if we're typing then we've already converted symbol->string
               (let* ((name (parse:name anchor))
-                     (valid (delete-if-not (lambda (s) (starts-with-subseq name s))
+                     (valid (delete-if-not (lambda (s) (starts-with-subseq name (string s)))
                                            candidates))
                      (exact-match (find name valid :test #'string=)))
                 (if exact-match
                     (setf candidates
                           (sort valid #'<
                                 :key (lambda (s)
-                                       (mk-string-metrics:damerau-levenshtein s name))))
+                                       (mk-string-metrics:damerau-levenshtein
+                                        name (string s)))))
                     (setf candidates valid)))))))
     (assert (not (plain-body-location-p (focus ui))) ()
             "focused the body ~a of ~a" (location-id (focus ui))
@@ -594,16 +548,17 @@ since these aren't a proper location."
   (parse:name (parse:name node)))
 
 ;; note: assumes length 1 symbol mapping for <= and >=
-(defparameter *arb-arity-binops* #("/" "*" "+" "-" "<" ">" "<=" ">=" "=" "/="))
-(defun binop-precedence (op)
-  (trivia:ematch (string op)
-    ((or "*") 3)
-    ((or "/" "+" "-") 2)
-    ((or "<" ">" "<=" ">=" "=" "/=") 1)))
+(defparameter *arb-arity-binops* #(/ * + - < > <= >= = /=))
+(defun binop-precedence (op-ref)
+  (trivia:ematch (parse::ref-coerce-symbol op-ref)
+    ((or *) 3)
+    ((or / + -) 2)
+    ((or < > <= >= = /=) 1)))
 
 (defun is-binop-call (node)
   (and (typep node 'parse:function-call)
-       (find (fname node) *arb-arity-binops* :test #'string=)))
+       (typep (parse:name node) 'parse:symbol-ref)
+       (find (parse:resolve (parse:name node)) *arb-arity-binops*)))
 
 (defun wrap-arith (op ui)
   "take first arithmetic operator with greater precedence than `op'
@@ -613,7 +568,7 @@ if none, surround current atom"
           for loc in (stack ui)
           for node = (location-node loc)
           while (and (is-binop-call node)
-                     (> (binop-precedence (fname node)) (binop-precedence op)))
+                     (> (binop-precedence (parse:name node)) (binop-precedence op)))
           finally (let ((sym (make-instance 'parse:symbol-ref
                                             :name (symbol-name op)
                                             :home-package (symbol-package op)))
@@ -626,15 +581,15 @@ if none, surround current atom"
                     (descend ui '(parse:body 1)))
                   (return t))))
 
-(loop for s across *arb-arity-binops*
-      do (when (= 1 (length s))
+(loop for sym across *arb-arity-binops*
+      for s = (string s)
+      do (when (= 1 (length (string s)))
            (setf (gethash (tui-sys:make-event :kind (schar s 0) :altp t)
                           *global-key-handlers*)
-                 ;; note: bug if we don't compute from s prior to its mutation by loop
-                 (let ((sym (intern s)))
-                   (lambda (view ui)
-                     (declare (ignore view))
-                     (wrap-arith sym ui))))))
+                 ;; oops old bug if we don't compute from s prior to its mutation by loop
+                 (lambda (view ui)
+                   (declare (ignore view))
+                   (wrap-arith sym ui)))))
 
 (setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
       (lambda (view ui)
@@ -868,7 +823,7 @@ if none, surround current atom"
   (end-selection-mode ui)
   (let ((old (stack ui)))
     (when-let (new-stack (parent-stack old))
-      (slog* `(moving to ,new-stack))
+      (slog* `(moving to ,(butlast new-stack 2))) ; depends on toplevel list
       (setf (goal-stacks ui) (cons old (when (goal-valid-p ui)
                                          (goal-stacks ui)))
             (stack ui) new-stack))))
@@ -956,7 +911,7 @@ if none, surround current atom"
 
 (defun completion-candidates (context)
   (declare (ignore context))
-  (loop for s being the symbols of (find-package "CL") collect (string s)))
+  (loop for s being the symbols of (find-package "CL") collect s))
 
 (defun symbol-char-p (c)
   (or (alphanumericp c) (find c "+-*/=<>!?&%$_~^.:@[]{}")))
@@ -978,9 +933,17 @@ if none, surround current atom"
            ((digit-char-p c)
             (let ((newnode (make-instance 'parse:literal :str (string c))))
               (swap-node location newnode ui)))
-           ((char= c #\`)
-            (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
-              (swap-node location newnode ui)))))
+           ;; ((char= c #\`)
+           ;;  (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
+           ;;    (swap-node location newnode ui)
+           ;;    (focus-first-hole ui)
+           ;;    t))
+           ((char= c #\')
+            (let ((newnode (make-instance 'parse:quote-form :op 'parse:read-quote
+                                                            :thing (hole))))
+              (swap-node location newnode ui)
+              (focus-first-hole ui)
+              t))))
         ((or (eql 'parse:fun-designator) (eql 'parse:symbol-ref))
          (when (and (symbol-char-p c) (not (digit-char-p c)))
            (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
@@ -1031,12 +994,13 @@ if none, surround current atom"
                    (swap-node location (hole) ui)))
              t)))))
 
-(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (* . #\×) (/= . #\≠) (lambda . "λ")))
+(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (/= . #\≠) (lambda . "λ")))
 
 (defparameter *reader-punctuation* '((parse:read-quote . "'")
                                      (parse:read-function . "#'")
                                      (parse:read-quasiquote . "`")
-                                     (unquote . ",") (unquote-splicing . ",@")))
+                                     (unquote . ",") (unquote-splicing . ",@")
+                                     (parse:read-eval . "#.")))
 
 (defun to-read-syntax (name)
   (case name
@@ -1047,20 +1011,40 @@ if none, surround current atom"
     (eclector.reader:unquote-splicing 'unquote-splicing)
     (t name)))
 
-(defun symbol-ref-text (node)
-  (if (typep node 'parse:reader-marker)
-      (or (assoc-value *reader-punctuation* (to-read-syntax (parse:resolve node)))
-          (string (parse:name node)))
-      (let ((name (parse:name node)))
-        (if (eq (parse:home-package node) (find-package :keyword))
-            (format nil ":~(~a~)" name)
-            (if-let (exp (assoc-value *symbol-mappings* name :test #'string=))
-              (string exp)
-              (string-downcase name))))))
+(defun string-and-package= (node sym)
+  "Suitable as a comparison predicate between symbol-ref, symbol"
+  (and (string= (parse:name node) sym)
+       (eq (parse:home-package node) (symbol-package sym))))
+
+(defun symbol-ref-text (node &optional use-mappings)
+  (let ((name (parse:name node)))
+    (cond
+      ((typep node 'parse:reader-marker)
+       (or (assoc-value *reader-punctuation* (to-read-syntax (parse:resolve node)))
+           (string name))) ; dot
+      ((eq (parse:home-package node) (find-package :keyword))
+       (format nil ":~(~a~)" name))
+      (t
+       (if-let (exp (and use-mappings
+                         (assoc-value *symbol-mappings* node :test #'string-and-package=)))
+         (string exp)
+         (if-let (nick (car (rassoc (parse:home-package node)
+                                    (sb-ext:package-local-nicknames *package*))))
+           (format nil "~(~a:~a~)" nick name)
+           (if-let (package (parse:home-package node))
+             (if (nth-value 1 (find-symbol (parse:name node)))
+                 (format nil "~(~a~)" name)
+                 (format nil "~(~a~a~a~)"
+                         (first (sort `(,@(package-nicknames package) ; copied
+                                        ,(package-name package))
+                                      #'< :key #'length))
+                         (if (external-symbol-p (parse:name node) package) ":" "::")
+                         name))
+             (format nil "#:~(~a~)" name))))))))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect &key)
   (let* ((location (car stack))
-         (str (symbol-ref-text node))
+         (str (symbol-ref-text node t))
          (focused (location= location (focus context))))
     (tui:puts* str 1 1 rect)
     (make-instance 'ast-view
@@ -1096,7 +1080,7 @@ if none, surround current atom"
 
 (defmethod render-node ((node parse:binder) stack context rect &key)
   (let* ((location (car stack))
-         (str (string-downcase (parse:name node)))
+         (str (symbol-ref-text node nil))
          (focused (location= location (focus context))))
     (tui:puts* str 1 1 rect (tui:make-style :italicp t))
     (make-instance 'ast-view
@@ -1110,9 +1094,9 @@ if none, surround current atom"
 (defun render-symbol-space (op loc stack context rect)
   "Renders `loc' as a bare focusable token for `op', a string designator,
 with a space after it unless specified."
-  (let* ((text (if-let (exp (assoc-value *reader-punctuation* op :test #'string=))
+  (let* ((text (if-let (exp (assoc-value *reader-punctuation* op))
                  (string exp)
-                 (if-let (exp (assoc-value *symbol-mappings* op :test #'string=))
+                 (if-let (exp (assoc-value *symbol-mappings* op))
                    (format nil "~(~a~) " exp)
                    (format nil "~(~a~) " op))))
          (focused (location= loc (focus context)))
@@ -1214,14 +1198,15 @@ Relies on children being in reading order, which `ordered-view' checks."
          (focused (location= location (focus context)))
          (head (first (elements l))))
     (flet ((contents (rect)
-             (render-elements (elements l) indent (list-locator location)
-                              (cdr stack) context rect
-                              `(,@(when (eq delimited t) '(:delimited t))
-                                ,@(when transform `(:transform ,transform))
-                                ;; raw specs are not meant to be recursively applied
-                                ;; to nested syntax. note: propagation should stop at any
-                                ;; evaluated form, which supplies its own drawing rules
-                                ,@(when (functionp indent) `(:indent ,indent))))))
+             (render-elements
+              (elements l) indent (list-locator location)
+              (cdr stack) context rect
+              `(,@(when (eq delimited t) '(:delimited t))
+                ,@(when transform `(:transform ,transform))
+                ;; raw specs are not meant to be recursively applied
+                ;; to nested syntax. note: propagation should stop at any
+                ;; evaluated form, which supplies its own drawing rules
+                ,@(when (functionp indent) `(:indent ,indent))))))
       (if (and delimited (not (typep head 'parse:reader-marker)))
           (let* ((handle (make-location :node l :id :open))
                  (open (render-delimiter (car *list-delimiters*) handle
@@ -1239,21 +1224,31 @@ Relies on children being in reading order, which `ordered-view' checks."
               (setf (tui:key-handler open) (global-key-handler l handle context)
                     (tui:focused open) t
                     (gethash :focus-view (redisplay-cache context)) open))
-            (make-instance 'ordered-view
+            (make-instance 'ast-view
+                           :location (car stack)
                            :key-handler (global-key-handler l location context)
                            :focused focused
                            :rect (tui:copy-rect
-                                  rect
-                                  :rows (max 1 (tui:rect-rows (tui:rect inner)))
-                                  :cols (- (max (tui:rect-x2 (tui:rect inner))
-                                                (tui:rect-x2 (tui:rect close)))
-                                           (tui:rect-x rect)))
+                                  rect :rows (max 1 (tui:rect-rows (tui:rect inner)))
+                                       :cols (- (max (tui:rect-x2 (tui:rect inner))
+                                                     (tui:rect-x2 (tui:rect close)))
+                                                (tui:rect-x rect)))
                            :children (list open inner close)))
-          (let ((view (if (elements l)
-                          (contents rect)
-                          (render-delimiter (format nil "~a~a" (car *list-delimiters*)
-                                                    (cdr *list-delimiters*))
-                                            location stack rect :hoverable t))))
+          (let* ((content (contents rect))
+                 (view (if (elements l)
+                           (make-instance
+                            'ast-view
+                            :location (car stack)
+                            :key-handler (global-key-handler l location context)
+                            :focused focused
+                            :rect (tui:copy-rect
+                                   rect :rows (max 1 (tui:rect-rows (tui:rect content)))
+                                        :cols (- (tui:rect-x2 (tui:rect content))
+                                                 (tui:rect-x rect)))
+                            :children (list content))
+                           (render-delimiter (format nil "~a~a" (car *list-delimiters*)
+                                                     (cdr *list-delimiters*))
+                                             location stack rect :hoverable t))))
             (setf (tui:key-handler view) (global-key-handler l location context)
                   (tui:focused view) focused)
             view)))))
@@ -1375,10 +1370,9 @@ Relies on children being in reading order, which `ordered-view' checks."
 ;;   - higher arity duplicated op views break invariant: always a single focused view
 ;; - for 2 arg division, draw horizontally. maybe future: (f)floor/ceiling/truncate
 (defmethod render-node ((node parse:function-call) stack context rect &key)
-  (cond
+  (trivia:match (and (= 2 (length (parse:body node))) (is-binop-call node))
     ;; note this case must go first since division is a binop
-    ((and (string= (fname node) "/")
-          (= 2 (length (parse:body node))))
+    ('cl:/
      (let* ((location (car stack))
             (arg1-view (render-node
                         (first (parse:body node))
@@ -1409,7 +1403,7 @@ Relies on children being in reading order, which `ordered-view' checks."
        (when (location= div-loc (focus context))
          (setf (gethash :focus-view (redisplay-cache context)) line-view))
        (tui:puts* (make-string width :initial-element #\─)
-              (1+ (tui:rect-rows arg1-rect)) 1 rect)
+                  (1+ (tui:rect-rows arg1-rect)) 1 rect)
        ;;
        (make-instance 'ast-view
                       :location location
@@ -1420,14 +1414,11 @@ Relies on children being in reading order, which `ordered-view' checks."
                       :key-handler (global-key-handler node location context)
                       :focused (location= location (focus context)))))
     ;; need wrapper for args
-    ((and (find (fname node) *arb-arity-binops* :test #'string=)
-          (= 2 (length (parse:body node))))
+    ((and op (not nil))
      (flet ((is-bracketed (arg)
-              (and (is-binop-call node) (is-binop-call arg)
-                   (or (> (binop-precedence (fname node)) (binop-precedence (fname arg)))
-                       (and (string= (fname node) "-")
-                            (or (string= (fname arg) "+")
-                                (string= (fname arg) "-")))))))
+              (when-let (arg-op (is-binop-call arg))
+                (or (> (binop-precedence op) (binop-precedence arg-op))
+                    (and (eq op 'cl:-) (member arg-op '(cl:+ cl:-)))))))
        (let* ((location (car stack))
               (arg1 (first (parse:body node)))
               (arg1-bracketed (is-bracketed arg1))
@@ -1507,7 +1498,7 @@ Relies on children being in reading order, which `ordered-view' checks."
                         :children (list arg1-view op-view arg2-view)
                         :key-handler (global-key-handler node location context)
                         :focused (location= location (focus context))))))
-    (t
+    (_
      (let* ((location (car stack))
             (name-view (render-node (parse:name node)
                                     (cons (make-location :node node :id 'parse:name) stack)
@@ -2240,7 +2231,7 @@ ASSUMES we never focus a plain list body."
 
 (defun build-call (ref &optional old-body)
   "ref must be a symbol-ref"
-  (assert (typep ref 'parse:symbol-ref))
+  (check-type ref parse:symbol-ref)
   (let ((fname (parse:resolve ref)))
     (if-let (expansion (gethash fname *default-expansions*))
       (funcall expansion)
@@ -2299,7 +2290,7 @@ addressed by indices."
         (declare (ignore view))
         (when-let* ((state (completion-state ui))
                     (selection (nth (selection state) (candidates state))))
-          (let ((s (find-symbol selection)))
+          (let ((s selection))
             (cond
               ((fboundp s)
                (let ((name-node (make-instance 'parse:symbol-ref
@@ -2431,8 +2422,7 @@ addressed by indices."
                         (list (funcall template))
                         (ref-list (funcall template))))
           ((listp value) (list (hole)))
-          (t (assert (typep value 'ref-list))
-             nil))))
+          (t (check-type value ref-list)))))
 
 (defun cut-selection (ui selection)
   "Cuts the current selection or zipper, modifying the ast."
@@ -2581,7 +2571,7 @@ modifying the ast."
         t))
 
 ;;; completions
-(defun render-completion (name index state rect)
+(defun render-completion (sym index state rect)
   (when (plusp (tui:rect-rows rect))
     (let ((prefix (parse:name (anchor state)))
           (selectedp (= index (selection state))))
@@ -2596,7 +2586,7 @@ modifying the ast."
                        :char #\space)
         (tui:puts* (string-downcase prefix) 1 1 rect (style t))
         (tui:puts* (string-downcase
-                (nth-value 1 (starts-with-subseq prefix name :return-suffix t)))
+                    (nth-value 1 (starts-with-subseq prefix (string sym) :return-suffix t)))
                1 (+ 1 (length prefix)) rect (style nil)))
       (make-instance 'tui:view :rect (tui:copy-rect rect :rows 1)))))
 
@@ -2604,8 +2594,8 @@ modifying the ast."
   (when-let (state (completion-state ui))
     (let* ((anchor (anchor state))
            (anchor-rect (tui:rect (gethash anchor (node-views ui))))
-           (maxlen (loop for c in (candidates state)
-                         maximize (tui:display-width c)))
+           (maxlen (loop for candidate in (candidates state)
+                         maximize (tui:display-width (string candidate))))
            (rect (tui:clamp-rect
                   (tui:make-rect :x (tui:rect-x anchor-rect)
                                  :y (max 0 (1+ (- (tui:rect-y anchor-rect) row-offset)))
@@ -2754,6 +2744,69 @@ is a list and never focused."
 ;;; main render loop
 ;;
 
+;; using oklab
+(defparameter *early-grayramp* #(0 7 #xb))
+(defparameter *mid-grayramp* #(#x10 #x16 #x1c #x20 #x28 #x2e #x34 #x3b #x41 #x48 #x4e #x50
+                               #x5c #x63 #x6a #x71))
+
+(defun transform-rect-to-screen (rect offset screen-rect)
+  (let ((y (max 0 (- (tui:rect-y rect) offset))))
+    (tui:clamp-rect
+     ;; consider rect-y before offset
+     (tui:copy-rect rect :y y
+                         :rows (max 0 (- (- (tui:rect-y2 rect) offset)
+                                         y)))
+     screen-rect)))
+
+(defun draw-highlights (ui view offset screen-rect)
+  (tui:view-traverse
+   view
+   (lambda (view)
+     (when (typep view 'ast-view)
+       (let* ((stack (view-stack view))
+              (node (node-at (car stack)))
+              (rect (transform-rect-to-screen (tui:rect view) offset screen-rect))
+              (real-stack-len (- (length stack) 2))
+              (i (cond
+                   ((<= real-stack-len 2)
+                    (truncate (svref *early-grayramp* (min 2 real-stack-len))))
+                   ((<= 3 real-stack-len (1- (length *mid-grayramp*)))
+                    (truncate (svref *mid-grayramp* (min (1- (length *mid-grayramp*))
+                                                         real-stack-len))))
+                   (t
+                    (min 255 (truncate (+ (last-elt *mid-grayramp*)
+                                          (* (- real-stack-len (1- (length *mid-grayramp*)))
+                                             10))))))))
+         (unless (parse:is-atom node)
+           (tui:fill-rect (tui:make-style :bg (tui:color i i i))
+                          (tui:copy-rect rect :x 0 :y 0) rect))
+         ;;
+         (if (eq node (focus-binder ui))
+             (tui:fill-rect (tui:make-style :bg (tui:color #x85 #x99 #x00))
+                            (tui:copy-rect rect :x 0 :y 0) rect)
+             (when (and (lexical-symbol-ref node (car stack))
+                        (not (symbol-ref-boundp node stack ui)))
+               (tui:fill-rect (tui:make-style :bg (tui:color #xcb #x4b #x16))
+                              (tui:copy-rect rect :x 0 :y 0) rect)))
+         ;;
+         (when (unexpanded-macro-op-p (car stack))
+           (tui:fill-rect (tui:make-style :bg (tui:color #xdc #x32 #x2f))
+                          (tui:copy-rect rect :x 0 :y 0) rect))
+         ;;
+         (when (location-selected-p ui stack)
+           (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
+                          (tui:copy-rect rect :x 0 :y 0) rect))
+         ;;
+         (when (zipper-top-p ui stack)
+           (dolist (form (selection-forms (selection ui)))
+             (when-let (view (gethash form (node-views ui)))
+               (let ((form-rect (tui:rect view)))
+                 (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
+                                (tui:copy-rect form-rect :x 0 :y 0) form-rect))))
+           (tui:fill-rect (tui:make-style :bg (tui:color #xb5 #x89 #x00))
+                          (tui:copy-rect rect :x 0 :y 0) rect))))
+     t)))
+
 (defmethod tui:render ((ui ui))
   ;; clear previous redisplay caches
   (clrhash (node-views ui))
@@ -2765,13 +2818,10 @@ is a list and never focused."
     (tui:fill-rect (tui:make-style :bg #x0) screen-rect screen-rect)
     (let* ((content (render-toplevel-window ui))
            (offset (scroll-state-viewport-row (scroll-state ui))))
+      (draw-highlights ui content offset screen-rect)
+      ;; draw focus after
       (when-let (focus-rect (focus-rect ui))
-        (let* ((y (max 0 (- (tui:rect-y focus-rect) offset)))
-               (rect (tui:clamp-rect
-                      (tui:copy-rect focus-rect :y y
-                                                :rows (max 0 (- (tui:rect-y2 focus-rect)
-                                                                offset y)))
-                      screen-rect)))
+        (let ((rect (transform-rect-to-screen focus-rect offset screen-rect)))
           (tui:fill-rect (tui:make-style :bg #xb58900)
                          (tui:copy-rect rect :x 0 :y 0) rect
                          :blend 0.5)))

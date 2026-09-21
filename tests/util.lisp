@@ -17,7 +17,7 @@
     (t (sx (parse:to-syntax x)))))
 
 (defun parse (source)
-  (parse:parse-from-string (parse:make-client source) source))
+  (parse:parse-from-string (parse:make-client source)))
 
 ;;; ui
 
