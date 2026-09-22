@@ -114,6 +114,70 @@
     (is eq t (parse:expanded (car entry)))
     (is equal '("X") (binder-names entry))))
 
+(define-symbol-macro walker-global-alias (global-payload global-value))
+
+(define-test walker-follows-symbol-macros :parent parser
+  (flet ((seen (form &optional stop)
+           (let (forms)
+             (parse::walk-form form parse::+nullenv+
+                               (lambda (form env)
+                                 (declare (ignore env))
+                                 (push form forms)
+                                 (not (equal form stop))))
+             forms)))
+    (let ((forms (seen '(symbol-macrolet ((alias (payload value))) alias))))
+      (is equal t (not (null (member '(payload value) forms :test #'equal))))
+      (is equal t (not (null (member 'value forms)))))
+    (let ((forms (seen '(symbol-macrolet ((a b) (b (payload value))) a))))
+      (is equal t (not (null (member '(payload value) forms :test #'equal)))))
+    (let ((forms (seen '(symbol-macrolet ((alias (payload value))) 'alias))))
+      (is equal nil (member '(payload value) forms :test #'equal)))
+    (let ((forms (seen '(symbol-macrolet ((alias (payload value))) nil))))
+      (is equal nil (member '(payload value) forms :test #'equal)))
+    (let ((forms (seen '(symbol-macrolet ((alias (payload value)))
+                         (let ((alias nil)) alias)))))
+      (is equal nil (member '(payload value) forms :test #'equal)))
+    (let ((forms (seen '(symbol-macrolet ((alias (payload value))) alias) 'alias)))
+      (is equal nil (member '(payload value) forms :test #'equal)))
+    (let ((forms (seen 'walker-global-alias)))
+      (is equal t (not (null (member '(global-payload global-value) forms :test #'equal)))))
+    (let ((forms (seen '(let ((walker-global-alias nil)) walker-global-alias))))
+      (is equal nil (member '(global-payload global-value) forms :test #'equal)))
+    (let ((forms (seen '(symbol-macrolet ((walker-global-alias nil)) walker-global-alias))))
+      (is equal t (not (null (member nil forms))))
+      (is equal nil (member '(global-payload global-value) forms :test #'equal)))))
+
+(defmacro symbol-macro-body (name form)
+  (let ((alias (gensym "ALIAS")))
+    `(let ((,name nil))
+       (symbol-macrolet ((,alias ,form)) ,alias))))
+
+(define-test symbol-macro-expansions-keep-binding-environments :parent parser
+  (let* ((ast (parse "(weave-tests::symbol-macro-body x (print x))"))
+         (entry (gethash (second (parse:body ast)) (parse:subforms ast))))
+    (is eq t (parse:expanded ast))
+    (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 1)))
+    (is eq 'parse:function-call (type-of (car entry)))
+    (is equal '("X") (binder-names entry))
+    (is equal '(:variable) (gethash (first (parse:body ast)) (cdr entry)))))
+
+(define-test trivia-matched-inputs-are-evaluated :parent parser
+  (dolist (source '("(trivia:match (source value) ((list x) x) (_ nil))"
+                    "(trivia:ematch (source value) ((list x) x))"
+                    "(trivia:cmatch (source value) ((list x) x))"))
+    (let* ((ast (parse source))
+           (entry (gethash (first (parse:body ast)) (parse:subforms ast))))
+      (is eq t (parse:expanded ast))
+      (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 0)))
+      (is eq 'parse:function-call (type-of (car entry)))
+      (is equal "(SOURCE VALUE)" (sx (car entry)))))
+  (let* ((ast (parse "(trivia:match* ((source value) other) (((list x) _) x))"))
+         (entry (gethash (parse:gen-tree-ref (parse:body ast) '(0 0)) (parse:subforms ast))))
+    (is eq t (parse:expanded ast))
+    (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 0 0)))
+    (is eq 'parse:function-call (type-of (car entry)))
+    (is equal "(SOURCE VALUE)" (sx (car entry)))))
+
 (define-test hole-argument-keeps-analysis :parent parser
   (let* ((ast (parse "(loop for x in (xs a) do (print x))"))
          (edited (parse:update ast '(parse:body 3 1) (parse:hole))))

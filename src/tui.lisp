@@ -933,6 +933,7 @@ if none, surround current atom"
            ((digit-char-p c)
             (let ((newnode (make-instance 'parse:literal :str (string c))))
               (swap-node location newnode ui)))
+           ;; needs to deal with comma depth and insertion
            ;; ((char= c #\`)
            ;;  (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
            ;;    (swap-node location newnode ui)
