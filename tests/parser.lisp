@@ -27,6 +27,42 @@
       (is equal "A" (parse:name argument))
       (is equal '("#||#") (mapcar #'parse:str (parse::trailing argument))))))
 
+(define-test reader-prefixes-do-not-consume-matching-operands :parent parser
+  (dolist (case '(("'quote" (quote quote) (0) t)
+                  ("(quote quote)" (quote quote) (0) nil)
+                  ("(#||# quote quote)" (quote quote) (0) nil)
+                  ("#'function" (function function) (0) t)
+                  ("(function function)" (function function) (0) nil)
+                  ("`eclector.reader:quasiquote"
+                   (eclector.reader:quasiquote eclector.reader:quasiquote) (0) t)
+                  ("(eclector.reader:quasiquote eclector.reader:quasiquote)"
+                   (eclector.reader:quasiquote eclector.reader:quasiquote) (0) nil)
+                  ("`(,eclector.reader:unquote)"
+                   (eclector.reader:quasiquote ((eclector.reader:unquote eclector.reader:unquote)))
+                   (1 0 0) t)
+                  ("`(,@eclector.reader:unquote-splicing)"
+                   (eclector.reader:quasiquote
+                    ((eclector.reader:unquote-splicing eclector.reader:unquote-splicing)))
+                   (1 0 0) t)
+                  ("#+(and) 'quote" (quote quote) (0) t)
+                  ("#+(and) (quote quote)" (quote quote) (0) nil)
+                  ("#+(and) #'function" (function function) (0) t)))
+    (destructuring-bind (source expected operator-path markerp) case
+      (let ((syntax (eclector.parse-result:read-from-string (parse:make-client source) source)))
+        (is equal expected
+            (parse::with-quiet-interning (interned)
+              (parse::strip-wrappers syntax interned)))
+        (is eq markerp (typep (parse:gen-tree-ref syntax operator-path) 'parse:reader-marker)))))
+  (let ((ast (parse:parse-from-string (parse:make-client "nil 'quote") :start 4)))
+    (is equal "(QUOTE QUOTE)" (sx ast))))
+
+(define-test trivia-pattern-can-match-the-symbol-quote :parent parser
+  (dolist (source '("(trivia:match v ((list 'quote x) x))"
+                    "(trivia:match v ((list (quote quote) x) x))"))
+    (let ((ast (parse source)))
+      (is eq 'parse:macro-call (type-of ast))
+      (is eq t (parse:expanded ast)))))
+
 ;;; parsing and macro analysis
 
 (define-test holes-parse-as-atoms :parent parser
@@ -71,6 +107,35 @@
 (defmacro copied-separate-scopes (a first-form b second-form)
   `(progn (let ((,a nil)) ,(copy-tree first-form))
           (let ((,b nil)) ,(copy-tree second-form))))
+
+(defmacro duplicated-evaluated (name form reference)
+  `(let ((,name nil)) ,form ,(copy-tree form) ,reference))
+
+(defmacro reconstructed-call ((operator value) after)
+  (declare (ignore operator))
+  `(progn (list ,value) ,after))
+
+(define-test repeated-evaluated-probes-keep-binding-maps :parent parser
+  (let* ((ast (parse "(weave-tests::duplicated-evaluated x (print x) x)"))
+         (binder (first (parse:body ast))))
+    (is eq t (parse:expanded ast))
+    (is = 2 (hash-table-count (parse:subforms ast)))
+    (dolist (source (rest (parse:body ast)))
+      (let ((entry (gethash source (parse:subforms ast))))
+        (is eq t (hash-table-p (cdr entry)))
+        (is equal '("X") (binder-names entry))
+        (is equal '(:variable) (gethash binder (cdr entry)))))))
+
+(define-test rejected-compound-probes-restore-descendants :parent parser
+  (let* ((ast (parse "(weave-tests::reconstructed-call (list x) (print y))"))
+         (source (first (parse:body ast)))
+         (reference (parse:gen-tree-ref source '(1)))
+         (after (second (parse:body ast))))
+    (is eq t (parse:expanded ast))
+    (is eq nil (gethash source (parse:subforms ast)))
+    (is eq reference (car (gethash reference (parse:subforms ast))))
+    (is eq 'parse:function-call (type-of (car (gethash after (parse:subforms ast)))))
+    (is = 2 (hash-table-count (parse:subforms ast)))))
 
 (define-test reconstructed-compound-forms :parent parser
   (let* ((ast (parse "(weave-tests::copied-body x (print (list x)))"))
