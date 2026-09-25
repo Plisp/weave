@@ -169,7 +169,8 @@
                      (is eq form (parse::env-variable-info form subenv))
                      (is eq nil (member form (ldiff (parse::variable-bindings subenv)
                                                    (parse::variable-bindings base-env)))))
-                   t)))))
+                   t))))
+            (constantly nil) (constantly nil))
            :consumed))
       (is eq :consumed result)
       (is eq t expanded))
@@ -194,7 +195,7 @@
            (not (eq outer (parse::probe-info-source info))))
          (lambda (raw env probes)
            (let ((occurrences 0))
-             (is = 2 (hash-table-count probes))
+             (is = 3 (hash-table-count probes))
              (parse::walk-form
               (parse::env-macroexpand raw env) env
               (lambda (form subenv)
@@ -206,7 +207,8 @@
                         (is eq inner (parse::probe-info-source info))
                         (incf occurrences)
                         nil)
-                      t))))
+                      t)))
+              (constantly nil) (constantly nil))
              occurrences)))
       (is = 1 result)
       (is eq t expanded))
@@ -246,9 +248,12 @@
    (lambda (raw base-env probes)
      (parse::walk-probed-expansion
       raw base-env probes
-      (lambda (info sort subenv)
+      (lambda (info namespace subenv)
         (declare (ignore subenv))
-        (not (eq sort (parse::probe-info-sort info))))
+        (not (or (and (eq namespace :exp)
+                      (eq (parse::probe-info-sort info) :exp))
+                 (and (eq (parse::probe-info-sort info) :ref)
+                      (eq namespace (parse::probe-info-namespace info))))))
       (lambda (form subenv) (funcall on-introduced form subenv base-env))))))
 
 (define-test hygiene-hook-walks-introduced-code :parent parser
@@ -344,15 +349,16 @@
        (is eq t
            (parse::walk-probed-expansion
             raw env probes
-            (lambda (info sort subenv)
+            (lambda (info namespace subenv)
               (declare (ignore subenv))
-              (push (list (parse::probe-info-sort info) sort) roles)
+              (push (list (parse::probe-info-sort info)
+                          (parse::probe-info-namespace info) namespace) roles)
               nil)
             (lambda (form subenv)
               (declare (ignore subenv))
               (when (symbolp form) (push form introduced-symbols))
               t)))))
-    (is equal '((:exp :exp) (:variable :ref)) roles)
+    (is equal '((:exp nil :exp) (:binder :variable :variable)) roles)
     (is eq nil (find-if (lambda (sym) (null (symbol-package sym))) introduced-symbols))))
 
 (defvar hygiene-unbound-special)
@@ -365,10 +371,327 @@
 
 (defmacro hygiene-env-marker () nil)
 
+(define-test tagbody-walker-scopes :parent parser
+  (let* ((outer-tags (list 'outer))
+         (env (parse::make-env :%tags outer-tags))
+         (seen nil)
+         (binders nil)
+         (scopes nil))
+    (parse::walk-form
+     '(tagbody (go later) later 17 nil
+        (tagbody (go later) later 23)
+        (go outer))
+     env
+     (lambda (form subenv)
+       (push form seen)
+       (when (and (consp form) (eq (car form) 'go))
+         (push (parse::tags subenv) scopes)
+         (is eq outer-tags (member 'outer (parse::tags subenv))))
+       t)
+     (lambda (tag sort) (push (list tag sort) binders))
+     (constantly nil))
+    (is eq nil (some #'atom seen))
+    (is equal '((later :tag) (17 :tag) (nil :tag) (later :tag) (23 :tag))
+        (nreverse binders))
+    (is equal '((later 17 nil outer) (later 23 later 17 nil outer)
+                (later 17 nil outer))
+        (nreverse scopes))
+    (is eq outer-tags (parse::tags env))))
+
+(define-test tagbody-parser-sorts-and-scopes :parent parser
+  (let* ((source "(tagbody (weave-tests::hygiene-env-marker) later #x10 () :end t
+                   (tagbody (weave-tests::hygiene-env-marker) later 23)
+                   (weave-tests::hygiene-env-marker))")
+         (syntax (probe-driver-syntax source))
+         (labels (subseq (parse:elements syntax) 2 7))
+         (scopes nil)
+         (ast (parse::parse
+               syntax (parse::make-env)
+               (lambda (source ast)
+                 (declare (ignore source))
+                 (when (typep ast 'parse:macro-call)
+                   (parse::with-temporary-interning (interned)
+                     (push (parse::tags (parse::strip-env (parse::call-env ast) interned))
+                           scopes)))
+                 ast))))
+    (is equal '((later 16 nil :end t) (later 23 later 16 nil :end t)
+                (later 16 nil :end t))
+        (nreverse scopes))
+    (is equal '(parse:eval-form parse:binder parse:binder parse:binder
+                parse:binder parse:binder parse:eval-form parse:eval-form)
+        (loop for i below (length (parse:body ast))
+              collect (parse:location-sort ast (list 'parse:body i))))
+    (is eq t (every #'eq labels (subseq (parse:body ast) 1 6)))
+    (is eq 'parse:binder (type-of (second (parse:body ast))))
+    (is equal (reverse labels) (mapcar #'cdr (parse:location-bindings ast '(parse:body 0))))
+    (is eq nil (parse:location-sort ast '(parse:body -1)))
+    (is eq nil (parse:location-sort ast '(parse:body 8)))
+    (is eq nil (parse::tagbody-tag-p (make-instance 'parse:literal :str "1.5")))
+    (is eq nil (parse::tagbody-tag-p (make-instance 'parse:ref-list :kind :vector)))))
+
+(define-test tagbody-shadowed-tags-in-compiler-environment :parent parser
+  (let* ((env (parse::make-env :%tags '(label 1 label 1)
+                              :%variable-bindings '((alias 42))))
+         (source "(tagbody (symbol-macrolet ((alias 42))
+                           (tagbody label 1 (list alias))) label 1)"))
+    (is eql 42 (parse::macroexpand-with-env 'alias env))
+    (is eq 'parse:tagbody-form (type-of (parse source)))))
+
+(define-test loop-labels-are-not-reference-captures :parent parser
+  (multiple-value-bind (bindings references complete)
+      (parse::hygiene-check (probe-driver-syntax "(loop repeat 1 do (print t))")
+                            (parse::make-env))
+    (is eq t complete)
+    (is eq nil (remove-if (lambda (entry) (and (consp entry) (eq :function (car entry))))
+                         references))
+    (is equal '((:block (nil))) (mapcar #'cdr bindings))))
+
+(define-test walker-function-reference-namespaces :parent parser
+  (let ((forms nil)
+        (references nil))
+    (parse::walk-form
+     '(symbol-macrolet ((hygiene-helper hidden-variable))
+        (progn (hygiene-helper) (function hygiene-helper)
+               (function (setf hygiene-helper))
+               (quote (hygiene-quoted))
+               ((lambda () (hygiene-inner)))))
+     (parse::make-env)
+     (lambda (form env) (declare (ignore env)) (push form forms) t)
+     (constantly nil)
+     (lambda (name namespace env)
+       (declare (ignore env))
+       (push (list namespace name) references)))
+    (is equal '((:function hygiene-helper) (:function hygiene-helper)
+                (:function (setf hygiene-helper)) (:function hygiene-inner))
+        (nreverse references))
+    (is eq nil (member 'hygiene-helper forms))
+    (is eq nil (member 'hidden-variable forms))
+    (is eq nil (member 'hygiene-quoted forms)))
+  (let ((references nil))
+    (parse::walk-form '(progn (hygiene-helper)) (parse::make-env)
+                     (constantly nil) (constantly nil)
+                     (lambda (&rest args) (push args references)))
+    (is eq nil references)))
+
+(define-test hygiene-function-reference-scopes :parent parser
+  (dolist (case '(((hygiene-helper) ((:function hygiene-helper)))
+                  ((function hygiene-helper) ((:function hygiene-helper)))
+                  ((function (setf hygiene-helper)) ((:function (setf hygiene-helper))))
+                  ((quote hygiene-helper) nil)
+                  ((let ((hygiene-helper nil)) (hygiene-helper))
+                   ((:function hygiene-helper)))
+                  ((flet ((hygiene-helper () nil))
+                     (hygiene-helper) (function hygiene-helper)) nil)
+                  ((flet ((hygiene-helper () (hygiene-helper))) (hygiene-helper))
+                   ((:function hygiene-helper)))
+                  ((labels ((hygiene-helper () (hygiene-helper))) (hygiene-helper)) nil)
+                  ((symbol-macrolet ((hygiene-helper hidden-variable))
+                     (function hygiene-helper)) ((:function hygiene-helper)))
+                  (((lambda () (hygiene-helper))) ((:function hygiene-helper)))
+                  ((function (lambda () (hygiene-helper))) ((:function hygiene-helper)))
+                  ((macrolet ((hygiene-macro () '(hygiene-helper))) (hygiene-macro))
+                   ((:function hygiene-helper)))))
+    (destructuring-bind (*hygiene-fixture-expansion* expected) case
+      (multiple-value-bind (bindings references complete)
+          (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                               (parse::make-env))
+        (is eq t complete)
+        (is eq nil bindings)
+        (is equal expected references))))
+  (let ((*hygiene-fixture-expansion* '(hygiene-helper)))
+    (is equal '((:function hygiene-helper))
+        (nth-value 1
+                   (parse::hygiene-check
+                    (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                    (parse::env-with-functions (parse::make-env) '(hygiene-helper))))))
+  (let* ((fresh (gensym "HYGIENE-FUNCTION"))
+         (*hygiene-fixture-expansion* `(progn (,fresh) (function ,fresh)
+                                            (function (setf ,fresh)))))
+    (is equal '(nil nil t)
+        (multiple-value-list
+         (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                              (parse::make-env))))))
+
+(defmacro hygiene-call-function (name) `(,name))
+(defmacro hygiene-function-name (name) `(function ,name))
+(defmacro hygiene-function-copy (name) `(progn (,name) (hygiene-helper)))
+(defmacro hygiene-local-function (name) `(flet ((,name () nil)) (,name)))
+(defmacro hygiene-capture-function (name) `(flet ((hygiene-local () nil)) (,name)))
+
+(define-test hygiene-catches-unsubstituted-function-gensym :parent parser
+  (let ((fresh (gensym "HYGIENE-LOCAL")))
+    (dolist (reference '((hygiene-helper) (function hygiene-helper)))
+      (let ((*hygiene-fixture-expansion* `(flet ((,fresh () nil)) ,reference)))
+        (is equal '(nil ((:function hygiene-helper)) t)
+            (multiple-value-list
+             (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                                  (parse::make-env))))))))
+
+(define-test function-reference-hook-does-not-expose-singleton-probes :parent parser
+  (let ((references nil))
+    (parse::call-with-macro-probes
+     (probe-driver-syntax "(weave-tests::copied-body x (print x))")
+     (parse::make-env) (constantly t)
+     (lambda (raw env probes)
+       (parse::walk-probed-expansion
+        raw env probes (constantly t) (constantly t)
+        (lambda (name namespace subenv)
+          (declare (ignore namespace subenv))
+          (push name references)))))
+    (is eq nil references)))
+
+(define-test hygiene-function-source-provenance :parent parser
+  (dolist (source '("(weave-tests::hygiene-call-function weave-tests::hygiene-helper)"
+                    "(weave-tests::hygiene-function-name weave-tests::hygiene-helper)"
+                    "(weave-tests::hygiene-function-name (setf weave-tests::hygiene-helper))"
+                    "(weave-tests::hygiene-local-function weave-tests::hygiene-helper)"))
+    (is equal '(nil nil t)
+        (multiple-value-list
+         (parse::hygiene-check (probe-driver-syntax source) (parse::make-env)))))
+  (is equal '(nil ((:function hygiene-helper)) t)
+      (multiple-value-list
+       (parse::hygiene-check
+        (probe-driver-syntax "(weave-tests::hygiene-function-copy weave-tests::hygiene-helper)")
+        (parse::make-env))))
+  (multiple-value-bind (bindings references complete)
+      (parse::hygiene-check
+       (probe-driver-syntax "(weave-tests::hygiene-capture-function weave-tests::hygiene-helper)")
+       (parse::make-env))
+    (is eq t complete)
+    (is eq nil references)
+    (is equal '((:function (hygiene-local))) (mapcar #'cdr bindings)))
+  (let* ((ast (parse "(weave-tests::hygiene-call-function weave-tests::hygiene-helper)"))
+         (name (first (parse:body ast))))
+    (is eq t (parse:expanded ast))
+    (is eq nil (gethash name (parse:subforms ast)))
+    (is eq 'parse:unevaluated (parse:location-sort ast '(parse:body 0)))))
+
 (defmacro hygiene-environment-specialness (&environment env)
   (if (eq :special (cl-environments:variable-information 'hygiene-free env))
       nil
       'hygiene-free))
+
+(define-test walker-block-reference-namespaces :parent parser
+  (let ((references nil)
+        (forms nil))
+    (parse::walk-form
+     '(block hygiene-outer
+        (block nil (return-from nil (return-from hygiene-outer hygiene-value))))
+     (parse::make-env)
+     (lambda (form env) (declare (ignore env)) (push form forms) t)
+     (constantly nil)
+     (lambda (name namespace env)
+       (push (list namespace name (parse::blocks env)) references)))
+    (is equal '((:block nil (nil hygiene-outer))
+                (:block hygiene-outer (nil hygiene-outer)))
+        (nreverse references))
+    (is eq nil (member 'hygiene-outer forms))
+    (is eq nil (member nil forms))
+    (is eq t (not (null (member 'hygiene-value forms))))))
+
+(define-test walker-defun-implicit-block-reference :parent parser
+  (let ((references nil))
+    ;; Walk DEFUN directly: a fixture macro returning DEFUN would let SBCL
+    ;; fully expand its implementation before reaching our hardwired walker.
+    (parse::walk-form
+     '(defun hygiene-outer () (return-from hygiene-outer))
+     (parse::make-env) (constantly t) (constantly nil)
+     (lambda (name namespace env)
+       (push (list namespace name (parse::blocks env)) references)))
+    (is equal '((:block hygiene-outer (hygiene-outer))) references)))
+
+(define-test hygiene-block-reference-scopes :parent parser
+  (dolist (case '(((return-from hygiene-outer) ((:block hygiene-outer)))
+                  ((return-from nil) ((:block nil)))
+                  ((return-from :exit) ((:block :exit)))
+                  ((return-from t) ((:block t)))
+                  ((block nil (return-from nil)) nil)
+                  ((block hygiene-outer (return-from hygiene-outer)) nil)
+                  ((block hygiene-outer
+                     (block hygiene-outer (return-from hygiene-outer))) nil)
+                  ((progn (block hygiene-outer nil) (return-from hygiene-outer))
+                   ((:block hygiene-outer)))
+                  ((block hygiene-outer (return-from nil)) ((:block nil)))
+                  ((let ((hygiene-outer nil)) (return-from hygiene-outer))
+                   ((:block hygiene-outer)))
+                  ((symbol-macrolet ((hygiene-outer hidden-reference))
+                     (return-from hygiene-outer)) ((:block hygiene-outer)))
+                  ((flet ((hygiene-outer () (return-from hygiene-outer))) nil) nil)
+                  ((block hygiene-outer (return-from hygiene-outer hygiene-free))
+                   (hygiene-free))))
+    (destructuring-bind (*hygiene-fixture-expansion* expected) case
+      (multiple-value-bind (bindings references complete)
+          (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                               (parse::make-env))
+        (is eq t complete)
+        (is eq nil bindings)
+        (is equal expected references))))
+  (dolist (name '(hygiene-outer nil))
+    (let ((*hygiene-fixture-expansion* `(return-from ,name)))
+      (is equal (list nil (list (list :block name)) t)
+          (multiple-value-list
+           (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                                (parse::env-with-blocks (parse::make-env) (list name)))))))
+  (let ((*hygiene-fixture-expansion* `(return-from ,(gensym "HYGIENE-BLOCK"))))
+    (is equal '(nil nil t)
+        (multiple-value-list
+         (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                              (parse::make-env))))))
+
+(defmacro hygiene-return-name (name) `(return-from ,name))
+(defmacro hygiene-block-copy (name) `(progn (return-from ,name) (return-from hygiene-outer)))
+(defmacro hygiene-source-block (name) `(block ,name (return-from ,name)))
+(defmacro hygiene-capture-block (name)
+  `(flet ((hygiene-local () nil))
+     (let ((hygiene-local nil))
+       (block hygiene-outer (return-from ,name)))))
+
+(define-test hygiene-block-source-provenance :parent parser
+  (dolist (source '("(weave-tests::hygiene-return-name weave-tests::hygiene-outer)"
+                    "(weave-tests::hygiene-source-block weave-tests::hygiene-outer)"))
+    (is equal '(nil nil t)
+        (multiple-value-list
+         (parse::hygiene-check (probe-driver-syntax source) (parse::make-env)))))
+  (is equal '(nil ((:block hygiene-outer)) t)
+      (multiple-value-list
+       (parse::hygiene-check
+        (probe-driver-syntax "(weave-tests::hygiene-block-copy weave-tests::hygiene-outer)")
+        (parse::make-env))))
+  (multiple-value-bind (bindings references complete)
+      (parse::hygiene-check
+       (probe-driver-syntax "(weave-tests::hygiene-capture-block weave-tests::hygiene-outer)")
+       (parse::make-env))
+    (is eq t complete)
+    (is eq nil references)
+    (is equal '((:block (hygiene-outer))) (mapcar #'cdr bindings)))
+  (let* ((ast (parse "(weave-tests::hygiene-return-name weave-tests::hygiene-outer)"))
+         (name (first (parse:body ast))))
+    (is eq t (parse:expanded ast))
+    (is eq nil (gethash name (parse:subforms ast)))
+    (is eq 'parse:unevaluated (parse:location-sort ast '(parse:body 0)))))
+
+(define-test constant-reference-names-are-not-probed :parent parser
+  (dolist (namespace '(:function :block))
+    (dolist (name '("nil" "()" "t" ":exit" "cl:pi"))
+      (let* ((source (format nil "(weave-tests::~a ~a)"
+                             (if (eq namespace :function)
+                                 "hygiene-function-name" "hygiene-return-name")
+                             name))
+             (call (probe-driver-syntax source)))
+        (multiple-value-bind (result expanded)
+            (parse::call-with-macro-probes
+             call (parse::make-env)
+             (lambda (&rest args)
+               (declare (ignore args))
+               (error "Constant name should not have been probed"))
+             (lambda (raw env probes)
+               (declare (ignore raw env))
+               (hash-table-count probes)))
+          (is eql 0 result)
+          (is eq t expanded))
+        ;; Constants remain unattributed: a conservative capture report is expected.
+        (is equal (list nil (list (list namespace (read-from-string name))) t)
+            (multiple-value-list (parse::hygiene-check call (parse::make-env))))))))
 
 (defmacro hygiene-expansion-error ()
   (error "Deliberate hygiene expansion failure"))
@@ -426,7 +749,8 @@
          (lambda (form env)
            (when (equal form '(hygiene-env-marker))
              (push (parse::env-special-p 'hygiene-free env) walked))
-           t))
+           t)
+         (constantly nil) (constantly nil))
         (parse::parse
          (probe-driver-syntax (prin1-to-string form)) (parse::make-env)
          (lambda (source ast)
@@ -570,7 +894,8 @@
                                (lambda (form env)
                                  (declare (ignore env))
                                  (push form forms)
-                                 (not (equal form stop))))
+                                 (not (equal form stop)))
+                               (constantly nil) (constantly nil))
              forms)))
     (let ((forms (seen '(symbol-macrolet ((alias (payload value))) alias))))
       (is equal t (not (null (member '(payload value) forms :test #'equal))))
@@ -639,7 +964,7 @@
                                      (parse:subforms edited))))))
 
 (define-test macro-argument-edits-survive-copying :parent parser
-  (let* ((call (parse "(dolist (x xs) wr)"))
+  (let* ((call (parse "(when xs wr)"))
          (edited (parse:update call '(parse:body 1) (sym "WRI")))
          (copy (parse:copy-node edited)))
     (is equal "WRI" (parse:name (car (gethash (nth 1 (parse:body copy)) (parse:subforms copy)))))))

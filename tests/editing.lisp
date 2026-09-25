@@ -309,7 +309,7 @@ second\"" (parse:str (parse::docstring code)))
     (is equal "(LOOP FOR X IN (QUOTE A))" (code ui))))
 
 (define-test completion-survives-macro-arguments :parent editing
-  (let ((ui (goto (ui-for "(dolist (x xs) wr)") '(parse:body 1))))
+  (let ((ui (goto (ui-for "(when xs wr)") '(parse:body 1))))
     (press ui #\i)
     (is equal t (and (w::completion-state ui) t))
     (press ui #\t)

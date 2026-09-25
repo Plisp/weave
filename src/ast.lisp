@@ -436,8 +436,8 @@ A method may return the contents at `id' as a second value, NIL when absent.")
 
 (defgeneric location-bindings (node id)
   (:documentation "The lexical bindings `node' contributes to the form at `id' as a
-list of (kind . binder) where kind is :variable, :function or :block, the innermost
-binding first so that the first of a name shadows the rest. `id' must name an evaluated
+list of (kind . binder) where kind is :variable, :function, :block or :tag, the innermost
+binding first so that the first occurrence shadows the rest. `id' must name an evaluated
 or function-code location, otherwise this errors.")
   (:method (node id) (check-evaluated node id) nil))
 
@@ -595,6 +595,11 @@ copy-env can exploit structure sharing, remember to PUSH!"
     (setf (%blocks new-env) (append bindings (%blocks new-env)))
     new-env))
 
+(defun env-with-tags (env bindings)
+  (let ((new-env (copy-env env)))
+    (setf (%tags new-env) (append bindings (%tags new-env)))
+    new-env))
+
 (defun wrap-with-wrapper (form entries wrapper)
   (if (null entries)
       form
@@ -626,7 +631,7 @@ copy-env can exploit structure sharing, remember to PUSH!"
       (let ((s (gensym)))
         `(catch ',s
            (tagbody
-              ,@tags
+              ,@(remove-duplicates tags :test #'eql)
               (throw ',s ,form))))))
 
 (defun go-tag-p (x) (or (integerp x) (symbolp x)))
@@ -2065,6 +2070,58 @@ other atom."
 (setf (gethash 'eclector.reader:quasiquote *special-walkers*) #'walk-quasiquote)
 (setf (gethash 'eclector.reader:quasiquote *special-parsers*) #'parse-quasiquote)
 
+;;; TAGBODY interleaves unevaluated labels and executable forms.
+(defform (tagbody &body body)
+  :binds ((body)))
+
+(defun tagbody-tag-p (form)
+  "Recognizes tags in both raw forms and source syntax, including () as NIL."
+  (typecase form
+    (symbol-ref t)
+    (literal (let ((*read-eval* nil))
+               (integerp (ignore-errors (read-from-string (str form))))))
+    (ref-list (and (eq (kind form) :list) (null (elements form))))
+    (t (go-tag-p form))))
+
+(defun walk-tagbody (form env walker on-binder)
+  (let* ((body (cdr form))
+         (body-env (env-with-tags env (remove-if-not #'go-tag-p body))))
+    (dolist (item body)
+      (if (go-tag-p item)
+          (funcall on-binder item :tag)
+          (funcall walker item body-env))))
+  nil)
+
+(defun parse-tagbody (rawform env walker alter-identity)
+  (declare (ignore alter-identity))
+  (let* ((body (gen-cdr rawform))
+         (body-tags (remove-if-not #'tagbody-tag-p body))
+         (body-env (env-with-tags env body-tags)))
+    (dolist (tag body-tags)
+      (when (typep tag 'symbol-ref) (change-class tag 'binder)))
+    (make-instance 'tagbody-form
+                   :op (gen-car rawform)
+                   :body (mapcar (lambda (item)
+                                   (if (tagbody-tag-p item)
+                                       item
+                                       (funcall walker item body-env)))
+                                 body))))
+
+(defmethod location-sort ((node tagbody-form) id)
+  (trivia:match id
+    ((eql 'op) 'symbol-ref)
+    ((list (eql 'body) (and (type integer) i))
+     (when (<= 0 i (1- (length (body node))))
+       (if (tagbody-tag-p (nth i (body node))) 'binder 'eval-form)))))
+
+(defmethod location-bindings ((node tagbody-form) id)
+  (check-evaluated node id)
+  (when (eq 'body (id-slot id))
+    (bindings-of :tag (remove-if-not #'tagbody-tag-p (body node)))))
+
+(setf (gethash 'tagbody *special-walkers*) #'walk-tagbody
+      (gethash 'tagbody *special-parsers*) #'parse-tagbody)
+
 (defform (defmethod &or (name &rest-qualifiers qualifiers &method-lambda fun-code)
                         ((setf-op name) &rest-qualifiers qualifiers &method-lambda fun-code))
   :binds ((fun-code :function name :block name)))
@@ -2226,8 +2283,9 @@ other atom."
 (defun walk-function-form (form env walker on-binder)
   "Macroexpansions tend to bind this, e.g. sbcl's destructuring-bind."
   (declare (ignore on-binder))
-  (when (lambda-operator-p (second form))
-    (funcall walker (second form) env))
+  (if (lambda-operator-p (second form))
+      (funcall walker (second form) env)
+      (funcall walker (second form) env :function))
   nil)
 
 (defun parse-function-form (rawform env walker alter-identity)
@@ -2245,6 +2303,13 @@ other atom."
 
 (defform (return-from name &body value)
   :binds ((value)))
+
+(defun walk-return-from (form env walker on-binder)
+  (funcall walker (second form) env :block)
+  (return-from-walker form env walker on-binder))
+
+(setf (gethash 'return-from *special-walkers*) #'walk-return-from)
+
 (defform (if test &body then-else)
   :binds ((test) (then-else)))
 
@@ -2264,8 +2329,6 @@ other atom."
 (defform (the type-specifier form)
   :binds ((form)))
 
-(defform (tagbody &body body)
-  :binds ((body)))
 (defform (go tag))
 
 (defform (unwind-protect protected &body cleanup)
@@ -2285,46 +2348,68 @@ other atom."
   "Whether the s-expression `x' is a lambda expression, e.g. in operator position."
   (and (consp x) (eq (car x) 'lambda)))
 
-(defun walk-form (form env on-form &optional (note-binder (constantly nil)))
-  "Form and env must consist of ordinary s-expressions, remove wrappers prior to walking."
-  (if (atom form)
-      (when (funcall on-form form env)
-        (multiple-value-bind (expansion expanded-p)
-            (env-macroexpand form env)
-          (when expanded-p
-            (walk-form expansion env on-form note-binder))))
-      (when (funcall on-form form env)
-        (let ((name (car form)))
-          (cond
-            ((lambda-operator-p name)
-             (walk-form name env on-form note-binder)
-             (mapcar (rcurry #'walk-form env on-form note-binder) (cdr form)))
-            ((gethash name *special-walkers*)
-             (funcall (gethash name *special-walkers*)
-                      form env
-                      (rcurry #'walk-form on-form note-binder)
-                      note-binder))
-            (t
-             (multiple-value-bind (newform expanded-p)
-                 (env-macroexpand form env)
-               (if expanded-p
-                   (if (atom newform)
-                       (funcall on-form newform env)
-                       (let ((newop (car newform)))
-                         (if-let (walker (gethash newop *special-walkers*))
-                           (funcall walker
-                                    newform env
-                                    (rcurry #'walk-form on-form note-binder)
-                                    note-binder)
-                           ;; must be function call
-                           (when (funcall on-form newform env)
-                             (when (lambda-operator-p newop)
-                               (walk-form newop env on-form note-binder))
-                             (mapcar (rcurry #'walk-form env on-form note-binder)
-                                     (cdr newform))))))
-                   (when (funcall on-form form env)
-                     (mapcar (rcurry #'walk-form env on-form note-binder)
-                             (cdr form)))))))))))
+(defun function-name-symbol (name)
+  "The symbol component of an ordinary or SETF function name."
+  (trivia:ematch name
+    ((type symbol) name)
+    ((list (eql 'setf) (and (type symbol) symbol)) symbol)))
+
+(defun reference-name-symbol (name namespace)
+  (if (eq namespace :function)
+      (function-name-symbol name)
+      name))
+
+(defun inert-reference-p (namespace)
+  (member namespace '(:function :block :tag)))
+
+(defun walk-form (form env on-form note-binder note-reference)
+  "Form and env must consist of ordinary s-expressions, remove wrappers prior to walking.
+`on-reference' receives (name namespace env) for non-variable references.
+Special walkers can pass a namespace as the third argument to their recursive walker;
+such names are reported directly, without evaluation or symbol-macro expansion."
+  (labels ((walk (form env &optional namespace)
+             "`namespace' designates a special kind of reference, like block names."
+             (if namespace
+                 (funcall note-reference form namespace env)
+                 (walk-form form env on-form note-binder note-reference)))
+           (walk-call (call)
+             (if (lambda-operator-p (car call))
+                 (walk (car call) env)
+                 (walk (car call) env :function))
+             (mapcar (rcurry #'walk env) (cdr call))))
+    (if (atom form)
+        (when (funcall on-form form env)
+          (multiple-value-bind (expansion expanded-p)
+              (env-macroexpand form env)
+            (when expanded-p
+              (walk expansion env))))
+        (when (funcall on-form form env)
+          (let ((name (car form)))
+            (cond
+              ((lambda-operator-p name)
+               (walk-call form))
+              ((gethash name *special-walkers*)
+               (funcall (gethash name *special-walkers*)
+                        form env
+                        #'walk
+                        note-binder))
+              (t
+               (multiple-value-bind (newform expanded-p)
+                   (env-macroexpand form env)
+                 (if expanded-p
+                     (if (atom newform)
+                         (funcall on-form newform env)
+                         (let ((newop (car newform)))
+                           (if-let (walker (gethash newop *special-walkers*))
+                             (funcall walker
+                                      newform env
+                                      #'walk
+                                      note-binder)
+                             ;; must be function call
+                             (when (funcall on-form newform env)
+                               (walk-call newform)))))
+                     (when (funcall on-form form env)
+                       (walk-call form)))))))))))
 
 (defun read-eval-p (form)
   "Whether `form' is the syntax list representing read evaluation."
@@ -2391,7 +2476,7 @@ XXX performs unguarded read-evaluation."
               :%variable-bindings (mapcar #'strip-binding (variable-bindings env))
               :%specials (mapcar (lambda (name) (strip-wrappers name interned)) (%specials env))
               :%blocks (mapcar #'strip-binding (blocks env))
-              :%tags (tags env))))
+              :%tags (mapcar #'strip-binding (tags env)))))
 
 (defmacro with-temporary-interning ((interned) &body body)
   "Runs `body', then uninterns all symbols in the vector `interned'. Warnings are disabled."
@@ -2446,7 +2531,7 @@ XXX performs unguarded read-evaluation."
                (setf form (nth i form)))))
 
 (defstruct probe-info
-  path source sort)
+  path source sort namespace)
 
 (defun call-with-macro-probes (call env accept-probe consume-probes)
   "Probe evaluated arguments and binders directly under `call'.
@@ -2487,7 +2572,12 @@ primary value and T, or NIL and NIL if the initial macroexpansion fails."
                      t)
                    (lambda (sym bind-sort)
                      (unless (constantp sym)
-                       (setf (gethash sym subform-sorts) bind-sort))))
+                       (setf (gethash sym subform-sorts) bind-sort)))
+                   (lambda (name namespace subenv)
+                     (declare (ignore subenv))
+                     (let ((symbol (reference-name-symbol name namespace)))
+                       (unless (constantp symbol)
+                         (setf (gethash symbol subform-sorts) :binder)))))
         ;; (disp (nreverse (hash-table-plist subform-sorts)))
         ;; analysis, first to understand syntax before constructing the returned maps
         (let ((probes (make-hash-table :test #'eq))
@@ -2502,13 +2592,20 @@ primary value and T, or NIL and NIL if the initial macroexpansion fails."
                             (lambda (form subenv)
                               (cond ((and compoundp (trivia:match form
                                                       ((list (eql gensym)) t)))
-                                     (return-from observe-probe (values :exp subenv)))
+                                     (return-from observe-probe (values :exp nil subenv)))
                                     ((and (not compoundp) (eq form gensym))
-                                     (return-from observe-probe (values :ref subenv)))
+                                     (return-from observe-probe
+                                       (values :ref :variable subenv)))
                                     (t t)))
-                            (lambda (sym bind-sort)
-                              (when (and (not compoundp) (eq sym gensym))
-                                (return-from observe-probe (values bind-sort nil)))))))
+                            (lambda (sym namespace)
+                              (when (and (not compoundp)
+                                         (eq gensym (reference-name-symbol sym namespace)))
+                                (return-from observe-probe (values :binder namespace nil))))
+                            (lambda (name namespace subenv)
+                              (when (and (not compoundp)
+                                         (eq (reference-name-symbol name namespace) gensym))
+                                (return-from observe-probe
+                                  (values :ref namespace subenv)))))))
                        (values nil nil)))
                    (probe (path form)
                      (let* ((gensym (gensym "PB"))
@@ -2517,11 +2614,12 @@ primary value and T, or NIL and NIL if the initial macroexpansion fails."
                             (replacement (if compoundp (list gensym) gensym))
                             (source (lookup-path path call)))
                        (substitute-sym path raw replacement)
-                       (multiple-value-bind (sort form-env)
+                       (multiple-value-bind (sort namespace form-env)
                            (observe-probe gensym compoundp)
-                         (let ((info (when sort
-                                       (make-probe-info :path path :source source
-                                                        :sort sort))))
+                         (let ((info
+                                 (when sort
+                                   (make-probe-info :path path :source source
+                                                    :sort sort :namespace namespace))))
                            (if (and info (funcall accept-probe info form-env))
                                (progn
                                  (setf (gethash gensym probes) info)
@@ -2561,13 +2659,16 @@ primary value and T, or NIL and NIL if the initial macroexpansion fails."
             (values (funcall consume-probes raw env probes) t)))))))
 
 (defun walk-probed-expansion (raw env probes on-probe
-                              &optional (on-introduced (constantly t)))
+                              &optional (on-introduced (constantly t))
+                                        (on-introduced-reference (constantly nil)))
   "Walk `RAW's expansion, dispatching source probes separately from introduced forms.
-`on-probe' receives (info occurrence-sort subenv),
+`on-probe' receives (info namespace subenv),
 `on-introduced' receives (form subenv).
-Each callback returns whether to descend. A symbol probe may occur as a reference
-even when first observed as a binder. Return T on completion, NIL on expansion or
-walk failure."
+`on-introduced-reference' receives (name namespace subenv) for non-variable references.
+Source function/block names are passed to `on-probe' with namespace :FUNCTION/:BLOCK.
+Form callbacks return whether to descend, name-reference callback values are ignored.
+Note: a symbol probe may occur as a reference even when first observed as a binder.
+Return T on completion, NIL on expansion or walk failure."
   (handler-bind ((warning #'muffle-warning))
     (let ((expansion (handler-case (env-macroexpand raw env)
                        (error () +fail+))))
@@ -2585,58 +2686,86 @@ walk failure."
                           (if (eq sort :exp)
                               (eq (probe-info-sort info) :exp)
                               (not (eq (probe-info-sort info) :exp))))
-                     (funcall on-probe info sort subenv)
-                     (funcall on-introduced form subenv))))))
+                     (funcall on-probe info (if (eq sort :exp) :exp :variable) subenv)
+                     (funcall on-introduced form subenv)))))
+           (constantly nil)
+           ;; for non-veriable references
+           (lambda (name namespace subenv)
+             (let ((info (gethash (reference-name-symbol name namespace) probes)))
+               (cond ((null info)
+                      (funcall on-introduced-reference name namespace subenv))
+                     ((eq (probe-info-sort info) :ref)
+                      (funcall on-probe info namespace subenv))))))
           t)))))
 
 (defun hygiene-check (call env)
-  "Report potential binding capture at source probes and VARIABLE reference capture
-at macro-introduced forms distinguished from source expressions.
+  "Report potential binding capture at source probes and reference capture at macro-introduced
+forms distinguished from source expressions.
 Return binding captures, reference captures, and whether analysis completed.
+
+Variable reference captures are symbols.
+Function/block captures are (:FUNCTION name)/(:BLOCK name).
 Note: failed analysis may retain partial findings so NIL alone does not indicate hygiene.
-TODO walk function names and blocks, or is this rather niche."
+Reference checking is incomplete when caller MACROLET bindings erase introduced function
+calls during macroexpansion before the walker observes their names.
+TODO walk tag references."
   (let ((binding-captures (list))
         (reference-captures (list))
         (complete-p nil))
-    (handler-bind ((warning #'muffle-warning))
-      (handler-case
-       (setf complete-p
-        (call-with-macro-probes
-       call env (constantly t)
-       (lambda (raw base-env probes)
-         (walk-probed-expansion
-          raw base-env probes
-          (lambda (info sort subenv)
-            (if (eq sort (probe-info-sort info))
-                (flet ((note-capture (accessor sort)
-                         (when-let (vars (remove-if-not
-                                          (lambda (entry)
-                                            (let ((name (ensure-car entry)))
-                                              ;; detect interned symbols, not introduced
-                                              ;; from the call (as probed)
-                                              (and (symbolp name) (symbol-package name)
-                                                   (not (gethash name probes))
-                                                   (or (not (eq sort :variable))
-                                                       (not (env-special-p name subenv))))))
+    (flet ((check-expansion (raw base-env probes)
+             (walk-probed-expansion
+              raw base-env probes
+              (lambda (info namespace subenv)
+                (if (or (and (eq namespace :exp)
+                             (eq (probe-info-sort info) :exp))
+                        (and (eq (probe-info-sort info) :ref)
+                             (eq namespace (probe-info-namespace info))))
+                    (flet ((note-capture (accessor namespace)
+                             (when-let (vars
+                                        (remove-if-not
+                                         (lambda (entry)
+                                           (let ((name (ensure-car entry)))
+                                             ;; detect interned symbols, not introduced
+                                             ;; from the call (as probed)
+                                             (and (symbolp name) (symbol-package name)
+                                                  (not (gethash name probes))
+                                                  (or (not (eq namespace :variable))
+                                                      (not (env-special-p name subenv))))))
+                                         (ldiff (funcall accessor subenv)
+                                                (funcall accessor base-env))))
+                               (push (cons (probe-info-source info) (list namespace vars))
+                                     binding-captures))))
+                      (unless (inert-reference-p namespace)
+                        (note-capture #'variable-bindings :variable))
+                      (unless (eq namespace :block)
+                        (note-capture #'function-bindings :function))
+                      (unless (eq namespace :function)
+                        (note-capture #'blocks :block))
+                      nil)
+                    t))
+              (lambda (form subenv)
+                (when (and (symbolp form) (symbol-package form)
+                           (not (constantp form))
+                           (not (env-special-p form subenv)))
+                  (let ((bound-vars (ldiff (variable-bindings subenv)
+                                           (variable-bindings base-env))))
+                    (unless (find form bound-vars :key #'ensure-car)
+                      (push form reference-captures))))
+                t)
+              (lambda (name namespace subenv)
+                (let ((accessor (ecase namespace
+                                  (:function #'function-bindings)
+                                  (:block #'blocks))))
+                  (when (and (symbol-package (reference-name-symbol name namespace))
+                             (not (member name
                                           (ldiff (funcall accessor subenv)
-                                                 (funcall accessor base-env))))
-                           (push (cons (probe-info-source info) (list sort vars))
-                                 binding-captures))))
-                  (note-capture #'variable-bindings :variable)
-                  (note-capture #'function-bindings :function)
-                  (note-capture #'blocks :block)
-                  nil)
-                t))
-          (lambda (form subenv)
-            (when (and (symbolp form) (symbol-package form)
-                       (not (constantp form))
-                       (not (env-special-p form subenv)))
-              (let ((bound-vars (ldiff (variable-bindings subenv)
-                                       (variable-bindings base-env))))
-                (unless (find form bound-vars :key #'ensure-car)
-                  (push form reference-captures))))
-            t)))))
-       ((and error (not analysis-invariant-error)) () nil)))
+                                                 (funcall accessor base-env))
+                                          :key #'ensure-car :test #'equal)))
+                    (push (list namespace name) reference-captures)))))))
+      (setf complete-p
+            (handler-bind ((warning #'muffle-warning))
+              (with-suppressed-parse-errors
+                (call-with-macro-probes call env (constantly t) #'check-expansion)))))
     (values binding-captures reference-captures complete-p)))
 
 (defmacro with-analysis-handlers (&body body)
@@ -2689,13 +2818,16 @@ entry to be keyed in the map. The second value is NIL when the call fails to exp
                         binders)))
                (walk-probed-expansion
                 raw stripped-env probes
-                (lambda (info sort subenv)
-                  (if (eq (probe-info-sort info) sort)
+                (lambda (info namespace subenv)
+                  ;; name-reference probes carry provenance for hygiene, but
+                  ;; are not evaluated expressions in the subform map.
+                  (if (and (not (inert-reference-p namespace))
+                           (not (eq (probe-info-sort info) :binder)))
                       (let* ((source (probe-info-source info))
-                             (ast (if (eq sort :ref)
-                                      source
-                                      (car (gethash source subform-asts)))))
-                        (when (eq sort :ref)
+                             (ast (if (eq namespace :exp)
+                                      (car (gethash source subform-asts))
+                                      source)))
+                        (when (eq namespace :variable)
                           (invariant (typep source '(or symbol-ref hole))))
                         (setf (gethash source subform-asts)
                               (cons ast (calc-bindings subenv)))
