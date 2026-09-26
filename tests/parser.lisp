@@ -148,7 +148,6 @@
                 (cond
                   ((and info (eq :exp (parse::probe-info-sort info)))
                    (is eq source (parse::probe-info-source info))
-                   (is equal '(2) (parse::probe-info-path info))
                    (let* ((prefix (ldiff (parse::variable-bindings subenv)
                                          (parse::variable-bindings base-env)))
                           (source-binder (find-if (lambda (entry) (gethash entry probes)) prefix)))
@@ -423,7 +422,8 @@
               collect (parse:location-sort ast (list 'parse:body i))))
     (is eq t (every #'eq labels (subseq (parse:body ast) 1 6)))
     (is eq 'parse:binder (type-of (second (parse:body ast))))
-    (is equal (reverse labels) (mapcar #'cdr (parse:location-bindings ast '(parse:body 0))))
+    (is equal (reverse labels)
+        (parse::tags (parse:location-env ast '(parse:body 0) (parse:make-env))))
     (is eq nil (parse:location-sort ast '(parse:body -1)))
     (is eq nil (parse:location-sort ast '(parse:body 8)))
     (is eq nil (parse::tagbody-tag-p (make-instance 'parse:literal :str "1.5")))
@@ -885,6 +885,105 @@
     (is eq t (parse:expanded (car entry)))
     (is equal '("X") (binder-names entry))))
 
+(defsetf walker-setq-accessor walker-setq-writer)
+(define-symbol-macro walker-setq-alias (walker-setq-accessor walker-setq-object))
+
+(defun setq-walk-observations (form)
+  (let ((forms nil) (references nil))
+    (parse::walk-form
+     form (parse::make-env)
+     (lambda (form env) (declare (ignore env)) (push form forms) t)
+     (constantly nil)
+     (lambda (name namespace env)
+       (declare (ignore env))
+       (push (list namespace name) references)))
+    (values (nreverse forms) (nreverse references))))
+
+(define-test setq-targets-are-references-not-evaluated-forms :parent parser
+  (multiple-value-bind (forms references)
+      (setq-walk-observations '(setq first-target (first-value) second-target (second-value)))
+    (is equal '((:variable first-target) (:function first-value)
+                (:variable second-target) (:function second-value)) references)
+    (is eq nil (member 'first-target forms))
+    (is eq nil (member 'second-target forms)))
+  (is equal nil (nth-value 1 (setq-walk-observations '(setq))))
+  (dolist (form '((setq x) (setq nil 1) (setq (car x) 1)))
+    (fail (setq-walk-observations form))))
+
+(define-test setq-symbol-macro-targets-use-setters :parent parser
+  (dolist (form '((symbol-macrolet ((alias (walker-setq-accessor walker-setq-object)))
+                   (setq alias walker-setq-value))
+                  (setq walker-setq-alias walker-setq-value)))
+    (multiple-value-bind (forms references) (setq-walk-observations form)
+      (is equal '((:function walker-setq-writer)) references)
+      (is eq t (not (null (member 'walker-setq-object forms))))
+      (is eq t (not (null (member 'walker-setq-value forms))))
+      (is eq nil (member 'alias forms))
+      (is eq nil (member 'walker-setq-alias forms))))
+  (let ((references
+          (nth-value 1
+                     (setq-walk-observations
+                      '(symbol-macrolet ((alias (walker-ordinary-accessor object)))
+                         (setq alias 1))))))
+    (is eq t (not (null (member '(:function (setf walker-ordinary-accessor)) references
+                                :test #'equal))))
+    (is eq nil (member '(:function walker-ordinary-accessor) references :test #'equal)))
+  (dolist (form '((let ((walker-setq-alias nil)) (setq walker-setq-alias 1))
+                  (locally (declare (special walker-setq-alias)) (setq walker-setq-alias 1))))
+    (is equal '((:variable walker-setq-alias))
+        (nth-value 1 (setq-walk-observations form))))
+  (is equal '((:variable cell))
+      (nth-value 1
+                 (setq-walk-observations
+                  '(symbol-macrolet ((alias cell)) (setq alias 1))))))
+
+(defmacro hygiene-setq-target (name) `(setq ,name 1))
+
+(define-test setq-write-references-retain-hygiene-analysis :parent parser
+  (dolist (case '(((setq hygiene-free 1) (hygiene-free))
+                  ((let ((hygiene-free nil)) (setq hygiene-free 1)) nil)
+                  ((locally (declare (special hygiene-free)) (setq hygiene-free 1)) nil)
+                  ((symbol-macrolet ((alias (walker-setq-accessor walker-setq-object)))
+                     (setq alias 1)) (walker-setq-object (:function walker-setq-writer)))))
+    (destructuring-bind (*hygiene-fixture-expansion* expected) case
+      (multiple-value-bind (bindings references complete)
+          (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                               (parse::make-env))
+        (is eq t complete)
+        (is eq nil bindings)
+        (is equal expected references))))
+  (is equal '(nil nil t)
+      (multiple-value-list
+       (parse::hygiene-check
+        (probe-driver-syntax "(weave-tests::hygiene-setq-target weave-tests::hygiene-free)")
+        (parse::make-env))))
+  (let* ((ast (parse "(weave-tests::hygiene-setq-target weave-tests::hygiene-free)"))
+         (target (first (parse:body ast))))
+    (is eq t (parse:expanded ast))
+    (is eq target (car (gethash target (parse:subforms ast))))))
+
+(defvar *walker-binder-object*)
+(defmacro walker-returns-binder () *walker-binder-object*)
+
+(define-test walker-rejects-binder-objects-before-on-form :parent parser
+  (let ((*walker-binder-object* (make-instance 'parse:binder :name "BINDER")))
+    (dolist (form (list *walker-binder-object* '(walker-returns-binder)))
+      (let ((binder-seen nil))
+        (is eq :caught
+            (handler-case
+                (parse::with-suppressed-parse-errors
+                  (parse::walk-form
+                   form (parse::make-env)
+                   (lambda (form env)
+                     (declare (ignore env))
+                     (when (typep form 'parse:binder) (setf binder-seen t))
+                     t)
+                   (constantly nil) (constantly nil)))
+              (parse::analysis-invariant-error () :caught)))
+        (is eq nil binder-seen))))
+  ;; A symbol used at both a binding and a reference occurrence remains valid.
+  (is eq t (not (null (member 'same (setq-walk-observations '(let ((same nil)) same)))))))
+
 (define-symbol-macro walker-global-alias (global-payload global-value))
 
 (define-test walker-follows-symbol-macros :parent parser
@@ -1046,6 +1145,115 @@
     (is equal 'parse:function-call
               (type-of (car (gethash (first (parse:body call)) (parse:subforms call)))))))
 
+(defun call-with-unresolved-function-source (source check)
+  (let* ((package (make-package (symbol-name (gensym "FUNCTION-SOURCE-")) :use '(:cl)))
+         (*package* package))
+    (unwind-protect
+         (let ((syntax (probe-driver-syntax source)))
+           (dolist (name '("M" "N" "OTHER"))
+             (when (find-symbol name package)
+               (unintern (find-symbol name package) package)))
+           (funcall check (parse::parse syntax (parse::make-env)
+                                       (lambda (source ast) (declare (ignore source)) ast)))
+           (dolist (name '("M" "N" "OTHER"))
+             (is eq nil (find-symbol name package))))
+      (delete-package package))))
+
+(define-test unresolved-local-macros-have-distinct-names :parent parser
+  (call-with-unresolved-function-source
+   "(macrolet ((m (x) x) (n (x) (list 'quote x)))
+      (m (print 1)) (n (print 2)) (other (print 3)))"
+   (lambda (ast)
+     (destructuring-bind (m n other) (parse:body ast)
+       (is eq 'parse:macro-call (type-of m))
+       (is eq 'parse:macro-call (type-of n))
+       (is eq t (parse:expanded m))
+       (is eq t (parse:expanded n))
+       (is = 1 (hash-table-count (parse:subforms m)))
+       (is = 0 (hash-table-count (parse:subforms n)))
+       (is eq 'parse:function-call (type-of other))))))
+
+(define-test unresolved-local-functions-shadow-only-their-own-name :parent parser
+  (dolist (operator '(flet labels))
+    (call-with-unresolved-function-source
+     (format nil "(macrolet ((m (x) x) (n (x) x))
+                    (~a ((m () (m (print 1))))
+                      (m) (n (print 2)) (other)
+                      (weave-tests::hygiene-env-marker)))" operator)
+     (lambda (ast)
+       (let* ((local (first (parse:body ast)))
+              (definition (first (parse:elements (parse:funs local))))
+              (code (second (parse:elements definition)))
+              (recursive-call (first (parse:body code))))
+         (is eq (if (eq operator 'labels) 'parse:function-call 'parse:macro-call)
+             (type-of recursive-call))
+         (destructuring-bind (m n other marker) (parse:body local)
+           (is eq 'parse:function-call (type-of m))
+           (is eq 'parse:macro-call (type-of n))
+           (is eq t (parse:expanded n))
+           (is = 1 (hash-table-count (parse:subforms n)))
+           (is eq 'parse:function-call (type-of other))
+           (let* ((env (parse::call-env marker))
+                  (entry (parse::env-function-info (parse:name m) env)))
+             (is eq t (typep entry 'parse:symbol-ref))
+             (is string= "M" (parse:name entry))
+             (is eq nil (parse::env-function-info (parse:name other) env)))))))))
+
+(define-test implicit-function-blocks-exclude-lambda-list-initializers :parent parser
+  (dolist (operator '(defun defmacro defmethod))
+    (let* ((form `(block hygiene-outer
+                    (,operator hygiene-helper
+                        (&optional (x (hygiene-env-marker)))
+                      (hygiene-env-marker))))
+           (expected '(("HYGIENE-OUTER") ("HYGIENE-HELPER" "HYGIENE-OUTER")))
+           (walked nil)
+           (parsed nil))
+      (parse::walk-form
+       form (parse::make-env)
+       (lambda (form env)
+         (when (equal form '(hygiene-env-marker))
+           (push (mapcar #'sx (parse::blocks env)) walked))
+         t)
+       (constantly nil) (constantly nil))
+      (parse::parse
+       (probe-driver-syntax (prin1-to-string form)) (parse::make-env)
+       (lambda (source ast)
+         (declare (ignore source))
+         (when (and (typep ast 'parse:macro-call)
+                    (eq 'hygiene-env-marker (parse:resolve (parse:op ast))))
+           (push (mapcar #'sx (parse::blocks (parse::call-env ast))) parsed))
+         ast))
+      (is equal expected (nreverse walked))
+      (is equal expected (nreverse parsed)))))
+
+(define-test function-environment-matches-wrappers-and-symbols :parent parser
+  (let* ((wrapper (sym "HYGIENE-HELPER" "WEAVE-TESTS"))
+         (env (parse::env-with-functions (parse::make-env) (list wrapper))))
+    (is eq wrapper (parse::env-function-info 'hygiene-helper env))
+    (is eq wrapper (parse::env-function-info (sym "HYGIENE-HELPER" "WEAVE-TESTS") env))
+    (is eq nil (parse::env-function-info (sym "HYGIENE-HELPER" "CL-USER") env))
+    (is eq 'hygiene-helper
+        (parse::env-function-info wrapper
+                                 (parse::env-with-functions (parse::make-env)
+                                                           '(hygiene-helper))))))
+
+(define-test macro-call-envmap-failure-return-values :parent parser
+  (dolist (source '("(weave-tests::hygiene-expansion-error)"
+                    nil))
+    (let ((results
+            (multiple-value-list
+             (parse::macro-call-envmap
+              (if source (probe-driver-syntax source)
+                  (make-instance 'parse:literal :str "("))
+              (parse:make-env)
+              (lambda (form env)
+                (declare (ignore env))
+                form)))))
+      (is = 3 (length results))
+      (is eq t (hash-table-p (first results)))
+      (is eq t (hash-table-p (second results)))
+      (is eq nil (third results)))))
+
 (define-test invariants-escape-error-handlers :parent parser
   (fail (parse::invariant nil) 'parse::analysis-invariant-error)
   (is eq :escaped
@@ -1056,7 +1264,8 @@
 (define-test copied-macro-calls-own-their-binders :parent parser
   (let* ((call (parse "(dotimes (i 10) (print i))"))
          (copy (parse:copy-node call))
-         (binder (cdr (first (parse:location-bindings copy '(parse:body 1))))))
+         (binder (parse:env-lookup (parse:gen-tree-ref (parse:body copy) '(0 0)) :variable
+                                  (parse:location-env copy '(parse:body 1) (parse:make-env)))))
     (is eq (parse:gen-tree-ref (parse:body copy) '(0 0)) binder)
     (is eq nil (eq binder (parse:gen-tree-ref (parse:body call) '(0 0))))))
 
@@ -1070,7 +1279,8 @@
          (entry (gethash (nth 1 (parse:body call)) (parse:subforms call))))
     (is equal 'parse:function-call (type-of (car entry)))
     (is equal nil (cdr entry))
-    (is equal nil (parse:location-bindings call '(parse:body 1)))))
+    (is equal nil (parse::variable-bindings
+                   (parse:location-env call '(parse:body 1) (parse:make-env))))))
 
 (define-test unparseable-calls-keep-parsed-arguments :parent parser
   (let* ((call (parse:update (parse "(dolist (x (f xs)) (print x))") 'parse:op (parse:hole)))

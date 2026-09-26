@@ -235,8 +235,6 @@ second\"" (parse:str (parse::docstring code)))
     (is equal '("(PROGN _)" ((parse::forms 0))) (empty "(progn 1)" '(parse::forms 0)))
     (is equal '("(UNWIND-PROTECT A _)" ((parse::cleanup 0)))
         (empty "(unwind-protect a b)" '(parse::cleanup 0)))
-    (is equal '("(LOAD-TIME-VALUE X _)" ((parse::read-only-p 0)))
-        (empty "(load-time-value x t)" '(parse::read-only-p 0)))
     (is equal '("(LET* ((_ _)) 2)" ((parse:vars 0 0)))
         (empty "(let* ((a 1)) 2)" '(parse:vars 0 1)))
     (is equal '("(FLET ((_ () _)) 2)" ((parse::funs 0 0)))
@@ -433,6 +431,110 @@ second\"" (parse:str (parse::docstring code)))
           (and (w::lexical-symbol-ref node (w::focus ui))
                (not (w::symbol-ref-boundp node (w::stack ui) ui))))))
 
+(defun resolution-at (source namespace &rest path)
+  (let* ((ui (apply #'goto (ui-for source) path))
+         (node (focused ui)))
+    (multiple-value-bind (entry kind)
+        (parse:env-lookup node namespace (w::environment-at (w::stack ui)))
+      (list (when entry (sx (alexandria:ensure-car entry))) kind))))
+
+(define-test environment-transformers-special-scope :parent editing
+  (is equal '(nil :special)
+      (resolution-at "(let ((x 1)) (locally (declare (special x)) x))"
+                     :variable '(parse:body 0) '(parse:body 0)))
+  (is equal '("X" :lexical)
+      (resolution-at "(locally (declare (special x)) (let ((x 1)) x))"
+                     :variable '(parse:body 0) '(parse:body 0)))
+  (is equal '("X" :lexical)
+      (resolution-at "(let ((x 1)) (let ((y x)) (declare (special x)) y))"
+                     :variable '(parse:body 0) '(parse:vars 0 1)))
+  (is equal '(nil :special)
+      (resolution-at "(let* ((x 1) (y x)) (declare (special x)) y)"
+                     :variable '(parse:vars 1 1)))
+  (is equal '(nil nil)
+      (resolution-at "(let* ((y x) (x 1)) (declare (special x)) y)"
+                     :variable '(parse:vars 0 1)))
+  (is equal '(nil :special)
+      (resolution-at "(lambda (x &optional (y x)) (declare (special x)) y)"
+                     :variable 'parse:fun-code '(parse:lambda-list 2 1)))
+  (is equal '(nil nil)
+      (resolution-at "(lambda (&optional (y x)) (declare (special x)) y)"
+                     :variable 'parse:fun-code '(parse:lambda-list 1 1)))
+  (is equal '("X" :lexical)
+      (resolution-at "(defmacro m ((x &optional (y x))) y)"
+                     :variable 'parse:macro-code '(parse:lambda-list 0 2 1)))
+  (dolist (source '("(flet ((f () nil)) (declare (special x)) x)"
+                    "(labels ((f () nil)) (declare (special x)) x)"
+                    "(macrolet ((m () nil)) (declare (special x)) x)"
+                    "(symbol-macrolet ((m nil)) (declare (special x)) x)"))
+    (is equal '(nil :special) (resolution-at source :variable '(parse:body 0)))))
+
+(define-test environment-transformers-function-boundaries :parent editing
+  (is equal '(nil nil)
+      (resolution-at "(defun f () (f))" :function
+                     'parse:fun-code '(parse:body 0) 'parse:name))
+  (is equal '("F" :lexical)
+      (resolution-at "(defun f (&optional (x (return-from f 1))) x)"
+                     :block 'parse:fun-code '(parse:lambda-list 1 1) 'parse:name))
+  (is equal '("F" :lexical)
+      (resolution-at "(block f (defun f (&optional (x (return-from f 1))) x))"
+                     :block '(parse:body 0) 'parse:fun-code '(parse:lambda-list 1 1) 'parse:name))
+  (is equal '("F" :lexical)
+      (resolution-at "(defun f () (return-from f 1))"
+                     :block 'parse:fun-code '(parse:body 0) 'parse:name))
+  (dolist (operator '(flet labels))
+    (let ((source (format nil "(~a ((f (&optional (x (return-from f 1))) (return-from f x))) nil)"
+                          operator)))
+      (is equal '("F" :lexical)
+          (resolution-at source :block '(parse:funs 0 1) '(parse:lambda-list 1 1) 'parse:name))
+      (is equal '("F" :lexical)
+          (resolution-at source :block '(parse:funs 0 1) '(parse:body 0) 'parse:name)))))
+
+(defmacro environment-special-body (name form)
+  `(locally (declare (special ,name)) ,form))
+
+(define-test macro-environment-transformers-special-scope :parent editing
+  (is equal '(nil :special)
+      (resolution-at "(let ((x 1)) (weave-tests::environment-special-body x (print x)))"
+                     :variable '(parse:body 0) '(parse:body 1) '(parse:body 0)))
+  (is equal '(nil :special)
+      (resolution-at "(destructuring-bind (x) '(1) (declare (special x)) (print x))"
+                     :variable '(parse:body 3) '(parse:body 0)))
+  (let* ((source "(weave-tests::environment-special-body x (print x))")
+         (syntax (probe-driver-syntax source))
+         (x (parse::gen-nth 1 syntax))
+         (old-env (parse::env-with-specials (parse:make-env) (list x)))
+         (call (parse::parse syntax old-env
+                            (lambda (source ast) (declare (ignore source)) ast))))
+    ;; A redundant declaration is still an effect when applied to a new parent.
+    (is eq :special
+        (nth-value 1 (parse:env-lookup x :variable
+                                      (parse:location-env call '(parse:body 1)
+                                                          (parse:make-env)))))
+    (is eq nil (parse::%specials (parse:make-env))))
+  (let* ((call (parse "(weave-tests::copied-body x (print x))"))
+         (env (parse::env-with-specials (parse:make-env)
+                                        (list (first (parse:body call)))))
+         (inside (parse:location-env call '(parse:body 1) env)))
+    ;; A new lexical binding overrides an incoming local special declaration.
+    (is eq :lexical (nth-value 1 (parse:env-lookup (first (parse:body call)) :variable inside)))
+    (is eq :special (nth-value 1 (parse:env-lookup (first (parse:body call)) :variable env)))))
+
+(define-test environment-transformers-survive-copy-and-update :parent editing
+  (let* ((original (parse "(defun f () (return-from f))"))
+         (copy (parse:copy-node original)))
+    (dolist (node (list original copy))
+      (let* ((code (parse:fun-code node))
+             (env (parse:location-env code '(parse:body 0)
+                                      (parse:location-env node 'parse:fun-code (parse:make-env)))))
+        (is eq (parse:name node) (parse:env-lookup (parse:name node) :block env))))
+    (let* ((renamed (parse:update copy 'parse:name (sym "G" "WEAVE-TESTS")))
+           (code (parse:fun-code renamed))
+           (env (parse:location-env code '(parse:body 0)
+                                    (parse:location-env renamed 'parse:fun-code (parse:make-env)))))
+      (is eq (parse:name renamed) (parse:env-lookup (parse:name renamed) :block env))
+      (is eq nil (parse:env-lookup (parse:name original) :block env)))))
+
 (define-test binders-and-unbound-references :parent editing
   (is equal '("F" nil) (binder-and-bound "(flet ((f (x) x)) (f 1))" '(parse:body 0) 'parse:name))
   (is equal '("F" nil) (binder-and-bound "(flet ((f () 1)) (function f))" '(parse:body 0) 'parse:fun-designator))
@@ -455,7 +557,7 @@ second\"" (parse:str (parse::docstring code)))
   (is equal '("OUTER" nil) (binder-and-bound "(loop named outer for x in xs do (return-from outer x))"
                                              '(parse:body 7) 'parse:name))
   (is equal '("B" nil) (binder-and-bound "(block b (return-from b 1))" '(parse:body 0) 'parse:name))
-  (is equal '(nil t) (binder-and-bound "(block b (return-from nope 1))" '(parse:body 0) 'parse:name)))
+    (is equal '(nil t) (binder-and-bound "(block b (return-from nope 1))" '(parse:body 0) 'parse:name)))
 
 ;;; selections
 

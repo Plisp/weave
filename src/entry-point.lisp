@@ -69,7 +69,7 @@
         (setf start end)))))
 
 (defun parse-file-loading-system (file)
-  "Loads FILE's owning asdf system before parsing"
+  "Loads `file's owning asdf system before parsing"
   (multiple-value-bind (system component)
       (system-for-file file)
     (unless (asdf:component-loaded-p system)
@@ -94,8 +94,7 @@
                                                 root-loc))))
       (setf *state* tui)
       (setf (location-node root-loc) tui)
-
-      ;; set default background to black and fore to pure white (xterm extension)
+      ;; set default background to black and foreground to pure white (xterm extension)
       (format *terminal-io* "~c]10;#ffffff~c" #\esc (code-char 7))
       (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))
       (unwind-protect

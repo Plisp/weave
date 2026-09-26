@@ -30,18 +30,17 @@
         str)))
 
 (defun list-insert (list item i)
-  "functional insertion, may share structure"
+  "Functional insertion, may share structure"
   `(,@(subseq list 0 i) ,item ,@(nthcdr i list)))
 
 (defun list-update (list item i)
-  "functional replace, may share structure"
+  "Functional replace, may share structure."
   `(,@(subseq list 0 i) ,item ,@(nthcdr (1+ i) list)))
 
 (defun list-remove (list i)
+  "Functional deletion, may share structure."
   `(,@(subseq list 0 i) ,@(nthcdr (1+ i) list)))
 
-;; note: an array's rank elements of `path' address one aref, not one level each, since
-;; a multidimensional array isn't nested the way conses/vectors are
 (defun array-copy (array)
   (let ((copy (make-array (array-dimensions array) :element-type (array-element-type array))))
     (dotimes (i (array-total-size array) copy)
@@ -58,8 +57,7 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
                  (tree-ref (apply #'aref tree (subseq path 0 rank)) (nthcdr rank path)))))))
 
 (defun tree-update (tree path new-value)
-  "Functionally replaces the position at `path' within `tree' with `new-value'. May share
-structure with `tree'."
+  "Functional replace, may share structure."
   (if (null path)
       new-value
       (etypecase tree

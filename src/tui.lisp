@@ -419,10 +419,11 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
              ,value
              (setf (gethash ,key (redisplay-cache ,ui)) (progn ,@body)))))))
 
-(defun bindings-at (loc ui)
-  (with-redisplay-cache (ui (cons (location-node loc) (location-id loc)))
-    (when (member (locsort loc) '(parse:eval-form parse:function-code))
-      (parse:location-bindings (location-node loc) (location-id loc)))))
+(defun environment-at (stack)
+  (let ((env (parse:make-env)))
+    (dolist (loc (reverse stack) env)
+      (when (member (locsort loc) '(parse:eval-form parse:function-code))
+        (setf env (parse:location-env (location-node loc) (location-id loc) env))))))
 
 (defun function-position-p (loc)
   (let ((node (location-node loc))
@@ -443,20 +444,16 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
            (block-position-p loc))))
 
 (defun compute-focus-binder (node stack ui)
+  (declare (ignore ui))
   (let ((loc (car stack)))
     (when (lexical-symbol-ref node loc)
       (let ((kind (cond ((function-position-p loc) :function)
                         ((block-position-p loc) :block)
                         (t :variable)))
-            (name (parse:name node)))
-        (loop for loc in stack
-              do (loop for (k . binder) in (bindings-at loc ui)
-                       do (when (and (eq k kind)
-                                     (typep binder 'parse:binder) ; ignore holes
-                                     (string= name (parse:name binder))
-                                     (eq (parse:home-package node)
-                                         (parse:home-package binder)))
-                            (return-from compute-focus-binder binder))))))))
+            (env (environment-at stack)))
+        (multiple-value-bind (entry kind) (parse:env-lookup node kind env)
+          (let ((binder (ensure-car entry)))
+            (when (and (eq kind :lexical) (typep binder 'parse:binder)) binder)))))))
 
 (defun focus-binder (ui)
   "The binder the symbol-ref under the cursor refers to, innermost binding first."
@@ -464,7 +461,13 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
     (compute-focus-binder (node-at (focus ui)) (stack ui) ui)))
 
 (defun symbol-ref-boundp (node stack ui)
-  (or (compute-focus-binder node stack ui)
+  (declare (ignore ui))
+  (or (eq :lexical
+          (nth-value 1 (parse:env-lookup node
+                                       (cond ((function-position-p (car stack)) :function)
+                                             ((block-position-p (car stack)) :block)
+                                             (t :variable))
+                                       (environment-at stack))))
       ;; blocks are never global
       (and (not (block-position-p (car stack)))
            (multiple-value-bind (symbol found) (parse:resolve node)
@@ -2064,7 +2067,7 @@ ASSUMES we never focus a plain list body."
   ((parse:op parse:situations)
    (1 parse:body)))
 
-(deflayout parse:load-time-value-form ((parse:read-only-p . (hole)))
+(deflayout parse:load-time-value-form ()
   ((parse:op parse:form 1 parse:read-only-p)))
 
 (deflayout parse:function-form ()
