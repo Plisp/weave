@@ -87,13 +87,11 @@
 (defun tui-main (&optional (ast nil astp))
   (let ((ast-list (if astp ast (demo-ast))))
     (check-type ast-list cons)
-    (let* ((root-loc (make-location :node 'undefined))
-           (tui (make-instance 'ui :ast ast-list
-                                   :stack (list (make-location :node ast-list
-                                                               :id 0)
-                                                root-loc))))
+    (let ((tui (make-instance 'ui :ast ast-list)))
       (setf *state* tui)
-      (setf (location-node root-loc) tui)
+      (setf (stack tui)
+            (list (make-location :node ast-list :id 0)
+                  (make-location :node tui :id nil)))
       ;; set default background to black and foreground to pure white (xterm extension)
       (format *terminal-io* "~c]10;#ffffff~c" #\esc (code-char 7))
       (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))

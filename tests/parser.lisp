@@ -2,6 +2,24 @@
 
 (define-test parser)
 
+(define-test macro-call-requires-environment :parent parser
+  (flet ((make-call (&rest initargs)
+           (apply #'make-instance 'parse:macro-call
+                  :op (sym "WHEN") :body nil
+                  :subforms (make-hash-table :test #'eq)
+                  :subform-envs (make-hash-table :test #'eq)
+                  initargs)))
+    (fail (make-call) 'error)
+    (let ((env (parse:make-env)))
+      (is eq env (parse::call-env (make-call :call-env env))))))
+
+(define-test empty-ref-list-default :parent parser
+  (is eq nil (parse:elements (make-instance 'parse:ref-list)))
+  (let ((vector (eclector.parse-result:read-from-string
+                 (parse:make-client "#()") "#()")))
+    (is eq :vector (parse::kind vector))
+    (is eq nil (parse:elements vector))))
+
 (define-test quasiquote-reader-markers :parent parser
   (flet ((read-syntax (source)
            (eclector.parse-result:read-from-string

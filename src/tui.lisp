@@ -46,7 +46,7 @@
                      (and (= (tui:rect-y ra) (tui:rect-y rb))
                           (<= (tui:rect-x ra) (tui:rect-x rb)))))))
 
-(defclass ordered-view (tui:view)
+(defrecord ordered-view (tui:view)
   ()
   (:documentation "A mixin view whose children must be in reading order. Checked at
 construction, do not modify."))
@@ -55,17 +55,10 @@ construction, do not modify."))
   (assert (reading-order-p (tui:children view)) ()
           "Children of ~a are not in reading order: ~a" view (tui:children view)))
 
-(defclass ast-view (ordered-view)
-  ((location :initarg :location
-             :initform (error "ast view must correspond to a location")
-             :accessor location
-             :type location)
-   (view-stack :initform nil
-               :accessor view-stack
-               :type list)
-   (hoverable :initarg :hoverable
-              :initform nil
-              :accessor hoverable)))
+(defrecord ast-view (ordered-view)
+  ((location :mutable t :type location)
+   (view-stack :init nil :mutable t :type list)
+   (hoverable :init nil :mutable t)))
 
 (defgeneric handle-key (node view location ui event)
   (:documentation "event is a uncursed key event. If this node is active then
@@ -73,19 +66,12 @@ adjust cursor state in the context, specialized for the `cursor'.
 If this returns NIL, propagate up the cursor stack.")
   (:method (node view location context event) nil))
 
-(defclass completion-state ()
-  ((anchor :initarg :anchor
-           :accessor anchor
-           :documentation "the node associated with this completion")
-   (candidates :initarg :candidates
-               :accessor candidates)
-   (selection :initform 0
-              :accessor selection)))
+(defrecord completion-state ()
+  ((anchor :mutable t)
+   (candidates :mutable t)
+   (selection :init 0 :mutable t)))
 
-(defstruct undo-state
-  (ast (error "must provide ast"))
-  (stack (error "must provide focus stack") :type list))
-
+;; TODO currently uses change-class, make struct once settled
 (defclass selection ()
   (;; tracks the stack during selection-mode, for growing and shrinking zippers
    (context :initarg :context
@@ -108,6 +94,23 @@ If this returns NIL, propagate up the cursor stack.")
           :initform (error "no stack")
           :reader zipper-stack
           :type list)))
+
+(defrecord undo-state ()
+  ((ast)
+   (stack :type list))
+  (:representation :struct))
+
+;; (defrecord selection ()
+;;   (;; tracks the stack during selection-mode, for growing and shrinking zippers
+;;    (context :mutable t)
+;;    ;; the location of the child where the selection was started
+;;    (location)
+;;    (point :mutable t :type integer)
+;;    (activep :init t :mutable t)))
+
+;; (defrecord zipper (selection)
+;;   ;; from the selection start location out to the top of the zipper
+;;   ((stack :type list)))
 
 (defun end-selection-mode (ui)
   (when-let (selection (selection ui))
@@ -159,39 +162,39 @@ If this returns NIL, propagate up the cursor stack.")
   (when (location-selected-p ui (stack ui))
     (selection ui)))
 
-(defclass cutbuffer ()
-  ((forms :initarg :forms
-          :initform (error "no forms")
-          :reader cutbuffer-forms)
-   (sorts :initarg :sorts
-          :initform (error "no sorts")
-          :reader cutbuffer-sorts)))
+(defrecord cutbuffer ()
+  ((forms)
+   (sorts))
+  (:representation :struct))
 
 ;; computed during redisplay from current toplevel
-(defstruct segment
-  (index (error "Missing segment index") :type (integer 0) :read-only t)
-  (start (error "Missing segment start") :type (integer 0) :read-only t)
-  (rows (error "Missing segment height") :type (integer 1) :read-only t)
-  (buffer (error "Missing segment buffer") :type (array tui::cell (* *)) :read-only t)
-  (view (error "Missing segment view") :type tui:view :read-only t))
+(defrecord segment ()
+  ((index :type (integer 0))
+   (start :type (integer 0))
+   (rows :type (integer 1))
+   (buffer :type (array tui::cell (* *)))
+   (view :type tui:view))
+  (:representation :struct))
 
 ;; segment index + relative row offset
-(defstruct scroll-position
-  (index 0 :type (integer 0) :read-only t)
-  (row 0 :type (integer 0) :read-only t))
+(defrecord scroll-position ()
+  ((index :type (integer 0))
+   (row :init 0 :type (integer 0)))
+  (:representation :struct))
 
-(defstruct scroll-state
-  (position (make-scroll-position) :type scroll-position)
-  ;; total number of rows
-  (rows 0 :type (integer 0))
-  ;; start of viewport
-  (viewport-row 0 :type (integer 0))
-  (segments nil :type list))
+;;XXX flag
+(defrecord scroll-state ()
+  ((position :type scroll-position)
+   ;; total number of rows
+   (rows :type (integer 0))
+   ;; start of viewport
+   (viewport-row :type (integer 0))
+   (segments :type list))
+  (:representation :struct))
 
 (defun copy-locations (locations)
-  (make-instance 'cutbuffer
-                 :forms (mapcar (lambda (loc) (parse:copy-node (node-at loc))) locations)
-                 :sorts (mapcar #'locsort locations)))
+  (make-cutbuffer :forms (mapcar (lambda (loc) (parse:copy-node (node-at loc))) locations)
+                  :sorts (mapcar #'locsort locations)))
 
 (defclass ui (tui:elemental)
   ((ast :initarg :ast ; this slot exists to cache the back of the stack (root)
@@ -200,20 +203,22 @@ If this returns NIL, propagate up the cursor stack.")
    (edit-loc :initarg :edit-loc
              :initform nil
              :accessor edit-loc)
-   (cutbuffer :initform nil
-              :accessor cutbuffer)
    (goal-col :initform 1
              :accessor goal-col
              :type positive-fixnum)
    (completion-state :initform nil
                      :accessor completion-state
                      :type (or null completion-state))
+   ;; selection
    (selection :initform nil
               :accessor selection
               :type (or null selection))
    (zipper :initform nil
            :accessor zipper
            :type (or null zipper))
+   (cutbuffer :initform nil
+              :accessor cutbuffer)
+   ;; undo
    (history :initform (list)
             :accessor history
             :type list)
@@ -222,6 +227,7 @@ If this returns NIL, propagate up the cursor stack.")
            :type list)
    ;; maintained by every edit and cursor move
    (stack :initarg :stack
+          :initform nil
           :accessor stack ; stack is always non-empty
           :type list)
    (goal-stacks :initform nil
@@ -234,8 +240,12 @@ If this returns NIL, propagate up the cursor stack.")
                             :accessor redisplayed-since-input)
    (redisplay-cache :initform (make-hash-table :test #'equal)
                     :reader redisplay-cache)
-   (scroll-state :initform (make-scroll-state)
-                 :reader scroll-state)
+   (scroll-state :initform (make-scroll-state :position (make-scroll-position :index 0)
+                                              :rows 0
+                                              :viewport-row 0
+                                              :segments nil)
+                 :accessor scroll-state
+                 :type scroll-state)
    (focus-rect :initform nil
                :accessor focus-rect
                :type (or null tui:rect))
@@ -526,6 +536,7 @@ since these aren't a proper location."
           (funcall handler view ui)))
     ;; state updates here
     (when-let (completion (completion-state ui))
+      ;; edit: with-accessors to let
       (with-accessors ((candidates candidates)
                        (anchor anchor))
           completion
@@ -979,9 +990,8 @@ if none, surround current atom"
                  (setf (anchor state) newnode)
                  (when (plusp (length s)) ; now length 2, completion for if
                    (setf (completion-state ui)
-                         (make-instance 'completion-state
-                                        :anchor newnode
-                                        :candidates (completion-candidates ui))))))
+                         (make-completion-state :anchor newnode
+                                                :candidates (completion-candidates ui))))))
              t)
             ((char= c #\Rubout)
              (let ((s (string s)))
@@ -992,9 +1002,9 @@ if none, surround current atom"
                      (swap-node location newnode ui)
                      (when (completion-state ui)
                        (setf (completion-state ui)
-                             (make-instance 'completion-state
-                                            :anchor newnode
-                                            :candidates (completion-candidates ui)))))
+                             (make-completion-state
+                              :anchor newnode
+                              :candidates (completion-candidates ui)))))
                    (swap-node location (hole) ui)))
              t)))))
 
@@ -1724,11 +1734,15 @@ already and focuses the hole."
 (defvar *default-expansions* (make-hash-table :test #'eq)
   "Operator symbol -> closure constructing a default node for that form.")
 
-(defstruct (layout (:constructor make-layout (type rows templates)))
-  "Describes the rendered shape of `type'.
-`rows' describe horizontal order and `templates' contains (slot . constructor)
-pairs building new elements for &rest and &body slots."
-  type rows templates)
+(defrecord layout ()
+  ((op :type symbol)
+   (rows :type list)
+   (templates))
+  (:representation :struct)
+  (:documentation
+   "Describes the rendered shape of a call to `op'.
+`rows' are laid out vertically and `templates' contains (slot . constructor)
+pairs building new elements of &rest and &body slots."))
 
 (defvar *layouts* (make-hash-table :test #'eq) "Form class -> its `layout'.")
 
@@ -1744,7 +1758,7 @@ pairs building new elements for &rest and &body slots."
   (cdr (assoc slot (layout-templates layout))))
 
 (defun slot-kind (layout slot)
-  (cdr (assoc slot (parse:form-slot-kinds (layout-type layout)))))
+  (cdr (assoc slot (parse:form-slot-kinds (layout-op layout)))))
 
 (defgeneric focus-order (node)
   (:method (node)
@@ -1791,7 +1805,7 @@ pairs building new elements for &rest and &body slots."
 
 (defun default-node (layout)
   "A form of the class of `layout' with every slot in its default state."
-  (apply #'make-instance (layout-type layout)
+  (apply #'make-instance (layout-op layout)
          (loop for slot in (layout-slots layout)
                unless (eq slot 'parse:op)
                  append (list (make-keyword slot)
@@ -1946,9 +1960,13 @@ pairs building new elements for &rest and &body slots."
       (gethash (tui-sys:make-event :kind #\() *layout-key-handlers*) #'layout-wrap)
 
 (defun register-layout (layout)
-  (setf (gethash (layout-type layout) *layouts*) layout
-        (gethash (parse:op (make-instance (layout-type layout))) *default-expansions*)
-        (lambda () (default-node layout))))
+  (assert (ends-with-subseq "-FORM" (string (layout-op layout))))
+  (let ((len (length "-FORM")))
+    (setf (gethash (layout-op layout) *layouts*) layout
+          (gethash (find-symbol (string-drop (string (layout-op layout)) len)
+                                "WEAVE-PARSER")
+                   *default-expansions*)
+          (lambda () (default-node layout)))))
 
 (defmacro deflayout (type templates rows)
   "Lays out forms of class `type' in `rows' of slots, where `templates' are forms building
@@ -1956,8 +1974,10 @@ new elements for its &rest and &body slots.
 ASSUMES that &rest slots accept (slot i j) even if the list is optional like let.
 ASSUMES we never focus a plain list body."
   `(register-layout
-    (make-layout ',type ',rows (list ,@(loop for (slot . template) in templates
-                                             collect `(cons ',slot (lambda () ,template)))))))
+    (make-layout :op ',type
+                 :rows ',rows
+                 :templates (list ,@(loop for (slot . template) in templates
+                                          collect `(cons ',slot (lambda () ,template)))))))
 
 (deflayout parse:let*-form ((parse:vars . (ref-list (hole) (hole)))
                             (parse:body . (hole)))
@@ -2736,11 +2756,13 @@ is a list and never focused."
                                     (aref (segment-buffer segment) row col)))))))
           (dolist (segment segments)
             (blit-segment segment viewport)))
-        (setf (scroll-state-position state) (scroll-position-at-row segments viewport)
-              (scroll-state-rows state) height
-              (scroll-state-segments state) segments
-              (scroll-state-viewport-row state) viewport
-              (focus-rect ui) rect
+        (setf (scroll-state ui)
+              (make-scroll-state :position (scroll-position-at-row segments viewport)
+                                 :rows height
+                                 :segments segments
+                                 :viewport-row viewport))
+        ;; edit: split up setf
+        (setf (focus-rect ui) rect
               (gethash forms (node-views ui)) root)
         root))))
 

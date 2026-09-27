@@ -26,10 +26,8 @@
          (ast (cond ((null parsed) (list (parse:hole)))
                     ((listp parsed) parsed)
                     (t (list parsed))))
-         (root (w::make-location :node 'undefined))
-         (ui (make-instance 'w::ui :ast ast :stack (list root))))
-    (setf (w::location-node root) ui
-          (w::stack ui) (list root))
+         (ui (make-instance 'w::ui :ast ast)))
+    (setf (w::stack ui) (list (w::make-location :node ui :id nil)))
     (w::descend ui 0)
     ui))
 

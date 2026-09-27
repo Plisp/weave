@@ -58,56 +58,36 @@
 ;;
 
 ;; mixin for tracking inactive text
-(defclass anchor ()
-  ((leading :initarg :leading
-            :initform nil
-            :accessor leading
-            :documentation "comments and reader conditionals written just before")
-   (trailing :initarg :trailing
-             :initform nil
-             :accessor trailing
-             :documentation "written just after")
-   (inside :initarg :inside
-           :initform nil
-           :accessor inside
-           :documentation "written within, only for an empty sequence")))
+(defrecord anchor ()
+  ((leading :init nil :mutable t)
+   (trailing :init nil :mutable t)
+   ;; only for empty lists
+   (inside :init nil :mutable t))
+  (:documentation "represents comments and reader-conditionals"))
 
-(defclass atom-form (anchor)
+(defrecord atom-form (anchor)
   ())
 
-(defclass eval-form (anchor)
-  ((typ :initform nil
-        :accessor typ))
+(defrecord eval-form (anchor)
+  ((typ :init nil :mutable t))
   (:documentation "Form in an evaluation context, perhaps quoted."))
 
-(defclass literal (eval-form atom-form)
-  ((str :initarg :str
-        :initform (error "literal not provided")
-        :reader str
-        :type string))
+(defrecord literal (eval-form atom-form)
+  ((str :type string))
   (:documentation "Atomic literal"))
 
-(defclass symbol-ref (eval-form atom-form)
-  ((name :initarg :name
-         :initform (error "must provide symbol ref name")
-         :reader name
-         :type string)
+(defrecord symbol-ref (eval-form atom-form)
+  ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
-   (home-package :initarg :home-package
-                 :initform *package*
-                 :reader home-package))
+   (home-package :init *package*))
   (:documentation "Represents a symbol, possibly referring to a symbol macro."))
-(defun symbol-ref-p (x) (typep x 'symbol-ref))
 
-(defclass binder (symbol-ref)
+(defrecord binder (symbol-ref)
   ()
   (:documentation "Represents a binder, NOT a reference in evaluation position."))
 
-(defclass hole ()
-  ((text :initarg :text
-         :initform ""
-         :accessor text
-         :type simple-string))
+(defrecord hole ()
+  ((text :init "" :mutable t :type simple-string))
   (:documentation "Stands in for a reader atom, or evaluated form."))
 (defun hole (&optional (text "")) (make-instance 'hole :text text))
 (defmethod name ((o hole)) "hole")
@@ -121,112 +101,63 @@
   '(or symbol-like hole))
 (deftype gen-list () '(or list ref-list))
 
-(defclass function-call (eval-form)
-  ((name :initarg :name
-         :initform (error "must provide function name")
-         :reader name)
-   (body :initarg :body
-         :initform (error "must provide function argument list")
-         :reader body
-         :type list))
+(defrecord function-call (eval-form)
+  ((name) (body :type list))
   (:documentation "body is a list of eval-forms"))
 
-(defclass irregular-form (eval-form)
+(defrecord irregular-form (eval-form)
   ()
   (:documentation "macro invocation or special operator"))
 
-(defclass macro-call (irregular-form)
-  ((op :initarg :op
-       :reader op)
-   (body :initarg :body
-         :initform (error "must provide unknown call body")
-         :reader body
-         :type list)
+(defrecord macro-call (irregular-form)
+  ((op) (body :type list)
    ;; this is a cache
-   (call-env :initarg :call-env
-             :initform nil
-             :reader call-env)
-   (subforms :initarg :subforms
-             :reader subforms
-             :documentation "Evaluated syntax in the body -> (parsed . binders in scope)")
-   (subform-envs :initarg :subform-envs
-                 :initform (make-hash-table :test #'eq)
-                 :reader subform-envs)
-   (expanded :initarg :expanded
-             :initform t
-             :reader expanded
-             :documentation "Whether the call's own macroexpansion succeeded")))
+   (call-env :type env)
+   ;; Evaluated syntax in the body -> (parsed . binders in scope)
+   (subforms)
+   (subform-envs)
+   ;; Whether the call's own macroexpansion succeeded
+   (expanded :init t)))
 
-(defclass ref-list (anchor)
-  ((elements :initarg :elements
-             :initform nil
-             :accessor elements
-             :type list)
+(defrecord ref-list (anchor)
+  ((elements :init nil :mutable t :type list)
    ;; note: an array holds one element - the contents as written
-   (kind :initarg :kind
-         :initform :list
-         :accessor kind
-         :type (member :list :vector :array))
-   (rank :initarg :rank
-         :initform nil
-         :accessor rank
-         :documentation "of an :array, which cannot be told from its contents")))
-(defun ref-list-p (x) (typep x 'ref-list))
+   (kind :init :list :mutable t :type (member :list :vector :array))
+   ;; an array is represented as nested written lists
+   (rank :init nil :mutable t)))
 
 (defmethod elements ((x list)) x)
 
-(defclass function-code (anchor)
-  ((lambda-list :initarg :lambda-list
-                :reader lambda-list
-                :type ref-list)
-   (lambda-list-kind :initarg :lambda-list-kind
-                     :reader lambda-list-kind
-                     :type (member :lambda :macro-lambda :method-lambda))
-   (docstring :initarg :docstring
-              :initform nil
-              :reader docstring
-              :type (or null literal string))
-   (declarations :initarg :declarations
-                 :initform nil
-                 :reader declarations
-                 :type list)
-   (body :initarg :body
-         :reader body
-         :type list))
+(defrecord function-code (anchor)
+  ((lambda-list :type ref-list)
+   (lambda-list-kind :type (member :lambda :macro-lambda :method-lambda))
+   (docstring :init nil :type (or null literal string))
+   (declarations :init nil :type list)
+   (body :type list))
   (:documentation "(macro) lambda list and body list of eval-forms"))
 
-(defclass reader-marker (symbol-ref)
+(defrecord reader-marker (symbol-ref)
   ()
   (:documentation "A symbol inserted to represent reader syntax"))
 
-(defclass comment ()
-  ((str :initarg :str
-        :accessor str)
-   (kind :initarg :kind
-         :initform :line
-         :accessor kind
-         :type (or (eql :line) (eql :block))))
+(defrecord comment ()
+  ((str :mutable t)
+   (kind :init :line :mutable t :type (or (eql :line) (eql :block))))
   (:documentation ""))
 
-(defclass dot-marker (reader-marker)
+(defrecord dot-marker (reader-marker)
   ()
   (:documentation "The dot marker produced by the reader as a symbol.
 This class exists because an uninterned symbol also has a null HOME-PACKAGE,
 so a name test alone can't distinguish #:|.| from a dot."))
-(defun dot-marker-p (x) (typep x 'dot-marker))
 
-(defclass label-ref (reader-marker)
+(defrecord label-ref (reader-marker)
   ()
   (:documentation "#n#, distinguished from the uninterned #:|n|"))
 
-(defclass label-def (eval-form atom-form)
-  ((name :initarg :name
-         :initform (error "must provide label name")
-         :reader name
-         :type string)
-   (labeled :initarg :labeled
-            :initform (error "must provide labeled form")
-            :reader labeled))
+(defrecord label-def (eval-form atom-form)
+  ((name :type string)
+   (labeled))
   (:documentation "#n=form"))
 
 (defmethod print-object ((object comment) stream)
@@ -318,25 +249,27 @@ so a name test alone can't distinguish #:|.| from a dot."))
                                            (copy-scope-change change form-pairs)))
                                    (subform-envs o))
                           table))
-         :subforms (let ((table (make-hash-table :test #'eq)))
-                     (maphash (lambda (form entry)
-                                (let ((copy (gethash form form-pairs)))
-                                  (setf (gethash copy table)
-                                        ;; check if the parsed copy (car entry) differs
-                                        ;; otherwise key under the call copy
-                                        (cons (if (eq (car entry) form)
-                                                  copy
-                                                  (copy-node (car entry)))
-                                              (when (cdr entry)
-                                                (let ((binders (make-hash-table :test #'eq)))
-                                                  (maphash (lambda (binder kinds)
-                                                             (setf (gethash (gethash binder form-pairs)
-                                                                            binders)
-                                                                   (copy-list kinds)))
-                                                           (cdr entry))
-                                                  binders))))))
-                              (subforms o))
-                     table)))))
+         :subforms
+         (let ((table (make-hash-table :test #'eq)))
+           (maphash
+            (lambda (form entry)
+              (let ((copy (gethash form form-pairs)))
+                (setf (gethash copy table)
+                      ;; check if the parsed copy (car entry) differs
+                      ;; otherwise key under the call copy
+                      (cons (if (eq (car entry) form)
+                                copy
+                                (copy-node (car entry)))
+                            (when (cdr entry)
+                              (let ((binders (make-hash-table :test #'eq)))
+                                (maphash (lambda (binder kinds)
+                                           (setf (gethash (gethash binder form-pairs)
+                                                          binders)
+                                                 (copy-list kinds)))
+                                         (cdr entry))
+                                binders))))))
+            (subforms o))
+           table)))))
   (:method ((o ref-list))
     (make-instance 'ref-list :elements (mapcar #'copy-node (elements o))
                              :kind (kind o) :rank (rank o)))
@@ -392,11 +325,11 @@ so a name test alone can't distinguish #:|.| from a dot."))
                        (list (to-syntax elt)))))))
 
 ;;; location
-(defstruct location
-  "`id's are typically either (slot) or (slot integer*) and should respect `cl:equal'.
-They are specific to the `node' type."
-  (node (error "must provide parent node"))
-  (id nil))
+(defrecord location ()
+  ((node) (id))
+  (:representation :struct)
+  (:documentation "`id's are typically either (slot) or (slot integer*) and should respect
+`cl:equal'. They are specific to the `node' type."))
 
 (defun append-id (id i)
   (if (atom id)
@@ -1136,12 +1069,13 @@ last position is a return value rather than documentation."
         (or (search-tree o (car tree))
             (some (lambda (m) (search-tree o m)) (cdr tree)))))
 
-  (defstruct function-info
-    (arglist nil :type gen-list)
+  (defrecord function-info ()
+    ((arglist :type gen-list)
     ;; note: the string as written, which in our representation is a LITERAL node
-    (documentation nil :type (or null string literal))
-    (decls nil :type list)
-    (body nil :type list))
+     (documentation :init nil :type (or null string literal))
+     (decls :init nil :type list)
+     (body :init nil :type list))
+    (:representation :struct))
 
   (defun eval-ctx-p (tag binds)
     (loop for (ctx) in binds thereis (eq tag ctx)))
@@ -1649,24 +1583,20 @@ Any binding forces a symbol match.
          (declaration-tag (car (rassoc '&declarations (spec-kinds spec))))
          (specials (when declaration-tag `(declaration-specials (first ,declaration-tag)))))
     `(progn
-       (defclass ,classname (irregular-form)
-         ((op :initarg :op :initform ',name :accessor op)
-          ,@(loop for name in slots
-                  collect `(,name :initarg ,(make-keyword name)
-                                  :initform nil
-                                  :accessor ,name))))
+       (defrecord ,classname (irregular-form)
+         ((op :init ',name) ,@(mapcar #'list slots)))
        (setf (gethash ',classname *form-slot-kinds*) ',(spec-kinds spec))
        ;; methods
        ,(when (member 'body slots)
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
        (defmethod copy-node ((old ,classname))
-         (let ((new (make-instance ',classname :op (op old))))
+         (make-instance ',classname :op (op old)
            ,@(loop for name in slots
-                   collect (if (member (cdr (assoc name (spec-kinds spec)))
-                                       '(&body &declarations &rest-qualifiers))
-                               `(setf (,name new) (mapcar #'copy-node (,name old)))
-                               `(setf (,name new) (copy-node (,name old)))))
-           new))
+                   append (list (make-keyword name)
+                                (if (member (cdr (assoc name (spec-kinds spec)))
+                                            '(&body &declarations &rest-qualifiers))
+                                    `(mapcar #'copy-node (,name old))
+                                    `(copy-node (,name old)))))))
        ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
        ,@(syntax-methods name classname spec rest-patterns)
        (defmethod suffix-path ((node ,classname) suffix)
@@ -1674,7 +1604,7 @@ Any binding forces a symbol match.
            (if (zerop (first suffix))
                (list 'op)
                (spec-suffix-path node ',spec ',rest-patterns
-                                (1- (first suffix)) (rest suffix)))))
+                                 (1- (first suffix)) (rest suffix)))))
        ;; exports
        (export ',classname)
        ,@(loop for name in slots
@@ -1721,11 +1651,11 @@ Any binding forces a symbol match.
                                        (with-gensyms (name info)
                                          `(loop
                                             for ,name
-                                              in ,(first (cdr (assoc whole-tag
-                                                                     rest-patterns)))
+                                              in ,(first
+                                                   (cdr (assoc whole-tag rest-patterns)))
                                             for ,info
-                                              in ,(lastcar (cdr (assoc whole-tag
-                                                                       rest-patterns)))
+                                              in ,(lastcar
+                                                   (cdr (assoc whole-tag rest-patterns)))
                                             collect
                                             (list* ,name
                                                    (function-info-arglist ,info)
@@ -1867,16 +1797,16 @@ Any binding forces a symbol match.
              (defun ,(symbolicate name "-PARSER") (rawform env walker alter-identity)
                (declare (ignorable env walker alter-identity))
                (,(symbolicate "WITH-PARSED-" name) (rawform t)
-                (let ((ast (make-instance ',classname
-                                          :op (if (typep (gen-car rawform) 'reader-marker)
-                                                  ',(symbolicate "READ-" name)
-                                                  ',name))))
-                  ,@
-                  (loop
+                (make-instance
+                 ',classname :op (if (typep (gen-car rawform) 'reader-marker)
+                                     ',(symbolicate "READ-" name)
+                                     ',name)
+                 ,@(loop
                     for tag in slots
                     for entries := (plist-alist (cdr (assoc tag binds)))
                     for tag-kind := (cdr (assoc tag tag-kinds))
-                    collect
+                    append
+                    (list (make-keyword tag)
                     (flet ((walk-function-body (env info augment-body kind)
                              `(loop
                                 with newenv-with-params := ,env
@@ -1954,37 +1884,35 @@ Any binding forces a symbol match.
                                                 (env-with-variables
                                                  ,newenv (list (gen-ensure-car ,whole))
                                                  ,specials))
-                                       finally (setf (,tag ast)
-                                                     (when (first ,tag)
-                                                       (with-elements (first ,tag)
-                                                         (nreverse ,res))))))
+                                       finally (return
+                                                 (when (first ,tag)
+                                                   (with-elements (first ,tag)
+                                                     (nreverse ,res))))))
                                   ;; normal, parallel bindings
                                   (with-gensyms (whole)
-                                    `(setf
-                                      (,tag ast)
-                                      (when (first ,tag)
+                                    `(when (first ,tag)
                                        (with-elements (first ,tag)
-                                       (mapcar
-                                        (lambda (,whole)
-                                          (if (symbol-ref-p ,whole)
-                                              (change-class ,whole 'binder)
-                                              (with-elements ,whole
-                                                `(,(change-class (gen-car ,whole) 'binder)
-                                                  ,@,(if (cdr (assoc value-tag tag-kinds))
-                                                         ;;(b &body)
-                                                         `(mapcar (rcurry walker env)
-                                                                  (gen-cdr ,whole))
-                                                         `(list (funcall walker
-                                                                         (gen-nth 1 ,whole)
-                                                                         env)))))))
-                                        (elements (first ,tag))))))))))
+                                         (mapcar
+                                          (lambda (,whole)
+                                            (if (symbol-ref-p ,whole)
+                                                (change-class ,whole 'binder)
+                                                (with-elements ,whole
+                                                  `(,(change-class (gen-car ,whole) 'binder)
+                                                    ,@,(if (cdr (assoc value-tag tag-kinds))
+                                                           ;;(b &body)
+                                                           `(mapcar (rcurry walker env)
+                                                                    (gen-cdr ,whole))
+                                                           `(list (funcall walker
+                                                                           (gen-nth 1 ,whole)
+                                                                           env)))))))
+                                          (elements (first ,tag)))))))))
                            ;; function-like bindings
                            ((list (type symbol)
                                   (and (or (eql '&lambda) (eql '&macro-lambda)) lambda-kind)
                                   (type symbol))
                             (let ((name-tag (first (cdr (assoc tag rest-patterns))))
                                   (code-tag (lastcar (cdr (assoc tag rest-patterns)))))
-                              (with-gensyms (res newenv name fun info)
+                              (with-gensyms (res newenv name info fun)
                                 `(loop
                                    with ,res := (list)
                                    with ,newenv
@@ -2000,56 +1928,50 @@ Any binding forces a symbol match.
                                    ;; note: NAME-TAG and CODE-TAG are accumulated by push,
                                    ;; this loop reverses the order back to normal
                                    do (push (list (change-class ,name 'binder) ,fun) ,res)
-                                   finally (setf (,tag ast)
-                                                 (when (first ,tag)
-                                                   (with-elements (first ,tag)
-                                                     (mapcar #'with-elements
-                                                             (elements (first ,tag))
-                                                             ,res))))))))))
+                                   finally (return
+                                             (when (first ,tag)
+                                               (with-elements (first ,tag)
+                                                 (mapcar #'with-elements
+                                                         (elements (first ,tag))
+                                                         ,res))))))))))
                         ;; non-&rest binder
                         ((loop for (ctx . %entries) in binds
                                thereis (cdr (rassoc tag (plist-alist %entries))))
-                         `(setf (,tag ast)
-                                (when-let (b (first ,tag)) (change-class b 'binder))))
+                         `(when-let (b (first ,tag)) (change-class b 'binder)))
                         ;; unevaluated - declarations, tags etc.
-                        ((not (assoc tag binds)) `(setf (,tag ast) (first ,tag)))
+                        ((not (assoc tag binds)) `(first ,tag))
                         ;; evaluation contexts
                         (t ; body tags aren't duplicated, so just take the first
                          (ecase tag-kind
-                           ((&declarations &rest-qualifiers)
-                            `(setf (,tag ast) (first ,tag)))
+                           ((&declarations &rest-qualifiers) `(first ,tag))
                            ((&body &rest nil)
-                            `(setf (,tag ast)
-                                   ,(if tag-kind
-                                        (with-gensyms (body-form newenv)
-                                          `(loop
-                                             with ,newenv := ,(body-env
-                                                               (augment-env `env entries)
-                                                               tag)
-                                             for ,body-form in (first ,tag)
-                                             collect (funcall walker ,body-form ,newenv)))
-                                        ;; assume walker will call alter-identity
-                                        `(funcall walker (first ,tag)
-                                                  ,(augment-env `env entries)))))
+                            (if tag-kind
+                                (with-gensyms (body-form newenv)
+                                  `(loop
+                                     with ,newenv := ,(body-env
+                                                       (augment-env `env entries)
+                                                       tag)
+                                     for ,body-form in (first ,tag)
+                                     collect (funcall walker ,body-form ,newenv)))
+                                ;; assume walker will call alter-identity
+                                `(funcall walker (first ,tag)
+                                          ,(augment-env `env entries))))
                            ((&lambda &macro-lambda &method-lambda)
-                            (with-gensyms (newenv)
-                              `(let ((,newenv ,(augment-env
-                                               `env (remove :block entries :key #'car))))
-                                 (setf (,tag ast)
-                                       ,(walk-function-body
-                                         `,newenv
-                                         `(first ,tag)
-                                         (if (eq tag-kind '&method-lambda)
-                                             `(env-with-blocks
-                                               (env-with-functions newenv-with-params
-                                                                   '(next-method-p
-                                                                     call-next-method))
-                                               (append ,@(collect-block-tags entries)))
-                                             `(env-with-blocks
-                                               newenv-with-params
-                                               (append ,@(collect-block-tags entries))))
-                                         tag-kind))))))))))
-                  ast)))
+                            (walk-function-body
+                             (augment-env
+                              `env (remove :block entries :key #'car))
+                             `(first ,tag)
+                             (if (eq tag-kind '&method-lambda)
+                                 `(env-with-blocks
+                                   (env-with-functions newenv-with-params
+                                                       '(next-method-p
+                                                         call-next-method))
+                                   (append ,@(collect-block-tags entries)))
+                                 `(env-with-blocks
+                                   newenv-with-params
+                                   (append ,@(collect-block-tags entries))))
+                             tag-kind))))))))
+                  )))
              ))
        (setf (gethash ',name *special-walkers*) ',(symbolicate name "-WALKER"))
        (setf (gethash ',name *special-parsers*) ',(symbolicate name "-PARSER"))
@@ -2644,10 +2566,11 @@ XXX performs unguarded read-evaluation."
                          (setf (cdr before) sym))))
                (setf form (nth i form)))))
 
-(defstruct probe-info
-  (source (error "no source") :type (or symbol-ref ref-list hole))
-  (sort (error "no sort") :type (member :exp :ref :binder))
-  (namespace (error "no namespace") :type (member nil :variable :function :block :tag)))
+(defrecord probe-info ()
+  ((source :type (or symbol-ref ref-list hole))
+   (sort :type (member :exp :ref :binder))
+   (namespace :type (member nil :variable :function :block :tag)))
+  (:representation :struct))
 
 (defun call-with-macro-probes (call env accept-probe consume-probes)
   "Probe evaluated arguments and binders directly under `call'.
@@ -2893,9 +2816,10 @@ calls during macroexpansion before the walker observes their names."
        ((and error (not (or ast-parse-error analysis-invariant-error))) ()
          (values (make-hash-table :test #'eq) (make-hash-table :test #'eq) nil)))))
 
-(defstruct (scope-change (:copier nil))
-  (env (error "no env") :type env)
-  (special-steps (error "no special-steps") :type list))
+(defrecord scope-change ()
+  ((env :type env)
+   (special-steps :type list))
+  (:representation :struct))
 
 (defun apply-scope-change (change outer-env)
   "Apply the macro-local scope `change' to `outer-env' without retaining its old parent."
@@ -2968,7 +2892,8 @@ calls during macroexpansion before the walker observes their names."
 (defun macro-call-envmap (call env parser)
   "Identifies body forms and binding scopes to return a map of {sexp -> parsed binder-env}.
 Walks subforms of the call using `parser' during analysis, which should return the parsed
-entry to be keyed in the map. The second value is NIL when the call fails to expand."
+entry to be keyed in the map and a table of environments.
+The third value is a boolean indicating if the call expansion succeeded."
   (with-analysis-handlers
     (let ((subform-asts (make-hash-table :test #'eq))
           (subform-envs (make-hash-table :test #'eq)))
@@ -3084,7 +3009,7 @@ Returns NIL when the call is unparseable or fails to expand."
                            op
                            (mapcar (rcurry #'unparse-syntax (subforms call)) body)))))
     (handler-case
-        (let ((new (parse syntax (or (call-env call) +nullenv+) #'copy-anchors)))
+        (let ((new (parse syntax (call-env call) #'copy-anchors)))
           (unless (and (typep new 'macro-call) (not (expanded new)))
             (copy-anchors call new)))
       (ast-parse-error () nil))))
@@ -3099,6 +3024,7 @@ Returns NIL when the call is unparseable or fails to expand."
                 :op op :body body
                 :call-env (call-env node)
                 :expanded nil
+                :subform-envs (make-hash-table :test #'eq)
                 :subforms (let ((table (make-hash-table :test #'eq)))
                             (maphash (lambda (form entry)
                                        (setf (gethash form table) (list (car entry))))
@@ -3251,30 +3177,18 @@ Returns NIL when the call is unparseable or fails to expand."
 ;;
 ;;; eclector reader
 ;;
-(defclass my-client (eclector.parse-result:parse-result-client)
-  ((source :initarg :source
-           :initform (error "no source")
-           :reader source
-           :type string)
-   (source-offset :initform 0
-                  :accessor source-offset)))
+(defrecord my-client (eclector.parse-result:parse-result-client)
+  ((source :type string)
+   (source-offset :init 0 :mutable t)))
 
 (defun make-client (source)
   (make-instance 'my-client :source source))
 
 ;; and or not
-(defclass read-cond (eval-form atom-form)
-  ((str :initarg :str
-        :initform (error "no str")
-        :reader str
-        :documentation "may include comments between the conditional and object")
-   (flags :initarg :flags
-          :initform (error "no flags")
-          :reader flags)
-   (kind :initarg :kind
-         :initform (error "no kind")
-         :reader kind
-         :type (or (eql #\+) (eql #\-)))))
+(defrecord read-cond (atom-form)
+  ((str)
+   (flags)
+   (kind :type (or (eql #\+) (eql #\-)))))
 
 (defmethod copy-node ((old read-cond))
   (make-instance 'read-cond :kind (kind old) :flags (flags old) :str (str old)))
@@ -3282,11 +3196,14 @@ Returns NIL when the call is unparseable or fails to expand."
 (defmethod print-object ((object read-cond) stream)
   (format stream "<~a~a ~a>" (kind object) (flags object) (str object)))
 
-(defstruct read-evaluated form feature-p)
-(defstruct read-feature
-  "Tags a value read as a feature expression, which eclector doesn't distinguish from a
-keyword or a list. Consumed by the conditional one level up, never part of the tree."
-  result)
+(defrecord read-evaluated ()
+  ((form) (feature-p))
+  (:representation :struct))
+(defrecord read-feature ()
+  ((result))
+  (:representation :struct)
+  (:documentation "Tags a value read as a feature expression, which eclector doesn't distinguish from a
+keyword or a list. Consumed by the conditional one level up, never part of the tree."))
 
 (defun label-reference-p (client source)
   "Whether the span is some #n#. Needed for objects in construction."
@@ -3435,11 +3352,10 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
                       (lastcar children)))
                    (t
                     ;; a feature expression, tagged for the conditional above to consume
-                    (make-read-feature
-                     :result (mapcar (lambda (c) (if (read-feature-p c)
-                                                (read-feature-result c)
-                                                c))
-                                     children))))))
+                    (make-read-feature :result (mapcar (lambda (c) (if (read-feature-p c)
+                                                                  (read-feature-result c)
+                                                                  c))
+                                                       children))))))
         (typecase result
           (cons
            (flet ((maybe-wrap (name)

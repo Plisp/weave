@@ -11,6 +11,7 @@
            #:string-drop #:split-string
            #:flex-vector
            #:external-symbol-p
+           #:defrecord
            ))
 (in-package #:weave-utils)
 
@@ -99,3 +100,94 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
 
 (defun external-symbol-p (s p)
   (eq :external (nth-value 1 (find-symbol s p))))
+
+(defmacro defrecord (name superclasses slots &rest options)
+  "Define `name' with `superclasses' and `slots', using classes unless :REPRESENTATION
+is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accessor
+(prefixed if :STRUCT). Omitting :INIT requires a value at construction."
+  (let ((representation :class)
+        (seen-representation nil)
+        (documentation nil)
+        (seen-documentation nil))
+    (dolist (option options)
+      (trivia:match option
+        ((list :representation (or :class :struct))
+         (when seen-representation
+           (error "Duplicate :REPRESENTATION"))
+         (setf seen-representation t
+               representation (second option)))
+        ((list :documentation (type string))
+         (when seen-documentation
+           (error "Duplicate :DOCUMENTATION"))
+         (setf seen-documentation t
+               documentation (second option)))
+        (t
+         (error "Invalid option spec: ~S" option))))
+    (labels ((parse-slot (spec)
+               (let* ((slot-name (car spec))
+                      (mutable nil)
+                      (mutablep nil)
+                      (initform nil)
+                      (initformp nil)
+                      (slot-type t)
+                      (seen-type nil))
+                 (unless (symbolp slot-name)
+                   (error "Invalid slot name in ~S." spec))
+                 (alexandria:doplist (option value (cdr spec))
+                   (case option
+                     (:init
+                      (when initformp
+                        (error "Duplicate :INIT in slot ~S." slot-name))
+                      (setf initformp t initform value))
+                     (:mutable
+                      (when mutablep
+                        (error "Duplicate :MUTABLE in slot ~S." slot-name))
+                      (unless (typep value 'boolean)
+                        (error ":MUTABLE must be a boolean: ~S." value))
+                      (setf mutablep t mutable value))
+                     (:type
+                      (when seen-type
+                        (error "Duplicate :TYPE in slot ~S." slot-name))
+                      (setf seen-type t slot-type value))
+                     (otherwise
+                      (error "Bad slot spec ~S" spec))))
+                 (unless initformp
+                   (setf initform `(error "~A not provided" ,(symbol-name slot-name))))
+                 (list slot-name initform slot-type mutable))))
+      (let ((parsed-slots (mapcar #'parse-slot slots)))
+        (ecase representation
+          (:class
+           `(progn
+              (defclass ,name ,superclasses
+                ,(loop
+                   for (slot-name initform slot-type mutable)
+                     in parsed-slots
+                   collect
+                   `(,slot-name
+                     :initarg ,(alexandria:make-keyword slot-name)
+                     :initform ,initform
+                     :type ,slot-type
+                     ,@(if mutable
+                           `(:accessor ,slot-name)
+                           `(:reader ,slot-name))))
+                ,@(when seen-documentation `((:documentation ,documentation))))
+              ;; constructor
+              ,@`((defun ,(symbolicate "MAKE-" name) (&rest initargs)
+                    (apply #'make-instance ',name initargs)))
+              ;; type predicate
+              (defun ,(alexandria:symbolicate name "-P") (x)
+                (typep x ',name))
+              ',name))
+          (:struct
+           (when (> (length superclasses) 1)
+             (error "Structures support single inheritance only."))
+           `(progn
+              (defstruct (,name (:copier nil)
+                                ,@(when superclasses `((:include ,(first superclasses)))))
+                ,@(when seen-documentation
+                    `(,documentation))
+                ,@(loop
+                    for (slot-name initform slot-type mutable) in parsed-slots
+                    collect `(,slot-name ,initform :type ,slot-type
+                                                   :read-only ,(not mutable))))
+              ',name)))))))
