@@ -1935,7 +1935,7 @@ pairs building new elements of &rest and &body slots."))
       ((and template (consp id))
        (let ((rest-loc (make-location :node node :id slot))
              (nested (typep (funcall template) 'ref-list)))
-         (case (length id)
+         (ccase (length id)
            (2 (if nested ; e.g. (body i), or (rest i) which needs traverse
                   (insert-or-jump rest-loc (1+ (second id)) ui stack
                                   :item (funcall template) :tail '(0))
@@ -2336,7 +2336,8 @@ addressed by indices."
                       (when-let (call (build-call name-node
                                                   (parse:body (location-node (focus ui)))))
                         (swap-node (second (stack ui)) call ui)
-                        (focus-first-hole ui)))))))
+                        (focus-first-hole ui))))
+                   (t t))))
               ((gethash s *default-expansions*)
                (let ((focus (focus ui)))
                  ;; replace the whole parent function node if editing the name

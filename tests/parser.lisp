@@ -491,8 +491,45 @@
                      (lambda (&rest args) (push args references)))
     (is eq nil references)))
 
+(define-test hygiene-ignore-function-references :parent parser
+  (let ((*hygiene-fixture-expansion*
+          '(progn (hygiene-helper) hygiene-free (return-from hygiene-outer nil))))
+    (multiple-value-bind (bindings references complete)
+        (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                             (parse::make-env) :ignore-function-references t)
+      (is eq t complete)
+      (is eq nil bindings)
+      (is equal '((:block hygiene-outer) hygiene-free) references)))
+  (let ((call (probe-driver-syntax
+               "(weave-tests::hygiene-capture-function weave-tests::hygiene-helper)")))
+    (is equal
+        (mapcar #'cdr (parse::hygiene-check call (parse::make-env)))
+        (mapcar #'cdr (parse::hygiene-check call (parse::make-env)
+                                          :ignore-function-references t)))))
+
 (define-test hygiene-function-reference-scopes :parent parser
   (dolist (case '(((hygiene-helper) ((:function hygiene-helper)))
+                  ((list (car nil)) nil)
+                  ((function car) nil)
+                  ((function (setf car)) nil)
+                  ((call-next-method) ((:function call-next-method)))
+                  ((next-method-p) ((:function next-method-p)))
+                  ((function call-next-method) ((:function call-next-method)))
+                  ((function next-method-p) ((:function next-method-p)))
+                  #+sbcl
+                  ((sb-kernel:%puthash nil nil nil) nil)
+                  #+sbcl
+                  ((function sb-concurrency:send-message) nil)
+                  #+sbcl
+                  ((function (sb-int:named-lambda hygiene-helper (x) x (hygiene-helper)))
+                   ((:function hygiene-helper)))
+                  #+sbcl
+                  ((function (sb-int:named-lambda (debug-name metadata) (x) x hygiene-free))
+                   (hygiene-free))
+                  #+sbcl
+                  ((function (sb-int:named-lambda hygiene-helper ()
+                               (return-from hygiene-helper nil)))
+                   ((:block hygiene-helper)))
                   ((function hygiene-helper) ((:function hygiene-helper)))
                   ((function (setf hygiene-helper)) ((:function (setf hygiene-helper))))
                   ((quote hygiene-helper) nil)
@@ -574,6 +611,13 @@
   (multiple-value-bind (bindings references complete)
       (parse::hygiene-check
        (probe-driver-syntax "(weave-tests::hygiene-capture-function weave-tests::hygiene-helper)")
+       (parse::make-env))
+    (is eq t complete)
+    (is eq nil references)
+    (is eq nil bindings))
+  (multiple-value-bind (bindings references complete)
+      (parse::hygiene-check
+       (probe-driver-syntax "(weave-tests::hygiene-capture-function weave-tests::hygiene-local)")
        (parse::make-env))
     (is eq t complete)
     (is eq nil references)
@@ -665,6 +709,13 @@
        (block hygiene-outer (return-from ,name)))))
 
 (define-test hygiene-block-source-provenance :parent parser
+  (multiple-value-bind (bindings references complete)
+      (parse::hygiene-check
+       (probe-driver-syntax "(weave-tests::hygiene-capture-block weave-tests::hygiene-other)")
+       (parse::make-env))
+    (is eq t complete)
+    (is eq nil bindings)
+    (is eq nil references))
   (dolist (source '("(weave-tests::hygiene-return-name weave-tests::hygiene-outer)"
                     "(weave-tests::hygiene-source-block weave-tests::hygiene-outer)"))
     (is equal '(nil nil t)

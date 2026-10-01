@@ -443,8 +443,9 @@ pprint-exit-if-list-exhausted/pop and other forms that introduce local macrolet 
        ,form)))
 
 (defun symbol-macrolet-wrap (name expansion form)
-  `(symbol-macrolet ((,name ,expansion))
-     ,form))
+  `(locally ,@(unlock-declaration name)
+     (symbol-macrolet ((,name ,expansion))
+       ,form)))
 
 (defun flet-wrap (name form)
   `(locally ,@(unlock-declaration name)
@@ -514,11 +515,12 @@ copy-env can exploit structure sharing, remember to PUSH!"
           ;; note: constants are possible in intermediate editing states
           (append (remove-if (lambda (entry)
                                (let ((name (gen-ensure-car entry)))
-                                 (typecase name
+                                 (etypecase name
                                    (symbol (constantp name))
                                    (symbol-ref
                                     (multiple-value-bind (symbol present) (resolve name)
-                                      (and present (constantp symbol)))))))
+                                      (and present (constantp symbol))))
+                                   (hole t))))
                              bindings)
                   (%variable-bindings new-env))
           (%specials new-env)
@@ -629,6 +631,7 @@ expanding in it may differ from expanding in the null environment."
 
 (declaim (type simple-vector *hardwired-operators*))
 (defparameter *hardwired-operators* #(lambda defun defmethod defmacro
+                                      #+sbcl sb-int:named-lambda
                                       eclector.reader:quasiquote
                                       eclector.reader:unquote
                                       eclector.reader:unquote-splicing)
@@ -768,7 +771,8 @@ symbol when it has no home package. Always returns a symbol."
            (typecase elt
              (symbol (find elt symbols))
              (symbol-ref (and (eq (home-package elt) #.(find-package "CL"))
-                              (find (name elt) symbols :test #'string=))))))
+                              (find (name elt) symbols :test #'string=)))
+             (t nil))))
   ;; we need to be more permissive for lambda lists. It makes little sense to preserve
   ;; well-formedness when it often breaks with edits due to positional &keyword context
   ;; e.g. (&key (a _) (b _)) -?> (a b)  or  (&optional (b _) c) -?> (b &optional c)
@@ -1147,9 +1151,9 @@ last position is a return value rather than documentation."
   ;;; location method generation
   (defun bind-tag-name (bind-tag)
     "The tag named by a BINDS plist entry: X, (< X), (= X) and (X data) all name X."
-    (if (consp bind-tag)
-        (if (member (car bind-tag) '(< =)) (second bind-tag) (first bind-tag))
-        bind-tag))
+    (cond ((atom bind-tag) bind-tag)
+          ((member (car bind-tag) '(< =)) (second bind-tag))
+          (t (first bind-tag))))
 
   (defun binder-tag-p (tag binds)
     (loop for (nil . entries) in binds
@@ -1441,6 +1445,10 @@ more precisely.")
                  (suffix-step node part rest)
                  (spec-step 1 1)))))))
 
+(defun expect-general-list (form)
+  (unless (gen-list-p form)
+    (form-parse-error "list expected, got ~a" form)))
+
 (defmacro spec-parser (spec binds rest-patterns ref-p)
   "Expects a valid spec, binds and rest-patterns. ref-p controls whether to check
 our reader representation or ordinary sexps."
@@ -1613,12 +1621,8 @@ Any binding forces a symbol match.
        ;; this merely does validation and preserves identity of all checked lists
        (defmacro ,(symbolicate "WITH-PARSED-" name) ((form &optional ref-p) &body body)
          `(let (,@',(remove-duplicates (mapcar #'car tag-kinds)))
-            (flet ((expect-general-list (form)
-                     (unless (gen-list-p form)
-                       (form-parse-error "list expected, got ~a" form))))
-              (declare (ignorable #'expect-general-list))
-              (funcall (spec-parser ,',spec ,',binds ,',rest-patterns ,ref-p)
-                       (gen-cdr ,form)))
+            (funcall (spec-parser ,',spec ,',binds ,',rest-patterns ,ref-p)
+                     (gen-cdr ,form))
             nil ; don't leak
             ,@body))
 
@@ -2161,9 +2165,12 @@ other atom."
   (check-evaluated node id)
   (let ((env outer-env)
         (specials (declaration-specials (decls node))))
-    (dolist (binder (let-like-binders node (when (eq (id-slot id) 'vars) (second id))))
+    (dolist (binder (let-like-binders node (when (eq (id-slot id) 'vars)
+                                             (second id))))
       (setf env (env-with-variables env (list binder) specials)))
-    (if (eq (id-slot id) 'body) (env-with-specials env specials) env)))
+    (if (eq (id-slot id) 'body)
+        (env-with-specials env specials)
+        env)))
 
 ;; TODO layout needs to handle &or ambiguity
 ;; (defform (alexandria:when-let* (&or (name &body init) (&rest vars))
@@ -2259,7 +2266,9 @@ other atom."
 
 (defmethod location-env ((node block-form) id outer-env)
   (check-evaluated node id)
-  (if (eq 'body (id-slot id)) (env-with-blocks outer-env (list (name node))) outer-env))
+  (if (eq 'body (id-slot id))
+      (env-with-blocks outer-env (list (name node)))
+      outer-env))
 
 (defform (defun &or (name &lambda fun-code) ((setf-op name) &lambda fun-code))
   :binds ((fun-code :block name)))
@@ -2271,6 +2280,11 @@ other atom."
       outer-env))
 
 (defform (lambda &lambda fun-code)
+  :binds ((fun-code)))
+
+;; SBCL emits these in handler and structure expansions, hardwire for now
+#+sbcl
+(defform (sb-int:named-lambda &tree name &lambda fun-code)
   :binds ((fun-code)))
 
 (defform (defmacro name &macro-lambda macro-code)
@@ -2345,8 +2359,8 @@ other atom."
 (defform (throw tag result)
   :binds ((tag) (result)))
 
-(defform (load-time-value form read-only-p)
-  :binds ((form)))
+(defform (load-time-value form &body read-only-p)
+  :binds ((form) (read-only-p))) ; XXX not evaluated, refine to boolean
 
 (defform (eval-when (&rest-qualifiers situations) &body body)
   :binds ((body)))
@@ -2377,7 +2391,7 @@ other atom."
 
 (defun lambda-operator-p (x)
   "Whether the s-expression `x' is a lambda expression, e.g. in operator position."
-  (and (consp x) (eq (car x) 'lambda)))
+  (and (consp x) (member (car x) '(lambda #+sbcl sb-int:named-lambda))))
 
 (defun function-name-symbol (name)
   "The symbol component of an ordinary or SETF function name."
@@ -2438,8 +2452,7 @@ such names are reported literally."
                            (if-let (walker (gethash newop *special-walkers*))
                              (funcall walker
                                       newform env
-                                      #'walk
-                                      note-binder)
+                                      #'walk note-binder)
                              ;; must be function call
                              (when (visit newform)
                                (walk-call newform)))))
@@ -2736,16 +2749,21 @@ Return T on completion, NIL on expansion or walk failure."
                (funcall on-introduced-reference name namespace subenv))))
           t)))))
 
-(defun hygiene-check (call env)
-  "Report potential binding capture at source probes and reference capture at macro-introduced
-forms distinguished from source expressions.
+(defun hygiene-check (call env &key ignore-function-references)
+  "Report potential binding capture at source probes and reference capture at
+macro-introduced forms distinguished from source expressions.
+Evaluated source expressions require conservative checks of all introduced bindings,
+since in theory a binding form can be introduced there, shadowing the macro's binding.
+At inert source references, binding captures require the same namespace and source name.
 Return binding captures, reference captures, and whether analysis completed.
 - Variable reference captures are symbols.
 - Function/block captures are (:FUNCTION name)/(:BLOCK name).
-TODO walk tag references
-Note: failed analysis may retain partial findings so NIL alone does not indicate hygiene.
-Reference checking is incomplete when caller MACROLET bindings erase introduced function
-calls during macroexpansion before the walker observes their names."
+TODO: reference checking is incomplete when caller MACROLET bindings erase introduced
+function bindings calls during macroexpansion before the walker observes their names.
+TODO: maybe walk tag references
+note: CL function names are exempt: portable code may not lexically rebind them.
+CALL-NEXT-METHOD and NEXT-METHOD-P are exceptions implicitly rebound by DEFMETHOD.
+note: function references from packages named SB-* are exempt implementation-internals."
   (let ((binding-captures (list))
         (reference-captures (list))
         (complete-p nil))
@@ -2765,7 +2783,7 @@ calls during macroexpansion before the walker observes their names."
                              (eq (probe-info-sort info) :exp))
                         (and (eq (probe-info-sort info) :ref)
                              (eq namespace (probe-info-namespace info))))
-                    (flet ((note-capture (accessor namespace)
+                    (flet ((note-capture (accessor binding-namespace)
                              (when-let (vars
                                         (remove-if-not
                                          (lambda (entry)
@@ -2774,11 +2792,14 @@ calls during macroexpansion before the walker observes their names."
                                              ;; from the call (as probed)
                                              (and (symbolp name) (symbol-package name)
                                                   (not (gethash name probes))
-                                                  (or (not (eq namespace :variable))
+                                                  (or (not (inert-reference-p namespace))
+                                                      (and (eq namespace binding-namespace)
+                                                           (symbol-like= name (probe-info-source info))))
+                                                  (or (not (eq binding-namespace :variable))
                                                       (not (env-special-p name subenv))))))
                                          (ldiff (funcall accessor subenv)
                                                 (funcall accessor base-env))))
-                               (push (cons (probe-info-source info) (list namespace vars))
+                               (push (cons (probe-info-source info) (list binding-namespace vars))
                                      binding-captures))))
                       (unless (inert-reference-p namespace)
                         (note-capture #'variable-bindings :variable))
@@ -2794,10 +2815,18 @@ calls during macroexpansion before the walker observes their names."
               (lambda (name namespace subenv)
                 (if (eq namespace :variable)
                     (note-variable-reference name subenv base-env)
-                    (let ((accessor (ecase namespace
+                    (let ((package (symbol-package (reference-name-symbol name namespace)))
+                          (accessor (ecase namespace
                                       (:function #'function-bindings)
                                       (:block #'blocks))))
-                      (when (and (symbol-package (reference-name-symbol name namespace))
+                      (when (and package
+                                 (not (and ignore-function-references
+                                           (eq namespace :function)))
+                                 (not (and (eq namespace :function)
+                                           (or (and (fboundp name)
+                                                    (not (member name '(call-next-method next-method-p)))
+                                                    (eq package (find-package :common-lisp)))
+                                               (starts-with-subseq "SB-" (package-name package)))))
                                  (not (member name
                                               (ldiff (funcall accessor subenv)
                                                      (funcall accessor base-env))
@@ -3110,7 +3139,7 @@ Returns NIL when the call is unparseable or fails to expand."
   (and (gen-form-p x)
        (let ((head (gen-car x)))
          (and (symbol-ref-p head)
-              (eq (resolve head) 'lambda)))))
+              (member (resolve head) '(lambda #+sbcl sb-int:named-lambda))))))
 
 (defun parse-call (form env alter-identity)
   (funcall alter-identity form
