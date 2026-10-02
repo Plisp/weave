@@ -43,7 +43,8 @@
   `(,@(subseq list 0 i) ,@(nthcdr (1+ i) list)))
 
 (defun array-copy (array)
-  (let ((copy (make-array (array-dimensions array) :element-type (array-element-type array))))
+  (let ((copy (make-array (array-dimensions array)
+                          :element-type (array-element-type array))))
     (dotimes (i (array-total-size array) copy)
       (setf (row-major-aref copy i) (row-major-aref array i)))))
 
@@ -68,7 +69,9 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
                       (indices (subseq path 0 rank))
                       (copy (array-copy tree)))
                  (apply #'(setf aref)
-                        (tree-update (apply #'aref tree indices) (nthcdr rank path) new-value)
+                        (tree-update (apply #'aref tree indices)
+                                     (nthcdr rank path)
+                                     new-value)
                         copy indices)
                  copy)))))
 

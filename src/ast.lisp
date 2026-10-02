@@ -59,10 +59,10 @@
 
 ;; mixin for tracking inactive text
 (defrecord anchor ()
-  ((leading :init nil :mutable t)
-   (trailing :init nil :mutable t)
+  ((leading :init nil :mutable t :type list)
+   (trailing :init nil :mutable t :type list)
    ;; only for empty lists
-   (inside :init nil :mutable t))
+   (inside :init nil :mutable t :type list))
   (:documentation "represents comments and reader-conditionals"))
 
 (defrecord atom-form (anchor)
@@ -79,7 +79,7 @@
 (defrecord symbol-ref (eval-form atom-form)
   ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
-   (home-package :init *package*))
+   (home-package :init *package* :type (or null package)))
   (:documentation "Represents a symbol, possibly referring to a symbol macro."))
 
 (defrecord binder (symbol-ref)
@@ -114,17 +114,17 @@
    ;; this is a cache
    (call-env :type env)
    ;; Evaluated syntax in the body -> (parsed . binders in scope)
-   (subforms)
-   (subform-envs)
+   (subforms :type hash-table)
+   (subform-envs :type hash-table)
    ;; Whether the call's own macroexpansion succeeded
-   (expanded :init t)))
+   (expanded :init t :type boolean)))
 
 (defrecord ref-list (anchor)
   ((elements :init nil :mutable t :type list)
    ;; note: an array holds one element - the contents as written
    (kind :init :list :mutable t :type (member :list :vector :array))
    ;; an array is represented as nested written lists
-   (rank :init nil :mutable t)))
+   (rank :init nil :mutable t :type (or null (integer 0)))))
 
 (defmethod elements ((x list)) x)
 
@@ -141,7 +141,7 @@
   (:documentation "A symbol inserted to represent reader syntax"))
 
 (defrecord comment ()
-  ((str :mutable t)
+  ((str :mutable t :type string)
    (kind :init :line :mutable t :type (or (eql :line) (eql :block))))
   (:documentation ""))
 
@@ -516,11 +516,12 @@ copy-env can exploit structure sharing, remember to PUSH!"
           (append (remove-if (lambda (entry)
                                (let ((name (gen-ensure-car entry)))
                                  (etypecase name
+                                   (hole t)
                                    (symbol (constantp name))
                                    (symbol-ref
-                                    (multiple-value-bind (symbol present) (resolve name)
-                                      (and present (constantp symbol))))
-                                   (hole t))))
+                                    (multiple-value-bind (symbol present)
+                                        (resolve name)
+                                      (and present (constantp symbol)))))))
                              bindings)
                   (%variable-bindings new-env))
           (%specials new-env)
@@ -621,6 +622,7 @@ expanding in it may differ from expanding in the null environment."
 (defun macroexpand-with-env (form env)
   "Expands `form' in `env', reconstructing `env' only when it can affect the expansion."
   (if (env-affects-expansion-p env)
+      ;; TODO use sb-eval:eval-in-native-environment and change format
       (eval (line-up-first `(locally (declare (special ,@(%specials env)))
                              (macroexpand-in-lispenv ,form))
                            (wrap-function-like-env (function-bindings env))
@@ -758,7 +760,7 @@ symbol when it has no home package. Always returns a symbol."
   (check-type wrapper symbol-ref)
   (if-let (p (home-package wrapper))
     (find-symbol (name wrapper) p)
-    (values (make-symbol (name wrapper)) '#:uninterned)))
+    (make-symbol (name wrapper))))
 
 (defun ref-coerce-symbol (s)
   "Converts binding names to an appropriate symbol for storing in an environment."
@@ -2179,14 +2181,6 @@ other atom."
 ;;   :binds ((init :variable (< name))
 ;;           (body :variable name)))
 
-;; (defmethod location-bindings ((node when-let*-form) id)
-;;   (check-evaluated node id)
-;;   (let ((binders (or (rest-binders (vars node)) (list (name node)))))
-;;     (bindings-of :variable
-;;                  (case (id-slot id)
-;;                    (body binders)
-;;                    (vars (subseq binders 0 (min (second id) (length binders))))))))
-
 (defform (flet (&rest funs)
            &declarations decls
            &body body)
@@ -2495,7 +2489,7 @@ XXX performs unguarded read-evaluation."
                ((symbol-ref-p form)
                 (multiple-value-bind (sym status)
                     (resolve form)
-                  (if status
+                  (if (or status (null (home-package form)))
                       sym
                       (let ((new (#+sbcl sb-ext:without-package-locks #-sbcl progn
                                    (intern (name form) (home-package form)))))
@@ -2758,10 +2752,11 @@ At inert source references, binding captures require the same namespace and sour
 Return binding captures, reference captures, and whether analysis completed.
 - Variable reference captures are symbols.
 - Function/block captures are (:FUNCTION name)/(:BLOCK name).
+TODO: check symbol macros (which are basically 0-arg macros and can introduce references).
 TODO: reference checking is incomplete when caller MACROLET bindings erase introduced
-function bindings calls during macroexpansion before the walker observes their names.
+function bindings during macroexpansion before the walker observes their names.
 TODO: maybe walk tag references
-note: CL function names are exempt: portable code may not lexically rebind them.
+note: CL function names are exempt; portable code may not lexically rebind them.
 CALL-NEXT-METHOD and NEXT-METHOD-P are exceptions implicitly rebound by DEFMETHOD.
 note: function references from packages named SB-* are exempt implementation-internals."
   (let ((binding-captures (list))
@@ -2776,62 +2771,69 @@ note: function references from packages named SB-* are exempt implementation-int
                    (unless (find form bound-vars :key #'ensure-car)
                      (push form reference-captures)))))
              (check-expansion (raw base-env probes)
-             (walk-probed-expansion
-              raw base-env probes
-              (lambda (info namespace subenv)
-                (if (or (and (eq namespace :exp)
-                             (eq (probe-info-sort info) :exp))
-                        (and (eq (probe-info-sort info) :ref)
-                             (eq namespace (probe-info-namespace info))))
-                    (flet ((note-capture (accessor binding-namespace)
-                             (when-let (vars
-                                        (remove-if-not
-                                         (lambda (entry)
-                                           (let ((name (ensure-car entry)))
-                                             ;; detect interned symbols, not introduced
-                                             ;; from the call (as probed)
-                                             (and (symbolp name) (symbol-package name)
-                                                  (not (gethash name probes))
-                                                  (or (not (inert-reference-p namespace))
-                                                      (and (eq namespace binding-namespace)
-                                                           (symbol-like= name (probe-info-source info))))
-                                                  (or (not (eq binding-namespace :variable))
-                                                      (not (env-special-p name subenv))))))
-                                         (ldiff (funcall accessor subenv)
-                                                (funcall accessor base-env))))
-                               (push (cons (probe-info-source info) (list binding-namespace vars))
-                                     binding-captures))))
-                      (unless (inert-reference-p namespace)
-                        (note-capture #'variable-bindings :variable))
-                      (unless (eq namespace :block)
-                        (note-capture #'function-bindings :function))
-                      (unless (eq namespace :function)
-                        (note-capture #'blocks :block))
-                      nil)
-                    t))
-              (lambda (form subenv)
-                (note-variable-reference form subenv base-env)
-                t)
-              (lambda (name namespace subenv)
-                (if (eq namespace :variable)
-                    (note-variable-reference name subenv base-env)
-                    (let ((package (symbol-package (reference-name-symbol name namespace)))
-                          (accessor (ecase namespace
-                                      (:function #'function-bindings)
-                                      (:block #'blocks))))
-                      (when (and package
-                                 (not (and ignore-function-references
-                                           (eq namespace :function)))
-                                 (not (and (eq namespace :function)
-                                           (or (and (fboundp name)
-                                                    (not (member name '(call-next-method next-method-p)))
-                                                    (eq package (find-package :common-lisp)))
-                                               (starts-with-subseq "SB-" (package-name package)))))
-                                 (not (member name
-                                              (ldiff (funcall accessor subenv)
-                                                     (funcall accessor base-env))
-                                              :key #'ensure-car :test #'equal)))
-                        (push (list namespace name) reference-captures))))))))
+               (walk-probed-expansion
+                raw base-env probes
+                (lambda (info namespace subenv)
+                  (if (or (and (eq namespace :exp)
+                               (eq (probe-info-sort info) :exp))
+                          (and (eq (probe-info-sort info) :ref)
+                               (eq namespace (probe-info-namespace info))))
+                      (labels ((macro-introduced (entry binding-namespace)
+                                 (let ((name (ensure-car entry)))
+                                   ;; detect interned symbols, not introduced
+                                   ;; from the call (as probed)
+                                   (and (symbolp name) (symbol-package name)
+                                        (not (gethash name probes))
+                                        (or (not (inert-reference-p namespace))
+                                            (and (eq namespace binding-namespace)
+                                                 (symbol-like= name (probe-info-source info))))
+                                        (or (not (eq binding-namespace :variable))
+                                            (not (env-special-p name subenv))))))
+                               (note-capture (accessor binding-namespace)
+                                 (when-let (vars (remove-if-not
+                                                  (lambda (entry)
+                                                    (macro-introduced entry binding-namespace))
+                                                  (ldiff (funcall accessor subenv)
+                                                         (funcall accessor base-env))))
+                                   (push (cons (probe-info-source info)
+                                               (list binding-namespace vars))
+                                         binding-captures))))
+                        (unless (inert-reference-p namespace)
+                          (note-capture #'variable-bindings :variable))
+                        (unless (eq namespace :block)
+                          (note-capture #'function-bindings :function))
+                        (unless (eq namespace :function)
+                          (note-capture #'blocks :block))
+                        nil)
+                      t))
+                (lambda (form subenv)
+                  (note-variable-reference form subenv base-env)
+                  t)
+                (lambda (name namespace subenv)
+                  (if (eq namespace :variable)
+                      (note-variable-reference name subenv base-env)
+                      (let ((package (symbol-package
+                                      (reference-name-symbol name namespace)))
+                            (accessor (ecase namespace
+                                        (:function #'function-bindings)
+                                        (:block #'blocks))))
+                        (flet ((builtin (name)
+                                 (and (eq namespace :function)
+                                      (or (and (fboundp name)
+                                               (not (member name '(call-next-method
+                                                                   next-method-p)))
+                                               (eq package (find-package :common-lisp)))
+                                          (starts-with-subseq "SB-"
+                                                              (package-name package))))))
+                          (when (and package
+                                     (not (and ignore-function-references
+                                               (eq namespace :function)))
+                                     (not (builtin name))
+                                     (not (member name
+                                                  (ldiff (funcall accessor subenv)
+                                                         (funcall accessor base-env))
+                                                  :key #'ensure-car :test #'equal)))
+                            (push (list namespace name) reference-captures)))))))))
       (setf complete-p
             (handler-bind ((warning #'muffle-warning))
               (with-suppressed-parse-errors
@@ -3208,14 +3210,14 @@ Returns NIL when the call is unparseable or fails to expand."
 ;;
 (defrecord my-client (eclector.parse-result:parse-result-client)
   ((source :type string)
-   (source-offset :init 0 :mutable t)))
+   (source-offset :init 0 :mutable t :type (integer 0))))
 
 (defun make-client (source)
   (make-instance 'my-client :source source))
 
 ;; and or not
 (defrecord read-cond (atom-form)
-  ((str)
+  ((str :type string)
    (flags)
    (kind :type (or (eql #\+) (eql #\-)))))
 
@@ -3226,7 +3228,8 @@ Returns NIL when the call is unparseable or fails to expand."
   (format stream "<~a~a ~a>" (kind object) (flags object) (str object)))
 
 (defrecord read-evaluated ()
-  ((form) (feature-p))
+  ((form)
+   (feature-p :type boolean))
   (:representation :struct))
 (defrecord read-feature ()
   ((result))

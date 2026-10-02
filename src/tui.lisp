@@ -58,7 +58,7 @@ construction, do not modify."))
 (defrecord ast-view (ordered-view)
   ((location :mutable t :type location)
    (view-stack :init nil :mutable t :type list)
-   (hoverable :init nil :mutable t)))
+   (hoverable :init nil :mutable t :type boolean)))
 
 (defgeneric handle-key (node view location ui event)
   (:documentation "event is a uncursed key event. If this node is active then
@@ -68,25 +68,28 @@ If this returns NIL, propagate up the cursor stack.")
 
 (defrecord completion-state ()
   ((anchor :mutable t)
-   (candidates :mutable t)
-   (selection :init 0 :mutable t)))
+   (candidates :mutable t :type list)
+   (selection :init 0 :mutable t :type (integer 0))))
 
 ;; TODO currently uses change-class, make struct once settled
 (defclass selection ()
   (;; tracks the stack during selection-mode, for growing and shrinking zippers
    (context :initarg :context
             :initform (error "no context")
-            :accessor selection-context)
+            :accessor selection-context
+            :type list)
    ;; the location of the child where the selection was started
    (location :initarg :location
              :initform (error "no location")
-             :reader selection-location)
+             :reader selection-location
+             :type location)
    (point :initarg :point
           :initform (error "no point")
           :accessor selection-point
           :type integer)
    (activep :initform t
-            :accessor selection-activep)))
+            :accessor selection-activep
+            :type boolean)))
 
 (defclass zipper (selection)
   ;; from the selection start location out to the top of the zipper
@@ -163,8 +166,8 @@ If this returns NIL, propagate up the cursor stack.")
     (selection ui)))
 
 (defrecord cutbuffer ()
-  ((forms)
-   (sorts))
+  ((forms :type list)
+   (sorts :type list))
   (:representation :struct))
 
 ;; computed during redisplay from current toplevel
@@ -202,7 +205,8 @@ If this returns NIL, propagate up the cursor stack.")
         :accessor ast)
    (edit-loc :initarg :edit-loc
              :initform nil
-             :accessor edit-loc)
+             :accessor edit-loc
+             :type (or null location))
    (goal-col :initform 1
              :accessor goal-col
              :type positive-fixnum)
@@ -217,7 +221,8 @@ If this returns NIL, propagate up the cursor stack.")
            :accessor zipper
            :type (or null zipper))
    (cutbuffer :initform nil
-              :accessor cutbuffer)
+              :accessor cutbuffer
+              :type (or null cutbuffer))
    ;; undo
    (history :initform (list)
             :accessor history
@@ -232,14 +237,18 @@ If this returns NIL, propagate up the cursor stack.")
           :type list)
    (goal-stacks :initform nil
                 :accessor goal-stacks
+                :type list
                 :documentation "The stacks at each node alt+p moved up from.")
    ;; recomputed on every redisplay
    (stage-cache :initform (make-hash-table :test #'eq) ; caching staged sizes
-                :reader stage-cache)
+                :reader stage-cache
+                :type hash-table)
    (redisplayed-since-input :initform nil
-                            :accessor redisplayed-since-input)
+                            :accessor redisplayed-since-input
+                            :type boolean)
    (redisplay-cache :initform (make-hash-table :test #'equal)
-                    :reader redisplay-cache)
+                    :reader redisplay-cache
+                    :type hash-table)
    (scroll-state :initform (make-scroll-state :position (make-scroll-position :index 0)
                                               :rows 0
                                               :viewport-row 0
@@ -250,7 +259,8 @@ If this returns NIL, propagate up the cursor stack.")
                :accessor focus-rect
                :type (or null tui:rect))
    (node-views :initform (make-hash-table)
-               :accessor node-views)))
+               :accessor node-views
+               :type hash-table)))
 
 (defun ui-rect (ui)
   (tui:make-rect :x 0 :y 0 :rows (tui:rows ui) :cols (tui:cols ui)))
@@ -480,7 +490,8 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
                                        (environment-at stack))))
       ;; blocks are never global
       (and (not (block-position-p (car stack)))
-           (multiple-value-bind (symbol found) (parse:resolve node)
+           (multiple-value-bind (symbol found)
+               (parse:resolve node)
              (and found
                   (if (function-position-p (car stack))
                       (fboundp symbol)
@@ -1737,7 +1748,7 @@ already and focuses the hole."
 (defrecord layout ()
   ((op :type symbol)
    (rows :type list)
-   (templates))
+   (templates :type list)) ;alist
   (:representation :struct)
   (:documentation
    "Describes the rendered shape of a call to `op'.
