@@ -605,8 +605,25 @@ copy-env can exploit structure sharing, remember to PUSH!"
 
 (defun go-tag-p (x) (or (integerp x) (symbolp x)))
 
-(defmacro macroexpand-in-lispenv (form &environment env)
-  `(macroexpand ',form ,env))
+(defvar *macroexpansion-observer* nil
+  "Optional hook taking partial expansions, passed a form and env.")
+(defvar *macroexpansion-env* nil)
+
+(defun expand-in-native-env (form native-env once)
+  "Expand `form' in `native-env', optionally observing each successful step."
+  (cond (once (macroexpand-1 form native-env))
+        ((null *macroexpansion-observer*) (macroexpand form native-env))
+        (t
+         (loop with any-expanded-p = nil
+               do (multiple-value-bind (next expanded-p)
+                      (macroexpand-1 form native-env)
+                    (unless expanded-p
+                      (return (values form any-expanded-p)))
+                    (funcall *macroexpansion-observer* form *macroexpansion-env*)
+                    (setf form next any-expanded-p t))))))
+
+(defmacro macroexpand-in-lispenv (form &optional once &environment env)
+  `(expand-in-native-env ',form ,env ,once))
 
 (defun env-affects-expansion-p (env)
   "Whether `env' holds a local/symbol macro or shadows a global one, so that
@@ -619,17 +636,19 @@ expanding in it may differ from expanding in the null environment."
               (or (consp entry) (and (symbolp entry) (nth-value 1 (macroexpand-1 entry)))))
             (variable-bindings env))))
 
-(defun macroexpand-with-env (form env)
-  "Expands `form' in `env', reconstructing `env' only when it can affect the expansion."
-  (if (env-affects-expansion-p env)
+(defun macroexpand-with-env (form env &optional once)
+  "Expands `form' in `env', reconstructing `env' only when it can affect the expansion.
+When `once' is true, only perform one step."
+  (let ((*macroexpansion-env* env))
+    (if (env-affects-expansion-p env)
       ;; TODO use sb-eval:eval-in-native-environment and change format
       (eval (line-up-first `(locally (declare (special ,@(%specials env)))
-                             (macroexpand-in-lispenv ,form))
+                             (macroexpand-in-lispenv ,form ,once))
                            (wrap-function-like-env (function-bindings env))
                            (wrap-variable-like-env (variable-bindings env))
                            (wrap-block-env (blocks env))
                            (wrap-tag-env (tags env))))
-      (macroexpand form)))
+      (expand-in-native-env form nil once))))
 
 (declaim (type simple-vector *hardwired-operators*))
 (defparameter *hardwired-operators* #(lambda defun defmethod defmacro
@@ -642,31 +661,34 @@ expanding in it may differ from expanding in the null environment."
 (defun hardwired-p (macro-name)
   (position macro-name *hardwired-operators*))
 
-(defun env-macroexpand-1 (x env)
-  "Tries macroexpanding a form x in evaluation position once,
-does not touch hardwired operators."
+(defun env-macroexpand-1 (x env &optional (once t))
+  "Tries macroexpanding `x' in evaluation position once,
+without expanding hardwired operators."
   (cond ((symbolp x)
          (if (env-special-p x env)
              (values x nil)
              (trivia:match (env-variable-info x env)
                (nil (macroexpand-1 x))
-               ((list _ expansion) (values expansion t))
+               ((list _ expansion)
+                (when *macroexpansion-observer*
+                  (funcall *macroexpansion-observer* x env))
+                (values expansion t))
                (_ (values x nil)))))
         ((consp x)
          (let ((name (car x)))
            (trivia:match (env-function-info name env)
              (nil (if (and (symbolp name)
                            (macro-function name) (not (hardwired-p name)))
-                      (macroexpand-with-env x env)
+                      (macroexpand-with-env x env once)
                       x))
-             ((type cons) (macroexpand-with-env x env))
+             ((type cons) (macroexpand-with-env x env once))
              (_ x))))
         (t x)))
 
 (defun env-macroexpand (form env)
   "Perform full macroexpansion of the head of form"
   (loop with any-expanded-p
-        for (newform expanded-p) := (multiple-value-list (env-macroexpand-1 form env))
+        for (newform expanded-p) := (multiple-value-list (env-macroexpand-1 form env nil))
         until (and (not expanded-p) (eq newform form))
         do (setf form newform)
            (or-f any-expanded-p expanded-p)
@@ -2743,6 +2765,9 @@ Return T on completion, NIL on expansion or walk failure."
                (funcall on-introduced-reference name namespace subenv))))
           t)))))
 
+(defun sbcl-internal-p (package)
+  (starts-with-subseq "SB-" (package-name package)))
+
 (defun hygiene-check (call env &key ignore-function-references)
   "Report potential binding capture at source probes and reference capture at
 macro-introduced forms distinguished from source expressions.
@@ -2752,13 +2777,12 @@ At inert source references, binding captures require the same namespace and sour
 Return binding captures, reference captures, and whether analysis completed.
 - Variable reference captures are symbols.
 - Function/block captures are (:FUNCTION name)/(:BLOCK name).
-TODO: check symbol macros (which are basically 0-arg macros and can introduce references).
-TODO: reference checking is incomplete when caller MACROLET bindings erase introduced
-function bindings during macroexpansion before the walker observes their names.
 TODO: maybe walk tag references
 note: CL function names are exempt; portable code may not lexically rebind them.
 CALL-NEXT-METHOD and NEXT-METHOD-P are exceptions implicitly rebound by DEFMETHOD.
-note: function references from packages named SB-* are exempt implementation-internals."
+note: function references from packages named SB-* are exempt implementation-internals.
+note: nested expansion performed internally by macro expanders is not observed, this is
+considered a form of environment query."
   (let ((binding-captures (list))
         (reference-captures (list))
         (complete-p nil))
@@ -2769,71 +2793,100 @@ note: function references from packages named SB-* are exempt implementation-int
                  (let ((bound-vars (ldiff (variable-bindings subenv)
                                           (variable-bindings base-env))))
                    (unless (find form bound-vars :key #'ensure-car)
-                     (push form reference-captures)))))
+                     (pushnew form reference-captures :test #'equal)))))
              (check-expansion (raw base-env probes)
-               (walk-probed-expansion
-                raw base-env probes
-                (lambda (info namespace subenv)
-                  (if (or (and (eq namespace :exp)
-                               (eq (probe-info-sort info) :exp))
-                          (and (eq (probe-info-sort info) :ref)
-                               (eq namespace (probe-info-namespace info))))
-                      (labels ((macro-introduced (entry binding-namespace)
-                                 (let ((name (ensure-car entry)))
-                                   ;; detect interned symbols, not introduced
-                                   ;; from the call (as probed)
-                                   (and (symbolp name) (symbol-package name)
+               (let ((*macroexpansion-observer*
+                       (lambda (form subenv)
+                         ;; Only report erased references resolved through caller bindings,
+                         ;; this can occur when bound in the expansion by (symbol-)macrolet.
+                         ;; e.g.
+                         ;; (defmacro foo '(capture))
+                         ;; (macrolet ((capture () 'erased)) (foo))
+                         (unless (equal form raw)
+                           (let* ((variablep (symbolp form))
+                                  (name (if variablep form (car form)))
+                                  (lookup (if variablep
+                                              #'env-variable-info
+                                              #'env-function-info))
+                                  (entry (funcall lookup name subenv)))
+                             (when (and (symbolp name) (symbol-package name)
                                         (not (gethash name probes))
-                                        (or (not (inert-reference-p namespace))
-                                            (and (eq namespace binding-namespace)
-                                                 (symbol-like= name (probe-info-source info))))
-                                        (or (not (eq binding-namespace :variable))
-                                            (not (env-special-p name subenv))))))
-                               (note-capture (accessor binding-namespace)
-                                 (when-let (vars (remove-if-not
-                                                  (lambda (entry)
-                                                    (macro-introduced entry binding-namespace))
-                                                  (ldiff (funcall accessor subenv)
-                                                         (funcall accessor base-env))))
-                                   (push (cons (probe-info-source info)
-                                               (list binding-namespace vars))
-                                         binding-captures))))
-                        (unless (inert-reference-p namespace)
-                          (note-capture #'variable-bindings :variable))
-                        (unless (eq namespace :block)
-                          (note-capture #'function-bindings :function))
-                        (unless (eq namespace :function)
-                          (note-capture #'blocks :block))
-                        nil)
-                      t))
-                (lambda (form subenv)
-                  (note-variable-reference form subenv base-env)
-                  t)
-                (lambda (name namespace subenv)
-                  (if (eq namespace :variable)
-                      (note-variable-reference name subenv base-env)
-                      (let ((package (symbol-package
-                                      (reference-name-symbol name namespace)))
-                            (accessor (ecase namespace
-                                        (:function #'function-bindings)
-                                        (:block #'blocks))))
-                        (flet ((builtin (name)
-                                 (and (eq namespace :function)
-                                      (or (and (fboundp name)
-                                               (not (member name '(call-next-method
-                                                                   next-method-p)))
-                                               (eq package (find-package :common-lisp)))
-                                          (starts-with-subseq "SB-"
-                                                              (package-name package))))))
-                          (when (and package
-                                     (not (and ignore-function-references
-                                               (eq namespace :function)))
-                                     (not (builtin name))
-                                     (not (member name
-                                                  (ldiff (funcall accessor subenv)
-                                                         (funcall accessor base-env))
-                                                  :key #'ensure-car :test #'equal)))
-                            (push (list namespace name) reference-captures)))))))))
+                                        (consp entry)
+                                        (eq entry (funcall lookup name base-env))
+                                        (if variablep
+                                            (not (env-special-p name subenv))
+                                            (and (not ignore-function-references)
+                                                 (not (sbcl-internal-p
+                                                       (symbol-package name))))))
+                               (pushnew (if variablep name (list :function name))
+                                        reference-captures :test #'equal)))))))
+                 (walk-probed-expansion
+                  raw base-env probes
+                  (lambda (info namespace subenv)
+                    (if (or (and (eq namespace :exp)
+                                 (eq (probe-info-sort info) :exp))
+                            (and (eq (probe-info-sort info) :ref)
+                                 (eq namespace (probe-info-namespace info))))
+                        (labels ((macro-introduced (entry binding-namespace)
+                                   (let ((name (ensure-car entry)))
+                                     ;; Detect introduced references in evaluation position
+                                     ;; not mentioned in the call which could potentially
+                                     ;; capture. For call/block positions, check the kind
+                                     (and (symbolp name) (symbol-package name)
+                                          (not (gethash name probes))
+                                          (or (not (inert-reference-p namespace))
+                                              (and (eq namespace binding-namespace)
+                                                   (symbol-like= name
+                                                                 (probe-info-source info))))
+                                          (or (not (eq binding-namespace :variable))
+                                              (not (env-special-p name subenv))))))
+                                 (note-capture (accessor binding-namespace)
+                                   (when-let (vars (remove-if-not
+                                                    (lambda (entry)
+                                                      (macro-introduced entry
+                                                                        binding-namespace))
+                                                    (ldiff (funcall accessor subenv)
+                                                           (funcall accessor base-env))))
+                                     (pushnew (cons (probe-info-source info)
+                                                 (list binding-namespace vars))
+                                              binding-captures :test #'equal))))
+                          (unless (inert-reference-p namespace)
+                            (note-capture #'variable-bindings :variable))
+                          (unless (eq namespace :block)
+                            (note-capture #'function-bindings :function))
+                          (unless (eq namespace :function)
+                            (note-capture #'blocks :block))
+                          nil)
+                        t))
+                  (lambda (form subenv)
+                    (note-variable-reference form subenv base-env)
+                    t)
+                  (lambda (name namespace subenv)
+                    ;; if macro-introduced and unbound, this free reference can be captured
+                    (if (eq namespace :variable)
+                        (note-variable-reference name subenv base-env)
+                        (let ((package (symbol-package
+                                        (reference-name-symbol name namespace)))
+                              (accessor (ecase namespace
+                                          (:function #'function-bindings)
+                                          (:block #'blocks))))
+                          (flet ((builtin (name)
+                                   (and (eq namespace :function)
+                                        (or (and (fboundp name)
+                                                 (not (member name '(call-next-method
+                                                                     next-method-p)))
+                                                 (eq package (find-package "CL")))
+                                            (sbcl-internal-p package)))))
+                            (when (and package
+                                       (not (and ignore-function-references
+                                                 (eq namespace :function)))
+                                       (not (builtin name))
+                                       (not (member name
+                                                    (ldiff (funcall accessor subenv)
+                                                           (funcall accessor base-env))
+                                                    :key #'ensure-car :test #'equal)))
+                              (pushnew (list namespace name) reference-captures
+                                       :test #'equal))))))))))
       (setf complete-p
             (handler-bind ((warning #'muffle-warning))
               (with-suppressed-parse-errors

@@ -388,6 +388,70 @@
 
 (defmacro hygiene-env-marker () nil)
 
+(defmacro hygiene-repeated-source (form)
+  `(let ((hygiene-local nil)) ,form ,form))
+
+(define-test hygiene-deduplicates-captures :parent parser
+  (let ((*hygiene-fixture-expansion*
+          '(progn hygiene-free hygiene-free
+            (hygiene-helper) (hygiene-helper)
+            (return-from hygiene-outer nil) (return-from hygiene-outer nil))))
+    (multiple-value-bind (bindings references complete)
+        (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)")
+                             (parse::make-env))
+      (is eq t complete)
+      (is eq nil bindings)
+      (is equal '((:block hygiene-outer) (:function hygiene-helper) hygiene-free) references)))
+  (multiple-value-bind (bindings references complete)
+      (parse::hygiene-check
+       (probe-driver-syntax "(weave-tests::hygiene-repeated-source (print x))")
+       (parse::make-env))
+    (is eq t complete)
+    (is eq nil references)
+    (is equal '((:variable (hygiene-local))) (mapcar #'cdr bindings))))
+
+(define-test hygiene-observes-erased-caller-references :parent parser
+  (let ((env (parse::env-with-functions
+              (parse::env-with-variables (parse::make-env) '((hygiene-free 42)))
+              '((hygiene-helper nil 'hygiene-free)))))
+    (dolist (case '((hygiene-free (hygiene-free))
+                    ((progn hygiene-free) (hygiene-free))
+                    ((hygiene-helper) (hygiene-free (:function hygiene-helper)))
+                    ((progn (hygiene-helper)) (hygiene-free (:function hygiene-helper)))
+                    ((macrolet ((hygiene-helper () 17)) (hygiene-helper)) nil)
+                    ((symbol-macrolet ((hygiene-free 17)) hygiene-free) nil)))
+      (destructuring-bind (*hygiene-fixture-expansion* expected) case
+        (multiple-value-bind (bindings references complete)
+            (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)") env)
+          (is eq t complete)
+          (is eq nil bindings)
+          (is equal expected references))))
+    (let ((*hygiene-fixture-expansion* '(hygiene-helper)))
+      (is equal '(nil (hygiene-free) t)
+          (multiple-value-list
+           (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-fixture)") env
+                                :ignore-function-references t))))
+    ;; The source call's own local macro name is not an introduced reference.
+    (let ((local-env (parse::env-with-functions (parse::make-env) '((hygiene-helper nil 42)))))
+      (is equal '(nil nil t)
+          (multiple-value-list
+           (parse::hygiene-check (probe-driver-syntax "(weave-tests::hygiene-helper)") local-env))))))
+
+(define-test expansion-observation-is-opt-in :parent parser
+  (let* ((env (parse::env-with-functions (parse::make-env) '((hygiene-helper nil 42))))
+         (*hygiene-fixture-expansion* '(hygiene-helper))
+         (form '(hygiene-fixture)))
+    (is equal '((hygiene-helper) t)
+        (multiple-value-list (parse::env-macroexpand-1 form env)))
+    (is equal '(42 t) (multiple-value-list (parse::env-macroexpand form env)))
+    (let* ((seen nil)
+           (parse::*macroexpansion-observer*
+             (lambda (head subenv)
+               (is eq env subenv)
+               (push head seen))))
+      (is equal '(42 t) (multiple-value-list (parse::env-macroexpand form env)))
+      (is equal '((hygiene-fixture) (hygiene-helper)) (nreverse seen)))))
+
 (define-test tagbody-walker-scopes :parent parser
   (let* ((outer-tags (list 'outer))
          (env (parse::make-env :%tags outer-tags))
