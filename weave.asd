@@ -13,6 +13,7 @@
                #:trivia
                #:uncursed
                #+sbcl #:sb-concurrency
+               #+sbcl #:sb-cltl2
                )
   :pathname "src"
   :components ((:file "util")

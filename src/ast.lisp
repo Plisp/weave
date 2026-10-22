@@ -636,19 +636,73 @@ expanding in it may differ from expanding in the null environment."
               (or (consp entry) (and (symbolp entry) (nth-value 1 (macroexpand-1 entry)))))
             (variable-bindings env))))
 
+#+sbcl
+(defun native-macro-environment (env)
+  "Reconstruct `env' as an sbcl environment for macroexpansion."
+  (sb-ext:without-package-locks
+    (let* ((native (sb-kernel:make-null-lexenv))
+           (sb-c:*lexenv* native)
+           (sb-c::*current-path* nil))
+      (dolist (binding (reverse (variable-bindings env)))
+        (setf native
+              (if (symbolp binding)
+                  (sb-cltl2:augment-environment native :variable (list binding))
+                  (sb-cltl2:augment-environment
+                   native :symbol-macro (list binding)
+                          :declare `((sb-ext:disable-package-locks ,(first binding)))))))
+      (dolist (binding (reverse (function-bindings env)))
+        (setf native
+              (sb-cltl2:augment-environment
+               native :declare `((sb-ext:disable-package-locks ,(ensure-car binding)))))
+        (setf native
+              (if (symbolp binding)
+                  (sb-cltl2:augment-environment native :function (list binding))
+                  ;; exclude runtime lexical bindings
+                  (let* ((definition-env (sb-c::make-restricted-lexenv native))
+                         (lambda-form (sb-cltl2:parse-macro
+                                       (first binding) (second binding) (cddr binding)
+                                       definition-env))
+                         (expander (sb-eval:eval-in-native-environment
+                                    `(function ,lambda-form) definition-env)))
+                    (sb-cltl2:augment-environment
+                     native :macro (list (list (first binding) expander)))))))
+      (setf (sb-c::lexenv-blocks native)
+            (mapcar (lambda (name)
+                      (let* ((entry (sb-c::make-entry))
+                             (cleanup (sb-c::make-cleanup :block entry))
+                             (target (list entry (sb-c::make-ctran) (sb-c::make-lvar))))
+                        (setf (sb-c::entry-cleanup entry) cleanup
+                              (sb-c::cleanup-block cleanup) target)
+                        (cons name target)))
+                    (blocks env)))
+      (when (tags env)
+        (let ((entry (sb-c::make-entry)))
+          (setf (sb-c::entry-cleanup entry) (sb-c::make-cleanup :tagbody entry))
+          (setf (sb-c::lexenv-tags native)
+                (mapcar (lambda (name) (list name entry (sb-c::make-ctran)))
+                        (remove-duplicates (tags env) :test #'eql)))))
+      (if (%specials env)
+          (sb-cltl2:augment-environment native :declare `((special ,@(%specials env))))
+          native))))
+
 (defun macroexpand-with-env (form env &optional once)
   "Expands `form' in `env', reconstructing `env' only when it can affect the expansion.
 When `once' is true, only perform one step."
   (let ((*macroexpansion-env* env))
+    #+sbcl
+    (expand-in-native-env form
+                          (when (env-affects-expansion-p env)
+                            (native-macro-environment env))
+                          once)
+    #-sbcl
     (if (env-affects-expansion-p env)
-      ;; TODO use sb-eval:eval-in-native-environment and change format
-      (eval (line-up-first `(locally (declare (special ,@(%specials env)))
-                             (macroexpand-in-lispenv ,form ,once))
-                           (wrap-function-like-env (function-bindings env))
-                           (wrap-variable-like-env (variable-bindings env))
-                           (wrap-block-env (blocks env))
-                           (wrap-tag-env (tags env))))
-      (expand-in-native-env form nil once))))
+        (eval (line-up-first `(locally (declare (special ,@(%specials env)))
+                                (macroexpand-in-lispenv ,form ,once))
+                             (wrap-function-like-env (function-bindings env))
+                             (wrap-variable-like-env (variable-bindings env))
+                             (wrap-block-env (blocks env))
+                             (wrap-tag-env (tags env))))
+        (expand-in-native-env form nil once))))
 
 (declaim (type simple-vector *hardwired-operators*))
 (defparameter *hardwired-operators* #(lambda defun defmethod defmacro

@@ -2,6 +2,73 @@
 
 (define-test parser)
 
+#+sbcl
+(define-test native-macro-environment-control-scopes :parent parser
+  (let* ((env (parse:make-env :%blocks '(inner nil outer inner)
+                            :%tags '(here there here)))
+         (native (parse::native-macro-environment env))
+         (blocks (sb-c::lexenv-blocks native))
+         (tags (sb-c::lexenv-tags native)))
+    (is equal '(inner nil outer inner) (mapcar #'car blocks))
+    (is equal '(there here) (mapcar #'car tags))
+    (dolist (binding blocks)
+      (destructuring-bind (name entry continuation value) binding
+        (declare (ignore name))
+        (is eq t (typep entry 'sb-c::entry))
+        (is eq t (typep continuation 'sb-c::ctran))
+        (is eq t (typep value 'sb-c::lvar))
+        (is eq (cdr binding) (sb-c::cleanup-block (sb-c::entry-cleanup entry)))))
+    (is eq nil (eq (second (first blocks)) (second (fourth blocks))))
+    (is eq t (eq (second (first tags)) (second (second tags))))
+    (is eq nil (eq (third (first tags)) (third (second tags))))
+    (dolist (binding tags)
+      (is eq t (typep (third binding) 'sb-c::ctran)))))
+
+#+sbcl
+(define-test native-macro-environment-definition-and-call-scopes :parent parser
+  (let* ((env (parse:make-env
+               :%blocks '(scope nil) :%tags '(label)
+               :%variable-bindings '(lexical (alias 17)) :%specials '(special-name)
+               :%function-bindings
+               '((inspect-native (&environment env)
+                   (list 'quote
+                         (list (outer-native)
+                               (sb-cltl2:variable-information 'lexical env)
+                               (sb-cltl2:variable-information 'special-name env)
+                               (macroexpand 'alias env)
+                               (sb-cltl2:function-information 'local-function env)
+                               (mapcar #'car (sb-c::lexenv-blocks env))
+                               (mapcar #'car (sb-c::lexenv-tags env)))))
+                 (outer-native () 42)
+                 local-function)))
+         (native (parse::native-macro-environment env)))
+    (is eq nil (compiled-function-p (macro-function 'inspect-native native)))
+    (is equal ''(42 :lexical :special 17 :function (scope nil) (label))
+        (parse::macroexpand-with-env '(inspect-native) env))))
+
+#+sbcl
+(defvar *native-environments-seen* nil)
+
+#+sbcl
+(define-test native-macro-environment-stepping-reuses-environment :parent parser
+  (let* ((*native-environments-seen* nil)
+         (seen nil)
+         (env (parse:make-env
+               :%blocks '(scope) :%tags '(label)
+               :%function-bindings
+               '((first-native (&environment env)
+                   (push env *native-environments-seen*) '(second-native))
+                 (second-native (&environment env)
+                   (push env *native-environments-seen*) ''done))))
+         (parse::*macroexpansion-observer*
+           (lambda (form observed-env)
+             (is eq env observed-env)
+             (push form seen))))
+    (is equal ''done (parse::macroexpand-with-env '(first-native) env))
+    (is equal '((second-native) (first-native)) seen)
+    (is = 2 (length *native-environments-seen*))
+    (is eq (first *native-environments-seen*) (second *native-environments-seen*))))
+
 (define-test macro-call-requires-environment :parent parser
   (flet ((make-call (&rest initargs)
            (apply #'make-instance 'parse:macro-call
