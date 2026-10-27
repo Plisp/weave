@@ -367,7 +367,8 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun ast-delete (loc index ui &optional (stack (stack ui)))
   "assumes that list has length > 1"
   (edit-list loc (lambda (body) (list-remove (elements body) index))
-             (append-id (location-id loc) (max 0 (1- index))) ui stack))
+             (append-id (location-id loc) (max 0 (1- index)))
+             ui stack))
 
 (defun value-at-path (loc path)
   "The thing at `path' from the list at `loc' or NIL if there is none."
@@ -384,7 +385,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun insert-or-jump (loc index ui stack &key (item (hole)) tail)
   "Moves to the hole at `index' of the list at `loc' and down the indices `tail' if passed,
 otherwise inserts `item' at `index' and focuses down `tail' within it. `stack' is the
-part of the ui stack starting in the node of `loc'."
+part of the ui stack starting from the node of `loc'."
   (let ((path (cons index tail)))
     (if (typep (value-at-path loc path) 'parse:hole)
         (progn
@@ -404,12 +405,13 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
         (parse:update call (location-id location) newnode)
       (multiple-value-call #'commit-edit ui
         (rebuild-spine (car outer) (constantly new-call) outer))
-      ;; descend into the parsed form, or keep the original path
+      ;;
       (dolist (id (if focus-id
                       (parse:path-at new-call focus-id)
-                      (or path (list (location-id location))))
-                  (focus ui))
-        (push (make-location :node (node-at (focus ui)) :id id) (stack ui))))))
+                      (or path ; translated path or vvv fast path
+                          (list (location-id location)))))
+        (push (make-location :node (node-at (focus ui)) :id id) (stack ui)))
+      (focus ui))))
 
 (defun swap-node (location newnode ui)
   "saves undo history"
@@ -476,7 +478,7 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
             (when (and (eq kind :lexical) (typep binder 'parse:binder)) binder)))))))
 
 (defun focus-binder (ui)
-  "The binder the symbol-ref under the cursor refers to, innermost binding first."
+  "The binder referenced by the symbol-ref under the cursor."
   (with-redisplay-cache (ui :focus-binder)
     (compute-focus-binder (node-at (focus ui)) (stack ui) ui)))
 
@@ -1208,8 +1210,7 @@ convention."
                                 (setf last-elt element)))))))))))
 
 (defun view-end (view)
-  "The column after and the line of the last cell `view' draws, following its last child.
-Relies on children being in reading order, which `ordered-view' checks."
+  "For placing parens."
   (if-let (children (tui:children view))
     (view-end (lastcar children))
     (let ((r (tui:rect view)))
@@ -1946,14 +1947,15 @@ pairs building new elements of &rest and &body slots."))
       ((and template (consp id))
        (let ((rest-loc (make-location :node node :id slot))
              (nested (typep (funcall template) 'ref-list)))
-         (ccase (length id)
+         (case (length id)
            (2 (if nested ; e.g. (body i), or (rest i) which needs traverse
                   (insert-or-jump rest-loc (1+ (second id)) ui stack
                                   :item (funcall template) :tail '(0))
                   (insert-or-jump rest-loc (1+ (second id)) ui stack)))
            (3 (when nested
                 (insert-or-jump (make-location :node node :id (list slot (second id)))
-                                (1+ (third id)) ui stack))))))
+                                (1+ (third id)) ui stack)))
+           (t (slog* (format nil "no space action for ~a" (length id)))))))
       ((and (eq (slot-kind layout slot) 'parse::&tree) (consp id))
        (insert-or-jump (make-location :node node :id (parent-id id))
                        (1+ (lastcar id)) ui stack)))))
@@ -2869,14 +2871,49 @@ is a list and never focused."
                        :rect (tui:rect content)
                        :children (delete nil (list content completion)))))))
 
-(defmethod tui:redisplay :around ((ui ui))
-  (restart-case
-      (unless (redisplayed-since-input ui)
-        (call-next-method)
-        (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'redisplay-done)))
-    (stop ()
-      :report "exit"
-      (tui:stop ui))))
+;; note: must go below definitions, next to tui:redisplay
+(let ((render-node-methods (c2cl:generic-function-methods #'render-node))
+      (old-render-method (find-method #'tui:render nil '(ui)))
+      (fnames '(render-toplevel-window stage-toplevel-window
+                render-one-toplevel scroll-position-at-row
+                top-level-focus-index translate-view-y reveal-focus-row
+                transform-rect-to-screen
+                view-end
+                render-elements
+                symbol-ref-text
+                render-delimiter render-symbol-space render-literal-text
+                render-literal-line render-layout-slot slot-render-keys
+                macro-call-indentation loop-indentation
+                draw-highlights
+                render-completion-window render-completion))
+      (funs (make-hash-table :test 'eq)))
+  (loop for name in fnames
+        do (setf (gethash name funs) (fdefinition name)))
+  (defun reset-ui ()
+    (remove-method #'tui:render (find-method #'tui:render nil '(ui)))
+    (add-method #'tui:render old-render-method)
+    (loop for method in (c2cl:generic-function-methods #'render-node)
+          do (remove-method #'render-node method))
+    (loop for method in render-node-methods
+          do (add-method #'render-node method))
+    (loop for name in fnames
+          do (setf (fdefinition name) (gethash name funs)))))
+
+(let ((redisplay-failing nil))
+  (defmethod tui:redisplay :around ((ui ui))
+    (restart-case
+        (unless (redisplayed-since-input ui)
+          (call-next-method)
+          (setf redisplay-failing nil)
+          (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'redisplay-done)))
+      (restore-ui-fallback ()
+        :report "restore broken redisplay methods, exit if still failing"
+        (reset-ui)
+        (if redisplay-failing
+            (progn (slog 'failed)
+                   (tui:stop ui))
+            (progn (setf redisplay-failing t)
+                   (tui:redisplay ui)))))))
 
 (defun translate-mouse-event (event row-offset)
   (if (tui:mouse-event-p event)
