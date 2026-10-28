@@ -26,10 +26,8 @@
          (ast (cond ((null parsed) (list (parse:hole)))
                     ((listp parsed) parsed)
                     (t (list parsed))))
-         (ui (make-instance 'w::ui :ast ast)))
-    (setf (w::stack ui) (list (w::make-location :node ui :id nil)))
-    (w::descend ui 0)
-    ui))
+         (ui (make-instance 'w::ui)))
+    (w::make-buffer ui :ast ast)))
 
 (defun goto (ui &rest path)
   "Focuses `path' from the first root"
@@ -43,9 +41,9 @@
   (let ((buffer (make-array (list rows cols))))
     (dotimes (i (array-total-size buffer))
       (setf (row-major-aref buffer i) (tui::make-cell)))
-    (setf (slot-value ui 'tui::%canvas) buffer)
+    (setf (slot-value (w::buffer-ui ui) 'tui::%canvas) buffer)
     (let ((tui::*put-buffer* buffer))
-      (setf (slot-value ui 'tui::%root-view) (tui:render ui)))
+      (setf (slot-value (w::buffer-ui ui) 'tui::%root-view) (tui:render (w::buffer-ui ui))))
     buffer))
 
 (defun cell-bgs (ui n &key (row 0))

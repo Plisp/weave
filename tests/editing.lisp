@@ -751,3 +751,116 @@ second\"" (parse:str (parse::docstring code)))
   (is equal '("P" nil)
             (binder-and-bound "(multiple-value-bind (p q) (f) (print p))"
                               '(parse:body 2) '(parse:body 0))))
+
+(define-test multiple-buffer-layout :parent editing
+  (let* ((first (ui-for "alpha"))
+         (ui (w::buffer-ui first))
+         (second (w::make-buffer ui :ast (list (parse "beta"))
+                                   :source #p"example.lisp" :x 8 :y 2))
+         (cells (render-buffer first :rows 6 :cols 20)))
+    (is equal #p"example.lisp" (w::buffer-source second))
+    (is equal '("alpha" "        beta") (lines first :rows 6 :cols 20))
+    (is eq first (w::focused-buffer ui))
+    (is eq second (w::location-node (car (last (w::stack second)))))
+    (is eq nil (eq (w::node-views first) (w::node-views second)))
+    (is eq nil (eq (w::scroll-state first) (w::scroll-state second)))
+    ;; Unbound symbols stay red; only the active buffer gets the gold focus blend.
+    (is eq nil (= #xcb4b16 (tui-sys:bg (tui::cell-style (aref cells 0 0)))))
+    (is = #xcb4b16 (tui-sys:bg (tui::cell-style (aref cells 2 8))))
+    (setf (w::focused-buffer ui) second)
+    (setf cells (render-buffer first :rows 6 :cols 20))
+    (is = #xcb4b16 (tui-sys:bg (tui::cell-style (aref cells 0 0))))
+    (is eq nil (= #xcb4b16 (tui-sys:bg (tui::cell-style (aref cells 2 8)))))
+    ;; A buffer outside a resized terminal neither draws nor leaves a stale view.
+    (render-buffer first :rows 1 :cols 4)
+    (is eq nil (w::buffer-view second))
+    (is equal '("alpha" "        beta") (lines first :rows 6 :cols 20))))
+
+(define-test multiple-buffer-input-and-history :parent editing
+  (let* ((first (ui-for "a"))
+         (ui (w::buffer-ui first))
+         (second (w::make-buffer ui :ast (list (parse "b")) :x 8 :y 2))
+         (received nil))
+    (render-buffer first :rows 6 :cols 20)
+    (setf (slot-value ui 'tui::%screen) (w::make-cell-buffer 6 20))
+    (flet ((send (event)
+             (let ((*standard-output* (make-broadcast-stream))
+                   (*terminal-io* (make-two-way-stream (make-string-input-stream "")
+                                                      (make-broadcast-stream))))
+               (tui:dispatch-event ui event))))
+      ;; Mouse dispatch uses the topmost buffer and translates to local coordinates.
+      (setf (tui:mouse-handler (w::buffer-view second))
+            (lambda (view event)
+              (declare (ignore view))
+              (let ((data (tui:event-kind event)))
+                (setf received (list (tui:mouse-data-row data)
+                                     (tui:mouse-data-col data))))))
+      (send (tui-sys:make-event :kind (tui-sys::make-mouse-data
+                                     :button :left :state :click :row 3 :col 9)))
+      (is eq second (w::focused-buffer ui))
+      (is equal '(1 1) received)
+      (send (event #\z))
+      (is equal "A" (code first))
+      (is equal "BZ" (code second))
+      (is = 0 (history-length first))
+      (is = 1 (history-length second))
+      (send (tui-sys:make-event :kind (tui-sys::make-mouse-data
+                                     :button :left :state :click :row 1 :col 1)))
+      (send (event #\x))
+      (is equal "AX" (code first))
+      (is equal "BZ" (code second))
+      (send (event '(:ctrl #\u)))
+      (is equal "A" (code first))
+      (is equal "BZ" (code second)))))
+
+(define-test selection-and-clipboard-across-buffers :parent editing
+  (let* ((first (goto (ui-for "(f a b)") '(parse:body 0)))
+         (ui (w::buffer-ui first))
+         (second (w::make-buffer ui :ast (list (parse "(g c)")) :y 4)))
+    (press first '(:shift :right) '(:ctrl #\c))
+    (let ((selection (w::selection ui)))
+      (is eq selection (w::selection first))
+      (setf (w::focused-buffer ui) second)
+      (is eq selection (w::selection ui))
+      (is eq nil (w::selection second))
+      (is eq nil (w::selection-activep selection))
+      (goto second '(parse:body 0))
+      (press second '(:ctrl #\v))
+      (is equal "(G C A B)" (code second))
+      (is equal "(F A B)" (code first)))))
+
+(define-test completion-overlays-all-buffers :parent editing
+  (let* ((buffer (ui-for "ca"))
+         (ui (w::buffer-ui buffer))
+         (other (w::make-buffer ui :ast (list (parse "underneath")) :y 3)))
+    (setf (w::buffer-x buffer) 3
+          (w::buffer-y buffer) 2
+          (w::completion-state buffer)
+          (w::make-completion-state :anchor (focused buffer) :candidates '(car caar)))
+    (let* ((cells (render-buffer buffer :rows 7 :cols 20))
+           (overlay (first (tui:children (tui:root-view ui))))
+           (rect (tui:rect overlay)))
+      (is = 3 (tui:rect-x rect))
+      (is = 3 (tui:rect-y rect))
+      (is equal "car " (format nil "~{~a~}"
+                                (loop for x from 3 below 7 collect
+                                      (tui::cell-string (aref cells 3 x)))))
+      (is eq other (w::buffer-at-point ui 4 4))
+      ;; An overlay click must not focus the buffer beneath it.
+      (setf (slot-value ui 'tui::%screen) (w::make-cell-buffer 7 20))
+      (let ((*standard-output* (make-broadcast-stream))
+            (*terminal-io* (make-two-way-stream (make-string-input-stream "")
+                                               (make-broadcast-stream))))
+        (tui:dispatch-event ui (tui-sys:make-event
+                               :kind (tui-sys::make-mouse-data
+                                      :button :left :state :click :row 4 :col 4))))
+      (is eq buffer (w::focused-buffer ui)))))
+
+(define-test scrolled-highlight-screen-coordinates :parent editing
+  (let* ((bounds (tui:make-rect :x 8 :y 2 :rows 6 :cols 12))
+         (view (tui:make-rect :x 1 :y 1 :rows 4 :cols 3))
+         (visible (w::transform-rect-to-screen view 3 bounds)))
+    (is = 9 (tui:rect-x visible))
+    (is = 2 (tui:rect-y visible))
+    (is = 2 (tui:rect-rows visible))
+    (is = 0 (tui:rect-rows (w::transform-rect-to-screen view 6 bounds)))))
