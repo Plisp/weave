@@ -14,7 +14,7 @@
            #:get-location #:node-at
 
            #:location-sort #:locsort #:location-env #:env-lookup
-           #:form-slot-kinds
+           #:form-slot-kinds #:form-optional-slots
 
            #:eval-form #:symbol-ref #:binder #:literal
            #:reader-marker #:read-quasiquote #:read-quote #:read-function #:read-eval
@@ -24,7 +24,7 @@
 
            #:irregular-form #:macro-call #:subforms #:path-at #:expanded
 
-           #:function-code #:docstring #:lambda-list
+           #:function-code #:docstring #:declarations #:lambda-list
            #:unevaluated
            #:body #:name #:str #:vars #:op
            #:hole #:text
@@ -79,7 +79,7 @@
 (defrecord symbol-ref (eval-form atom-form)
   ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
-   (home-package :init *package* :type (or null package)))
+   (home-package :type (or null package)))
   (:documentation "Represents a symbol, possibly referring to a symbol macro."))
 
 (defrecord binder (symbol-ref)
@@ -1044,6 +1044,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
        (gen-tree-ref l path)))
     ((eql 'docstring) (docstring node))
     ((eql 'declarations) (declarations node))
+    ((list* (eql 'declarations) path) (gen-tree-ref (declarations node) path))
     ((eql 'body) (body node))
     ((list (eql 'body) (and (type integer) i)) (nth i (body node)))))
 
@@ -1060,6 +1061,8 @@ The specializer-list-p argument is always NIL so we can classify specializers."
        (rebuild :lambda-list (gen-tree-update (lambda-list node) path new-value)))
       ((eql 'docstring) (rebuild :docstring new-value))
       ((eql 'declarations) (rebuild :declarations new-value))
+      ((list* (eql 'declarations) path)
+       (rebuild :declarations (gen-tree-update (declarations node) path new-value)))
       ((eql 'body) (rebuild :body new-value))
       ((list (eql 'body) (and (type integer) i))
        (rebuild :body (list-update (body node) new-value i))))))
@@ -1067,6 +1070,7 @@ The specializer-list-p argument is always NIL so we can classify specializers."
 (defmethod location-sort ((node function-code) id)
   (trivia:match id
     ((eql 'docstring) 'string)
+    ((or (eql 'declarations) (list* (eql 'declarations) _)) 'unevaluated)
     ((list (eql 'body) (type integer)) 'eval-form)
     ((list* (eql 'lambda-list) path)
      (when-let (sorts (elements (lambda-list-sorts node)))
@@ -1260,11 +1264,14 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
           (update-clauses (list))
           (sort-clauses (list)))
       (flet ((rebuild (slot value)
-               `(make-instance ',classname
-                               :op (op node)
-                               ,@(loop for s in slots
-                                       append `(,(make-keyword s)
-                                                ,(if (eq s slot) value `(,s node)))))))
+               `(apply #'make-instance ',classname :op (op node)
+                       (append
+                        ,@(loop for s in slots
+                                collect
+                                (if (eq s slot)
+                                    `(list ,(make-keyword s) ,value)
+                                    `(when (slot-boundp node ',s)
+                                       (list ,(make-keyword s) (,s node)))))))))
         (push `((eql 'op) (op node)) get-clauses)
         ;; accessors
         (loop
@@ -1304,7 +1311,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                 (push `((list (eql ',part) (and (type integer) i))
                         ,(rebuild part `(list-update (,part node) new-value i)))
                       update-clauses))
-               (&tree
+               ((&tree &declarations)
                 (push `((list* (eql ',part) path) (gen-tree-ref (,part node) path))
                       get-clauses)
                 (push `((list* (eql ',part) path)
@@ -1340,7 +1347,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                      (push `((list (eql ',part) (type integer)) 'unevaluated) sort-clauses))
                     ;; note: nothing inside quoted data is ever a binder or eval-form
                     ;; TODO refine sorts by value type (symbol/string/number/...)
-                    (&tree
+                    ((&tree &declarations)
                      (push `((eql ',part) 'unevaluated) sort-clauses)
                      (push `((list* (eql ',part) (type list)) 'unevaluated) sort-clauses))
                     (&rest
@@ -1379,6 +1386,19 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
   (defun pattern-tags (pattern)
     (remove-duplicates (mapcar #'car (spec-kinds pattern))))
 
+  (defun required-pattern-tags (pattern)
+    "The tags present in every alternative of `pattern'."
+    (cond ((null pattern) nil)
+          ((eq (car pattern) '&or)
+           (intersection (required-pattern-tags (second pattern))
+                         (required-pattern-tags (third pattern))))
+          ((consp (car pattern))
+           (union (required-pattern-tags (car pattern))
+                  (required-pattern-tags (cdr pattern))))
+          ((member (car pattern) *parser-keywords*)
+           (adjoin (second pattern) (required-pattern-tags (cddr pattern))))
+          (t (adjoin (car pattern) (required-pattern-tags (cdr pattern))))))
+
   (defun effective-tags (pattern rest-patterns)
     (let ((tags (pattern-tags pattern)))
       (union tags (loop for tag in tags
@@ -1392,7 +1412,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
   (defun second-alternative-check (alternatives node rest-patterns)
     "Did the parse take the second alternative?"
     `(or ,@(loop for tag in (second-unique-tags alternatives rest-patterns)
-                 collect `(,tag ,node))))
+                 collect `(slot-boundp ,node ',tag))))
 
   (defun or-syntax (alternatives node rest-patterns)
     `(if ,(second-alternative-check alternatives node rest-patterns)
@@ -1458,7 +1478,7 @@ more precisely.")
 
 (defun alternative-taken-p (node alternatives rest-patterns)
   "Did the parse of `node' take the second of `alternatives'?"
-  (some (lambda (tag) (funcall tag node))
+  (some (lambda (tag) (slot-boundp node tag))
         (second-unique-tags alternatives rest-patterns)))
 
 (defun rest-suffix-path (node tag rest-patterns rest)
@@ -1571,11 +1591,17 @@ our reader representation or ordinary sexps."
                (block nil
                  ,@(mapcar
                     (lambda (pattern)
-                      `(handler-case
-                           (return
-                             (funcall (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
-                                      ,form))
-                         (form-parse-error () nil)))
+                      (let* ((tags (effective-tags (ensure-list pattern) rest-patterns))
+                             (saved (loop for tag in tags collect (gensym (string tag)))))
+                        `(let ,(mapcar #'list saved tags)
+                           (handler-case
+                               (return
+                                 (funcall
+                                  (spec-parser ,pattern ,binds ,rest-patterns ,ref-p)
+                                  ,form))
+                             (form-parse-error ()
+                               (setf ,@(mapcan #'list tags saved))
+                               nil)))))
                     (cdr spec))
                  (form-parse-error "expected one of ~a got ~a" ',(cdr spec) ,form))))
            ((&method-lambda &lambda &macro-lambda)
@@ -1632,6 +1658,18 @@ our reader representation or ordinary sexps."
                                    (gen-cdr ,form)))
                    (form-parse-error "expected non-nil car: ~a" ,form))))))))))
 
+(defvar *form-optional-slots* (make-hash-table :test #'eq))
+
+(defun form-optional-slots (classname)
+  (gethash classname *form-optional-slots*))
+
+(defun make-parsed-form (class absent-slots &rest initargs)
+  "Constructs `class', omitting slots belonging to inactive alternatives."
+  (apply #'make-instance class
+         (loop for (key value) on initargs by #'cddr
+               unless (find key absent-slots :key #'make-keyword)
+                 append (list key value))))
+
 (defvar *form-slot-kinds* (make-hash-table :test #'eq))
 
 (defun form-slot-kinds (classname)
@@ -1666,23 +1704,36 @@ Any binding forces a symbol match.
                                 (check-binds tag-kinds rest-patterns binds)))
          (classname (symbolicate name "-FORM"))
          (slots (pattern-tags spec))
+         (optional-slots (set-difference slots (required-pattern-tags spec)))
          (declaration-tag (car (rassoc '&declarations (spec-kinds spec))))
          (specials (when declaration-tag `(declaration-specials (first ,declaration-tag)))))
     `(progn
-       (defrecord ,classname (irregular-form)
-         ((op :init ',name) ,@(mapcar #'list slots)))
-       (setf (gethash ',classname *form-slot-kinds*) ',(spec-kinds spec))
+       (defclass ,classname (irregular-form)
+         ((op :initarg :op :initform ',name :reader op)
+          ,@(loop for slot in slots
+                  collect `(,slot :initarg ,(make-keyword slot) :reader ,slot
+                                  ,@(unless (member slot optional-slots)
+                                      `(:initform (error "~A not provided" ',slot)))))))
+       (defun ,(symbolicate "MAKE-" classname) (&rest initargs)
+         (apply #'make-instance ',classname initargs))
+       (defun ,(symbolicate classname "-P") (node)
+         (typep node ',classname))
+       (setf (gethash ',classname *form-slot-kinds*) ',(spec-kinds spec)
+             (gethash ',classname *form-optional-slots*) ',optional-slots)
        ;; methods
        ,(when (member 'body slots)
           `(defmethod get-body ((node ,classname)) (values (body node) t)))
        (defmethod copy-node ((old ,classname))
-         (make-instance ',classname :op (op old)
-           ,@(loop for name in slots
-                   append (list (make-keyword name)
-                                (if (member (cdr (assoc name (spec-kinds spec)))
-                                            '(&body &declarations &rest-qualifiers))
-                                    `(mapcar #'copy-node (,name old))
-                                    `(copy-node (,name old)))))))
+         (apply #'make-instance ',classname :op (op old)
+                (append
+                 ,@(loop for slot in slots
+                         collect
+                         `(when (slot-boundp old ',slot)
+                            (list ,(make-keyword slot)
+                                  ,(if (member (cdr (assoc slot (spec-kinds spec)))
+                                               '(&body &declarations &rest-qualifiers))
+                                       `(mapcar #'copy-node (,slot old))
+                                       `(copy-node (,slot old)))))))))
        ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
        ,@(syntax-methods name classname spec rest-patterns)
        (defmethod suffix-path ((node ,classname) suffix)
@@ -1879,8 +1930,11 @@ Any binding forces a symbol match.
              (defun ,(symbolicate name "-PARSER") (rawform env walker alter-identity)
                (declare (ignorable env walker alter-identity))
                (,(symbolicate "WITH-PARSED-" name) (rawform t)
-                (make-instance
-                 ',classname :op (if (typep (gen-car rawform) 'reader-marker)
+                (make-parsed-form
+                 ',classname
+                 (append ,@(loop for tag in optional-slots
+                                 collect `(unless ,tag (list ',tag))))
+                 :op (if (typep (gen-car rawform) 'reader-marker)
                                      ',(symbolicate "READ-" name)
                                      ',name)
                  ,@(loop
@@ -2366,11 +2420,12 @@ other atom."
       (env-with-blocks outer-env (list (name node)))
       outer-env))
 
-(defform (function fun-designator))
+(defform (function &tree fun-designator))
 (defmethod location-sort ((node function-form) id)
-  (case id
+  (case (id-slot id)
     (op 'symbol-ref)
-    (fun-designator (if (symbol-ref-p (fun-designator node))
+    (fun-designator (if (and (eq id 'fun-designator)
+                             (symbol-ref-p (fun-designator node)))
                         'fun-designator
                         'unevaluated))))
 

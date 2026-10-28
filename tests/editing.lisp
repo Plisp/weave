@@ -58,7 +58,7 @@ second\" (declare (type fixnum x)) (+ x 1))"))
     (is = 1 (length (parse:body code)))
     (is equal "\"first
 second\"" (parse:str (parse::docstring code)))
-    (is equal "defun g /  (x) /  \"first /  second\" /  x + 1" (draw ui)))
+    (is equal "defun g /  (x) /  \"first /  second\" /  (declare (type fixnum x)) /  x + 1" (draw ui)))
   (let ((code (make-instance 'parse:function-code
                              :lambda-list-kind :lambda
                              :lambda-list (parse:ref-list)
@@ -391,7 +391,7 @@ second\"" (parse:str (parse::docstring code)))
     (is equal '("(DEFUN G (X) \"doc\")" (parse:fun-code parse::docstring))
         (code-back "(defun g (x) \"doc\" 1)" 'parse:fun-code '(parse:body 0)))
     (is equal '("(DEFUN G (X) \"doc\" (DECLARE (TYPE FIXNUM X)))"
-                (parse:fun-code parse::docstring))
+                (parse:fun-code (parse:declarations 0)))
         (code-back "(defun g (x) \"doc\" (declare (type fixnum x)) 1)"
                    'parse:fun-code '(parse:body 0)))))
 
@@ -864,3 +864,85 @@ second\"" (parse:str (parse::docstring code)))
     (is = 2 (tui:rect-y visible))
     (is = 2 (tui:rect-rows visible))
     (is = 0 (tui:rect-rows (w::transform-rect-to-screen view 6 bounds)))))
+
+(define-test setf-function-name-rendering-and-editing :parent editing
+  (let ((buffer (ui-for "#'(setf aref)")))
+    (is equal "#'(setf aref)" (draw buffer))
+    (goto buffer '(parse:fun-designator 1))
+    (is eq 'parse:unevaluated (w::locsort (w::focus buffer)))
+    (is equal "AREF" (parse:name (focused buffer)))
+    (press buffer #\x)
+    (is equal "(FUNCTION (SETF AREFX))" (code buffer))
+    (is equal "#'(setf cl::arefx)" (draw buffer))
+    (press buffer '(:ctrl #\u))
+    (is equal "#'(setf aref)" (draw buffer))))
+
+(define-test default-special-forms-have-all-slots :parent editing
+  (maphash
+   (lambda (type layout)
+     (let ((node (w::default-node layout)))
+       (dolist (slot (c2cl:class-slots (find-class type)))
+         (is eq (not (member (c2cl:slot-definition-name slot)
+                            (parse:form-optional-slots type)))
+             (slot-boundp node (c2cl:slot-definition-name slot))))
+       (is eq t (stringp (draw (ui-for node))))
+       (is eq t (typep (parse:to-syntax node) 'parse:ref-list))))
+   w::*layouts*))
+
+(define-test complete-let-with-enter :parent editing
+  (let ((buffer (ui-for nil)))
+    (press buffer #\l #\e #\t :enter)
+    (is eq 'parse:let-form (type-of (first (w::ast buffer))))
+    (is equal "(LET ((_ _)) _)" (code buffer))
+    (is equal "let (hole hole) /  hole" (draw buffer))))
+
+(define-test declaration-trees-render-and-edit :parent editing
+  (dolist (source '("(let ((x 1)) (declare (ignore x)) x)"
+                    "(defun f (x) (declare (ignore x)) x)"))
+    (let* ((buffer (ui-for source))
+           (functionp (typep (first (w::ast buffer)) 'parse:defun-form))
+           (slot (if functionp 'parse:declarations 'parse:decls)))
+      (is eq t (not (null (search "(declare (ignore x))" (draw buffer)))))
+      (when functionp (w::descend buffer 'parse:fun-code))
+      (w::descend buffer (list slot 0 1 1))
+      (is eq 'parse:unevaluated (w::locsort (w::focus buffer)))
+      (press buffer #\y)
+      (is eq t (not (null (search "(DECLARE (IGNORE XY))" (code buffer)))))
+      (press buffer :space)
+      (is eq t (not (null (search "(DECLARE (IGNORE XY _))" (code buffer)))))
+      (press buffer :rubout)
+      (is eq t (not (null (search "(DECLARE (IGNORE XY))" (code buffer)))))
+      (press buffer '(:ctrl #\u))
+      (is eq t (not (null (search "(DECLARE (IGNORE XY _))" (code buffer))))))))
+
+(define-test buffer-package-symbol-display :parent editing
+  (let ((home (make-package (string (gensym "DISPLAY-HOME-")) :use nil))
+        (target (make-package (string (gensym "DISPLAY-TARGET-")) :use nil)))
+    (unwind-protect
+         (let* ((symbol (intern "VISIBLE" home))
+                (node (sym "VISIBLE" home))
+                (buffer (w::make-buffer (make-instance 'w::ui)
+                                        :ast (list node) :package target)))
+           (export symbol home)
+           (sb-ext:add-package-local-nickname "LOCAL" home target)
+           (let ((*package* home))
+             (is equal "local:visible" (draw buffer)))
+           (import symbol target)
+           (is equal "visible" (draw buffer))
+           (unintern symbol target)
+           (shadow "VISIBLE" target)
+           (is equal "local:visible" (draw buffer))
+           (unexport symbol home)
+           (is equal "local::visible" (draw buffer))
+           (setf (w::buffer-package buffer) home)
+           (let ((*package* target))
+             (is equal "visible" (draw buffer)))
+           (is equal ":visible" (w::symbol-ref-text (sym "VISIBLE" :keyword) target))
+           (is equal "#:visible" (w::symbol-ref-text (sym "VISIBLE" nil) target))
+           (multiple-value-bind (forms end package)
+               (w::parse-source
+                (format nil "(in-package ~s) visible" (package-name home)))
+             (declare (ignore forms end))
+             (is eq home package)))
+      (delete-package target)
+      (delete-package home))))

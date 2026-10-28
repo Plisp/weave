@@ -218,6 +218,8 @@ If this returns NIL, propagate up the cursor stack.")
 
 (defclass buffer ()
   ((owner :initarg :owner :reader buffer-ui)
+   (package :initarg :package :initform *package* :accessor buffer-package
+            :type package)
    (source :initarg :source :initform nil :accessor buffer-source
            :type (or null pathname))
    (x :initarg :x :initform 0 :accessor buffer-x :type (integer 0))
@@ -272,11 +274,13 @@ If this returns NIL, propagate up the cursor stack.")
                :accessor node-views
                :type hash-table)))
 
-(defun make-buffer (ui &key (ast (list (hole))) source (x 0) (y 0))
+(defun make-buffer (ui &key (ast (list (hole))) source (x 0) (y 0) (package *package*))
   "Adds a buffer containing `ast' to `ui', optionally associated with `source'."
   (check-type ast cons)
   (let ((buffer (make-instance 'buffer :owner ui :ast ast
-                                       :source (when source (pathname source)) :x x :y y)))
+                                       :source (when source (pathname source)) :x x :y y
+                                       :package (or (find-package package)
+                                                    (error "Unknown package ~s" package)))))
     (setf (stack buffer) (list (make-location :node ast :id 0)
                                (make-location :node buffer :id nil))
           (buffers ui) (append (buffers ui) (list buffer)))
@@ -992,14 +996,18 @@ if none, surround current atom"
       (trivia:match (slog (locsort location))
         ((eql 'parse:binder)
          (when (and (symbol-char-p c) (not (digit-char-p c)))
-           (swap-node location (make-instance 'parse:binder :name (string-upcase c))
+           (swap-node location (make-instance 'parse:binder
+                                              :name (string-upcase c)
+                                              :home-package (buffer-package buffer))
                       buffer)))
         ((eql 'parse:eval-form)
          (cond
            ((and (char= c #\() (not (typep (location-node location) 'parse:macro-call)))
             (swap-node location (ref-list) buffer))
            ((and (symbol-char-p c) (not (digit-char-p c)))
-            (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
+            (let ((newnode (make-instance 'parse:symbol-ref
+                                          :name (string-upcase c)
+                                          :home-package (buffer-package buffer))))
               (swap-node location newnode buffer)))
            ((digit-char-p c)
             (let ((newnode (make-instance 'parse:literal :str (string c))))
@@ -1018,7 +1026,9 @@ if none, surround current atom"
               t))))
         ((or (eql 'parse:fun-designator) (eql 'parse:symbol-ref))
          (when (and (symbol-char-p c) (not (digit-char-p c)))
-           (let ((newnode (make-instance 'parse:symbol-ref :name (string-upcase c))))
+           (let ((newnode (make-instance 'parse:symbol-ref
+                                         :name (string-upcase c)
+                                         :home-package (buffer-package buffer))))
              (swap-node location newnode buffer))))
         ((eql 'parse:unevaluated)
          (cond
@@ -1027,7 +1037,9 @@ if none, surround current atom"
             (refocus buffer (append-id (location-id (focus buffer)) 0)))
            ((and (symbol-char-p c) (not (digit-char-p c)))
             (swap-node location
-                       (make-instance 'parse:symbol-ref :name (string-upcase c))
+                       (make-instance 'parse:symbol-ref
+                                      :name (string-upcase c)
+                                      :home-package (buffer-package buffer))
                        buffer))
            ((digit-char-p c)
             (swap-node location (make-instance 'parse:literal :str (string c)) buffer))))))))
@@ -1088,35 +1100,35 @@ if none, surround current atom"
   (and (string= (parse:name node) sym)
        (eq (parse:home-package node) (symbol-package sym))))
 
-(defun symbol-ref-text (node &optional use-mappings)
-  (let ((name (parse:name node)))
+(defun symbol-ref-text (node package &optional use-mappings)
+  (let ((name (parse:name node))
+        (home (parse:home-package node)))
     (cond
       ((typep node 'parse:reader-marker)
        (or (assoc-value *reader-punctuation* (to-read-syntax (parse:resolve node)))
-           (string name))) ; dot
-      ((eq (parse:home-package node) (find-package :keyword))
-       (format nil ":~(~a~)" name))
+           (string name)))
+      ((eq home (find-package :keyword)) (format nil ":~(~a~)" name))
+      ((and use-mappings
+            (assoc-value *symbol-mappings* node :test #'string-and-package=))
+       (string (assoc-value *symbol-mappings* node :test #'string-and-package=)))
+      ((null home) (format nil "#:~(~a~)" name))
+      ((or (eq home package)
+           (multiple-value-bind (symbol found) (find-symbol name package)
+             (and found
+                  (multiple-value-bind (original present) (find-symbol name home)
+                    (and present (eq symbol original))))))
+       (string-downcase name))
       (t
-       (if-let (exp (and use-mappings
-                         (assoc-value *symbol-mappings* node :test #'string-and-package=)))
-         (string exp)
-         (if-let (nick (car (rassoc (parse:home-package node)
-                                    (sb-ext:package-local-nicknames *package*))))
-           (format nil "~(~a:~a~)" nick name)
-           (if-let (package (parse:home-package node))
-             (if (nth-value 1 (find-symbol (parse:name node)))
-                 (format nil "~(~a~)" name)
-                 (format nil "~(~a~a~a~)"
-                         (first (sort `(,@(package-nicknames package) ; copied
-                                        ,(package-name package))
-                                      #'< :key #'length))
-                         (if (external-symbol-p (parse:name node) package) ":" "::")
-                         name))
-             (format nil "#:~(~a~)" name))))))))
+       (let ((prefix (or (car (rassoc home (sb-ext:package-local-nicknames package)))
+                         (first (sort (cons (package-name home)
+                                            (copy-list (package-nicknames home)))
+                                      #'< :key #'length)))))
+         (format nil "~(~a~a~a~)" prefix
+                 (if (external-symbol-p name home) ":" "::") name))))))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect &key)
   (let* ((location (car stack))
-         (str (symbol-ref-text node t))
+         (str (symbol-ref-text node (buffer-package context) t))
          (focused (location= location (focus context))))
     (tui:puts* str 1 1 rect)
     (make-instance 'ast-view
@@ -1152,7 +1164,7 @@ if none, surround current atom"
 
 (defmethod render-node ((node parse:binder) stack context rect &key)
   (let* ((location (car stack))
-         (str (symbol-ref-text node nil))
+         (str (symbol-ref-text node (buffer-package context)))
          (focused (location= location (focus context))))
     (tui:puts* str 1 1 rect (tui:make-style :italicp t))
     (make-instance 'ast-view
@@ -1325,10 +1337,12 @@ convention."
             view)))))
 
 ;; for body lists
-(defmethod render-node ((l list) stack context rect &key (indent *horizontal*))
+(defmethod render-node ((l list) stack context rect
+                        &key (indent *horizontal*) delimited)
   (let* ((location (car stack))
          (view (render-elements l indent (list-locator location)
-                                (cdr stack) context rect nil)))
+                                (cdr stack) context rect
+                                (when delimited (list :delimited delimited)))))
     (setf (tui:key-handler view) (global-key-handler l location context)
           (tui:focused view) (location= location (focus context)))
     view))
@@ -1612,7 +1626,7 @@ convention."
   (and (typep element 'parse:symbol-ref)
        (find (parse:name element) *loop-clause-keywords* :test #'string=)))
 
-(defun loop-indentation (elements)
+(defun loop-indentation (elements &optional (package *package*))
   "Indent spec for a loop form. The operator has its own line, then a line indented by one
 for every clause keyword, except those following and/else. Forms of a do-like clause after
 its first are aligned with the first, and a loop without keywords has a line per form."
@@ -1629,12 +1643,14 @@ its first are aligned with the first, and a loop without keywords has a line per
                     (if (member (find-loop-keyword previous) *loop-prefix-keywords*
                                 :test #'equal)
                         (progn (incf (cdar rows))
-                               (incf column (1+ (length (symbol-ref-text previous)))))
+                               (incf column
+                                     (1+ (length (symbol-ref-text previous package)))))
                         (progn (push (cons indent 1) rows)
                                (setf column indent)))
                     (setf body-column (when (member keyword *loop-body-keywords*
                                                     :test #'string=)
-                                        (+ column (length (symbol-ref-text element)) 1))
+                                        (+ column
+                                           (length (symbol-ref-text element package)) 1))
                           body-started nil))
                    (first-element
                     (push (cons indent 1) rows)
@@ -1648,10 +1664,10 @@ its first are aligned with the first, and a loop without keywords has a line per
              (setf previous element))
     (reverse rows)))
 
-(defun macro-call-indentation (op)
+(defun macro-call-indentation (op &optional (package *package*))
   "`loop-indentation' for loop. Note `op' can be a hole"
   (if-let (s (and (typep op 'parse:symbol-ref) (parse:resolve op)))
-    (cond ((eq s 'loop) #'loop-indentation)
+    (cond ((eq s 'loop) (lambda (elements) (loop-indentation elements package)))
           ((member s '(setf psetf psetq)) `((0 . 3) (,(1+ (length (string s))) . 2)))
           ((fboundp s)
            (let* ((arglist (slynk-backend:arglist s)))
@@ -1682,7 +1698,7 @@ its first are aligned with the first, and a loop without keywords has a line per
   (let* ((location (car stack))
          (view (render-elements
                 (cons (parse:op node) (parse:body node))
-                (macro-call-indentation (parse:op node))
+                (macro-call-indentation (parse:op node) (buffer-package context))
                 (lambda (index)
                   (make-location :node node
                                  :id (if (zerop index)
@@ -1770,7 +1786,9 @@ already and focuses the hole."
                                             rect)
                             :delimited t
                             :indent (lambda (elements)
-                                      (let ((spec (macro-call-indentation (first elements))))
+                                      (let ((spec (macro-call-indentation
+                                                   (first elements)
+                                                   (buffer-package context))))
                                         (if (functionp spec)
                                             (funcall spec elements)
                                             spec)))))
@@ -1824,7 +1842,8 @@ pairs building new elements of &rest and &body slots."))
       (layout-slots layout)))
   (:method ((node parse:function-call)) '(parse:name parse:body))
   (:method ((node parse:macro-call)) '(parse:op parse:body))
-  (:method ((node parse:function-code)) '(parse:lambda-list parse:docstring parse:body))
+  (:method ((node parse:function-code))
+    '(parse:lambda-list parse:docstring parse:declarations parse:body))
   (:documentation "The slots of `node' in reading order."))
 
 (defun slot-end-position (node slot)
@@ -1862,17 +1881,21 @@ pairs building new elements of &rest and &body slots."))
     (t (hole))))
 
 (defun default-node (layout)
-  "A form of the class of `layout' with every slot in its default state."
+  "Initializes the slots of `layout', leaving unused alternative slots unbound."
   (apply #'make-instance (layout-op layout)
-         (loop for slot in (layout-slots layout)
-               unless (eq slot 'parse:op)
+         (loop with visible = (layout-slots layout)
+               with optional = (parse:form-optional-slots (layout-op layout))
+               for (slot . kind) in (remove-duplicates
+                                     (parse:form-slot-kinds (layout-op layout))
+                                     :key #'car :from-end t)
+               unless (and (member slot optional) (not (member slot visible)))
                  append (list (make-keyword slot)
-                              (default-slot-value (slot-kind layout slot)
-                                                  (layout-template layout slot))))))
+                              (default-slot-value kind (layout-template layout slot))))))
 
 (defun slot-render-keys (node slot)
   (case (cdr (assoc slot (parse:form-slot-kinds (type-of node))))
     (parse::&tree '(:delimited t))
+    (parse::&declarations (list :indent *vertical* :delimited t))
     (&rest (list :indent *vertical* :delimited :shallow))
     (t (list :indent *vertical*))))
 
@@ -1936,6 +1959,23 @@ pairs building new elements of &rest and &body slots."))
       (unless (zerop i)
         (funcall handler layout (nthcdr (1- i) (stack buffer)) buffer)))))
 
+(defun rubout-tree-slot (loc stack buffer)
+  "Deletes at `loc', keeping focus valid when a declaration list becomes empty."
+  (save-history buffer)
+  (let* ((id (location-id loc))
+         (node (location-node loc)))
+    (if (consp id)
+        (let* ((parent-id (parent-id id))
+               (parent (make-location :node node :id parent-id)))
+          (if (= 1 (length (elements (node-at parent))))
+              (edit-list parent (constantly nil)
+                         (if (member parent-id '(parse:decls parse:declarations))
+                             (move-back node parent-id)
+                             parent-id)
+                         buffer stack)
+              (ast-delete parent (lastcar id) buffer stack)))
+        (swap-node loc (hole) buffer))))
+
 (defun layout-rubout (layout stack buffer)
   "Deletes the focused element of a list slot, or restores the slot to its template."
   (let* ((loc (car stack))
@@ -1959,14 +1999,8 @@ pairs building new elements of &rest and &body slots."))
                       (reset)
                       (progn (save-history buffer)
                              (ast-delete rest-loc (second id) buffer stack))))))))
-      ((eq (slot-kind layout slot) 'parse::&tree)
-       (save-history buffer)
-       (if (consp id)
-           (let ((parent (make-location :node node :id (parent-id id))))
-             (if (= 1 (length (elements (node-at parent))))
-                 (edit-list parent (constantly nil) (location-id parent) buffer stack)
-                 (ast-delete parent (lastcar id) buffer stack)))
-           (swap-node loc (hole) buffer))))))
+      ((member (slot-kind layout slot) '(parse::&tree parse::&declarations))
+       (rubout-tree-slot loc stack buffer)))))
 
 (defun layout-space (layout stack buffer)
   "Graphically inserts after, or jumps to the next adjacent hole."
@@ -1974,7 +2008,11 @@ pairs building new elements of &rest and &body slots."))
          (node (location-node loc))
          (id (location-id loc))
          (slot (ensure-car id))
-         (next (when (symbolp id) (cadr (member id (layout-slots layout)))))
+         (next (when (symbolp id)
+                 (find-if (lambda (next)
+                            (or (not (eq (slot-kind layout next) 'parse::&declarations))
+                                (funcall next node)))
+                          (cdr (member id (layout-slots layout))))))
          (template (layout-template layout slot)))
     (cond
       ((handle-focus-p buffer loc)
@@ -1985,7 +2023,7 @@ pairs building new elements of &rest and &body slots."))
        (let ((next-loc (make-location :node node :id next))
              (next-template (layout-template layout next)))
          (if (and (member (cdr (assoc next (parse:form-slot-kinds (type-of node))))
-                          '(&rest &body parse::&tree))
+                          '(&rest &body parse::&tree parse::&declarations))
                   (gen-list-p (node-at next-loc)))
              (insert-or-jump next-loc 0 buffer stack
                              :item (if next-template (funcall next-template) (hole)))
@@ -2002,14 +2040,16 @@ pairs building new elements of &rest and &body slots."))
                 (insert-or-jump (make-location :node node :id (list slot (second id)))
                                 (1+ (third id)) buffer stack)))
            (t (slog* (format nil "no space action for ~a" (length id)))))))
-      ((and (eq (slot-kind layout slot) 'parse::&tree) (consp id))
+      ((and (member (slot-kind layout slot) '(parse::&tree parse::&declarations))
+            (consp id))
        (insert-or-jump (make-location :node node :id (parent-id id))
                        (1+ (lastcar id)) buffer stack)))))
 
 (defun layout-wrap (layout stack buffer)
   "Wraps the focused part of an unevaluated slot in a syntax list."
   (let ((loc (car stack)))
-    (when (eq (slot-kind layout (ensure-car (location-id loc))) 'parse::&tree)
+    (when (member (slot-kind layout (ensure-car (location-id loc)))
+                  '(parse::&tree parse::&declarations))
       (save-history buffer)
       (wrap-in-list loc buffer stack)
       t)))
@@ -2041,12 +2081,13 @@ ASSUMES we never focus a plain list body."
 (deflayout parse:let*-form ((parse:vars . (ref-list (hole) (hole)))
                             (parse:body . (hole)))
   ((parse:op parse:vars)
-   ;; parse:decls
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:let-form ((parse:vars . (ref-list (hole) (hole)))
                            (parse:body . (hole)))
   ((parse:op parse:vars)
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:flet-form
@@ -2058,6 +2099,7 @@ ASSUMES we never focus a plain list body."
                                  :body (list (hole)))))
      (parse:body . (hole)))
   ((parse:op parse:funs)
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:labels-form
@@ -2069,6 +2111,7 @@ ASSUMES we never focus a plain list body."
                                  :body (list (hole)))))
      (parse:body . (hole)))
   ((parse:op parse:funs)
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:macrolet-form
@@ -2080,11 +2123,13 @@ ASSUMES we never focus a plain list body."
                                  :body (list (hole)))))
      (parse:body . (hole)))
   ((parse:op parse:macro-defs)
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:symbol-macrolet-form ((parse:macro-code . (ref-list (hole) (hole)))
                                        (parse:body . (hole)))
   ((parse:op parse:macro-code)
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:block-form ((parse:body . (hole)))
@@ -2140,6 +2185,7 @@ ASSUMES we never focus a plain list body."
 
 (deflayout parse:locally-form ((parse:body . (hole)))
   (parse:op
+   (1 parse:decls)
    (1 parse:body)))
 
 (deflayout parse:eval-when-form ((parse:body . (hole)))
@@ -2205,6 +2251,8 @@ ASSUMES we never focus a plain list body."
             (shorter-than (id limit)
               (< (length (elements (node-at (make-location :node node :id id)))) limit)))
        (trivia:cmatch (location-id loc)
+         ((list* (eql 'parse:declarations) path)
+          (insert-into (parent-id (location-id loc)) (1+ (lastcar path))))
          ((list (eql 'parse:lambda-list) (and (type integer) i))
           (insert-into 'parse:lambda-list (1+ i)))
          ((eql 'parse:lambda-list) (insert-into 'parse:lambda-list 0))
@@ -2225,6 +2273,10 @@ ASSUMES we never focus a plain list body."
  (lambda (stack buffer)
    (let ((loc (car stack)))
      (trivia:match (location-id loc)
+       ((list* (eql 'parse:declarations) _)
+        (save-history buffer)
+        (wrap-in-list loc buffer stack)
+        t)
        ((or (list (eql 'parse:lambda-list) (type integer))
             (list (eql 'parse:lambda-list) (type integer) (type integer)))
         (save-history buffer)
@@ -2239,6 +2291,8 @@ ASSUMES we never focus a plain list body."
           (node (location-node loc))
           (ll-loc (make-location :node node :id 'parse:lambda-list)))
      (trivia:match (location-id loc)
+       ((list* (eql 'parse:declarations) _)
+        (rubout-tree-slot loc stack buffer))
        ((list (eql 'parse:lambda-list) (and (type integer) i))
         (save-history buffer)
         (if (= 1 (length (parse:elements (node-at ll-loc))))
@@ -2260,7 +2314,7 @@ ASSUMES we never focus a plain list body."
         (swap-node ll-loc (parse:ref-list) buffer))))))
 
 ;;; function-code (lambda-list, documentation and body, shared by defun/defmacro/
-;;; defmethod/lambda/flet/labels). Declarations are stored but not displayed.
+;;; defmethod/lambda/flet/labels), including declarations.
 (defmethod render-node ((node parse:function-code) stack context rect &key)
   (let* ((location (car stack))
          (lambda-list-view
@@ -2278,9 +2332,19 @@ ASSUMES we never focus a plain list body."
                            (tui:copy-rect rect :x (tui:rect-x rect)
                                                :y (tui:rect-y2 ll-rect))
                            rect))))
-         (body-y (if docstring-view
-                     (tui:rect-y2 (tui:rect docstring-view))
-                     (tui:rect-y2 ll-rect)))
+         (declarations-y (if docstring-view
+                             (tui:rect-y2 (tui:rect docstring-view))
+                             (tui:rect-y2 ll-rect)))
+         (declarations-view
+           (when (parse:declarations node)
+             (render-node (parse:declarations node)
+                          (cons (make-location :node node :id 'parse:declarations) stack)
+                          context
+                          (tui:clamp-rect (tui:copy-rect rect :y declarations-y) rect)
+                          :indent *vertical* :delimited t)))
+         (body-y (if declarations-view
+                     (tui:rect-y2 (tui:rect declarations-view))
+                     declarations-y))
          (body-view
            (render-elements (parse:body node) *vertical*
                             (list-locator (make-location :node node :id 'parse:body))
@@ -2289,7 +2353,8 @@ ASSUMES we never focus a plain list body."
                              (tui:copy-rect rect :x (tui:rect-x rect) :y body-y)
                              rect)
                             nil))
-         (children (remove nil (list lambda-list-view docstring-view body-view))))
+         (children (remove nil (list lambda-list-view docstring-view
+                                     declarations-view body-view))))
     (make-instance
      'ast-view
      :location location
@@ -2361,13 +2426,30 @@ addressed by indices."
   (let ((node (node-at (focus buffer))))
     (loop for (slot . kind) in (parse:form-slot-kinds (type-of node))
           do (when-let (path
-                        (if (and (member kind '(&rest &body parse::&tree))
+                        (if (and (member kind
+                                         '(&rest &body parse::&tree parse::&declarations))
                                  (gen-list-p (node-at (make-location :node node :id slot))))
                             (list-hole-path node slot)
                             (hole-path node slot)))
                (dolist (id path)
                  (descend buffer id))
                (return)))))
+
+(setf (gethash (tui-sys:make-event :kind #\space) *global-key-handlers*)
+      (lambda (view buffer)
+        (declare (ignore view))
+        (slog (mapcar #'location-id (stack buffer)))
+        (let ((stack (stack buffer)))
+          (when (= (length stack) 2)
+            (let* ((toplevel (car stack))
+                   (i (location-id toplevel)))
+              (assert (integerp i))
+              (save-history buffer)
+              (let ((newroot (list-insert (location-node toplevel) (hole) (1+ i))))
+                (commit-edit buffer
+                             (cons (make-location :node newroot :id (1+ i))
+                                   (rest stack))
+                             newroot)))))))
 
 (setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
       (lambda (view buffer)

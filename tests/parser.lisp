@@ -1166,7 +1166,7 @@
 (defmacro walker-returns-binder () *walker-binder-object*)
 
 (define-test walker-rejects-binder-objects-before-on-form :parent parser
-  (let ((*walker-binder-object* (make-instance 'parse:binder :name "BINDER")))
+  (let ((*walker-binder-object* (make-instance 'parse:binder :name "BINDER" :home-package *package*)))
     (dolist (form (list *walker-binder-object* '(walker-returns-binder)))
       (let ((binder-seen nil))
         (is eq :caught
@@ -1551,3 +1551,34 @@
          (binders (cdr (gethash (car (last (parse:body ast))) (parse:subforms ast)))))
     (is equal nil (gethash (parse:gen-tree-ref (parse:body ast) '(0)) binders))
     (is equal '(:variable) (gethash (parse:gen-tree-ref (parse:body ast) '(1)) binders))))
+
+(parse::defform (alternative-slot-test parse::&or ((left right)) (fallback)))
+
+(define-test alternative-slots-preserve-presence :parent parser
+  ;; The first branch fails after collecting LEFT. It must not leak into the second.
+  (let* ((syntax (parse:ref-list (sym 'alternative-slot-test)
+                                (parse:ref-list (sym 'x))))
+         (node (alternative-slot-test-parser
+                syntax (parse:make-env) (lambda (form &rest args)
+                                         (declare (ignore args)) form)
+                #'identity)))
+    (is eq nil (slot-boundp node 'left))
+    (is eq nil (slot-boundp node 'right))
+    (is eq t (slot-boundp node 'fallback))
+    (let* ((updated (parse:update node 'fallback nil))
+           (copy (parse:copy-node updated)))
+      (is eq t (slot-boundp copy 'fallback))
+      (is eq nil (fallback copy))
+      (is eq nil (slot-boundp copy 'left))
+      (is eq nil (slot-boundp copy 'right))
+      (is equal "(ALTERNATIVE-SLOT-TEST ())" (sx (parse:to-syntax copy))))))
+
+(define-test parsed-defun-inactive-setf-slot :parent parser
+  (dolist (source '("(defun f () 1)" "(defmethod f () 1)"))
+    (let* ((node (parse source))
+           (copy (parse:copy-node node))
+           (updated (parse:update copy 'parse:name (sym 'g))))
+      (is eq nil (slot-boundp node 'parse:setf-op))
+      (is eq nil (slot-boundp copy 'parse:setf-op))
+      (is eq nil (slot-boundp updated 'parse:setf-op))
+      (is eq t (typep (parse:to-syntax updated) 'parse:ref-list)))))
