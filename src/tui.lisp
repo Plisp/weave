@@ -1119,7 +1119,7 @@ if none, surround current atom"
                     (and present (eq symbol original))))))
        (string-downcase name))
       (t
-       (let ((prefix (or (car (rassoc home (sb-ext:package-local-nicknames package)))
+       (let ((prefix (or (car (rassoc home (slynk-backend:package-local-nicknames package)))
                          (first (sort (cons (package-name home)
                                             (copy-list (package-nicknames home)))
                                       #'< :key #'length)))))
@@ -2438,7 +2438,6 @@ addressed by indices."
 (setf (gethash (tui-sys:make-event :kind #\space) *global-key-handlers*)
       (lambda (view buffer)
         (declare (ignore view))
-        (slog (mapcar #'location-id (stack buffer)))
         (let ((stack (stack buffer)))
           (when (= (length stack) 2)
             (let* ((toplevel (car stack))
@@ -2510,6 +2509,17 @@ addressed by indices."
               (swap-node (focus buffer) call buffer)
               (focus-first-hole buffer)
               t)))))
+
+;; TODO support a different (debugger) buffer type that uses different key handlers
+;; evaluation TODO display popup evaluated buffer using view anchoring
+(setf (gethash (tui-sys:make-event :kind #\e :altp t) *global-key-handlers*)
+      (lambda (view buffer)
+        (declare (ignore view))
+        (let ((stack (stack buffer)))
+          (handler-bind ((warning #'muffle-warning))
+            (parse::with-temporary-interning (interned)
+              (slog (eval (parse::strip-wrappers (parse:to-syntax (node-at (car stack)))
+                                                 interned))))))))
 
 ;; convert back to hole
 (setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
@@ -2807,31 +2817,30 @@ modifying the ast."
      (if (< (segment-index segment) (1- toplevel-count)) 1 0)))
 
 (defun stage-toplevel-window (buffer scroll focus-index screen-rows screen-cols)
-  "Returns segments and the initial viewport row for `scroll'."
+  "Returns staged segments and the viewport row revealing the focus."
   (let* ((forms (ast buffer))
          (count (length forms))
          (index (scroll-position-index scroll))
          (root-stack (last (stack buffer))))
-    (flet ((stage (index start)
-             (render-one-toplevel index start forms root-stack buffer
-                                  screen-rows screen-cols)))
-      ;; stage previous even if the separator is top line, so scrolling can use the data
-      (let* ((previous (when (plusp index) (stage (1- index) 0)))
-             (anchor (stage index (if previous (segment-end previous count) 0)))
-             (viewport (+ (segment-start anchor)
-                          (min (scroll-position-row scroll) ; can be bigger after deletion
-                               (segment-rows anchor)))) ; clamp to separator row
-             (end (+ viewport screen-rows))
-             (last-required (max index focus-index))
-             (following
-               (loop for i from (1+ index) below count
-                     for start = (segment-end anchor count) then (segment-end segment count)
-                     for segment = (stage i start)
-                     collect segment
-                     ;; include one whole successor after both viewport and focus.
-                     until (and (>= start end) (> i last-required)))))
-        (values (append (when previous (list previous)) (list anchor) following)
-                viewport)))))
+    ;; keep a predecessor above both anchor and focus for upward movement.
+    (loop with viewport = 0
+          for i from (max 0 (1- (min index focus-index))) below count
+          for start = 0 then (segment-end segment count)
+          for segment = (render-one-toplevel i start forms root-stack buffer
+                                             screen-rows screen-cols)
+          do (translate-view-y (segment-view segment) start)
+             (when (and (= i index) (<= index focus-index))
+               (setf viewport (+ start (min (scroll-position-row scroll)
+                                            (segment-rows segment)))))
+             (when (= i focus-index)
+               (let ((rect (tui:rect (gethash :focus-view (redisplay-cache buffer)))))
+                 (setf viewport (if (< focus-index index)
+                                    (tui:rect-y rect)
+                                    (reveal-focus-row viewport rect screen-rows)))))
+          collect segment into segments
+          ;; include one whole successor beyond the resolved viewport and focus.
+          until (and (> i focus-index) (>= start (+ viewport screen-rows)))
+          finally (return (values segments viewport)))))
 
 (defun scroll-position-at-row (segments row)
   "Returns the file position at staged `row' in `segments'."
@@ -2876,14 +2885,11 @@ buffer."
          (focus-index (top-level-focus-index buffer))
          (scroll (if (not (find focus-index (scroll-state-segments state)
                                 :key #'segment-index))
+                     ;; for large forward jumps, reset
                      (make-scroll-position :index focus-index)
                      (scroll-state-position state))))
     (multiple-value-bind (segments initial-viewport)
         (stage-toplevel-window buffer scroll focus-index rows cols)
-      ;; translate to viewport
-      (dolist (segment segments)
-        (translate-view-y (segment-view segment) (segment-start segment)))
-      ;;
       (let* ((height (segment-end (lastcar segments) (length forms)))
              (location (lastcar (stack buffer)))
              (root (make-instance 'ordered-view
@@ -2895,8 +2901,7 @@ buffer."
                                   :focused nil))
              (focus-view (gethash :focus-view (redisplay-cache buffer)))
              (rect (tui:rect focus-view))
-             (viewport (max 0 (min (reveal-focus-row initial-viewport rect rows)
-                                   (- height rows)))))
+             (viewport (max 0 (min initial-viewport (- height rows)))))
         ;; copy segments to the screen
         (flet ((blit-segment (segment viewport)
                  (let ((start (- viewport (segment-start segment))))
@@ -2946,7 +2951,7 @@ buffer."
      (tui:rect view) (scroll-state-viewport-row (scroll-state buffer))
      (buffer-rect buffer))))
 
-(defun draw-highlights (buffer view offset screen-rect)
+(defun draw-semantic-backgrounds (buffer view offset screen-rect)
   (tui:view-traverse
    view
    (lambda (view)
@@ -2979,20 +2984,27 @@ buffer."
          ;;
          (when (unexpanded-macro-op-p (car stack))
            (tui:fill-rect (tui:make-style :bg (tui:color #xdc #x32 #x2f))
-                          (tui:copy-rect rect :x 0 :y 0) rect))
-         ;;
-         (when (location-selected-p buffer stack)
-           (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
-                          (tui:copy-rect rect :x 0 :y 0) rect))
-         ;;
-         (when (zipper-top-p buffer stack)
-           (dolist (form (selection-forms (selection buffer)))
-             (when-let (form-rect (node-screen-rect buffer form))
-               (tui:fill-rect (tui:make-style :bg (tui:color #x6c #x71 #xc4))
-                              (tui:copy-rect form-rect :x 0 :y 0) form-rect)))
-           (tui:fill-rect (tui:make-style :bg (tui:color #xb5 #x89 #x00))
                           (tui:copy-rect rect :x 0 :y 0) rect))))
      t)))
+
+(defun draw-highlights (buffer view offset screen-rect)
+  (tui:view-traverse
+   view
+   (lambda (view)
+     (when (typep view 'ast-view)
+       (let ((stack (view-stack view))
+             (rect (transform-rect-to-screen (tui:rect view) offset screen-rect)))
+         (when (zipper-top-p buffer stack)
+           (tui:fill-rect (tui:make-style :bg #xb58900)
+                          (tui:copy-rect rect :x 0 :y 0) rect :blend 0.35))
+         (when (location-selected-p buffer stack)
+           (tui:fill-rect (tui:make-style :bg #x6c71c4)
+                          (tui:copy-rect rect :x 0 :y 0) rect :blend 0.35))))
+     t))
+  (when-let (focus-rect (and (buffer-focused-p buffer) (focus-rect buffer)))
+    (let ((rect (transform-rect-to-screen focus-rect offset screen-rect)))
+      (tui:fill-rect (tui:make-style :bg #xb58900)
+                     (tui:copy-rect rect :x 0 :y 0) rect :blend 0.7))))
 
 (defun buffer-rect (buffer)
   "The screen area available to `buffer'"
@@ -3018,13 +3030,8 @@ buffer."
                      :char #\space)
       (let* ((content (render-toplevel-window buffer bounding-rect))
              (offset (scroll-state-viewport-row (scroll-state buffer))))
+        (draw-semantic-backgrounds buffer content offset bounding-rect)
         (draw-highlights buffer content offset bounding-rect)
-        ;; draw focus after
-        (when-let (focus-rect (and (buffer-focused-p buffer) (focus-rect buffer)))
-          (let ((rect (transform-rect-to-screen focus-rect offset bounding-rect)))
-            (tui:fill-rect (tui:make-style :bg #xb58900)
-                           (tui:copy-rect rect :x 0 :y 0) rect
-                           :blend 0.5)))
         (setf (buffer-view buffer) content)))))
 
 (defmethod tui:render ((ui ui))
@@ -3039,14 +3046,14 @@ buffer."
                              :children (when completion (list completion)))))
 
 ;; note: must go below definitions, next to tui:redisplay
-(let ((render-node-methods (c2cl:generic-function-methods #'render-node))
+(let ((render-node-methods (closer-mop:generic-function-methods #'render-node))
       (old-render-method (find-method #'tui:render nil '(ui)))
       (fnames '(render-buffer render-toplevel-window
                 symbol-ref-text render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements
                 render-layout-slot slot-render-keys
                 macro-call-indentation loop-indentation
-                draw-highlights
+                draw-semantic-backgrounds draw-highlights
                 render-completion-window render-completion))
       (funs (make-hash-table :test 'eq)))
   (loop for name in fnames
@@ -3054,7 +3061,7 @@ buffer."
   (defun reset-ui ()
     (remove-method #'tui:render (find-method #'tui:render nil '(ui)))
     (add-method #'tui:render old-render-method)
-    (loop for method in (c2cl:generic-function-methods #'render-node)
+    (loop for method in (closer-mop:generic-function-methods #'render-node)
           do (remove-method #'render-node method))
     (loop for method in render-node-methods
           do (add-method #'render-node method))
