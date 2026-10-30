@@ -10,7 +10,7 @@
   (is equal "flet (f (x) /         x) /  f 1" (draw (ui-for "(flet ((f (x) x)) (f 1))")))
   (is equal "symbol-macrolet (s car y) /  s" (draw (ui-for "(symbol-macrolet ((s (car y))) s)")))
   (is equal "'(a (b c) d)" (draw (ui-for "'(a (b c) d)")))
-  (is equal "list () /      x" (draw (ui-for "(list () x)")))
+  (is equal "list () x" (draw (ui-for "(list () x)")))
   (is equal "progn /  ()" (draw (ui-for "(progn ())"))))
 
 (define-test quasiquote-rendering :parent editing
@@ -23,7 +23,7 @@
   (is equal '("`(loop" "   for x in ,xs" "   collect x)")
       (lines (ui-for "`(loop for x in ,xs collect x)")))
   (let ((ui (ui-for "`(a ,(+ x 1) ,@(list y z))")))
-    (is equal '("`(a ,x + 1 ,@list y" "                  z)") (lines ui))
+    (is equal '("`(a ,x + 1 ,@list y z)") (lines ui))
     (is equal (lines ui) (lines ui))))
 
 (define-test quasiquote-evaluated-editing :parent editing
@@ -428,7 +428,7 @@ second\"" (parse:str (parse::docstring code)))
          (node (focused ui))
          (binder (w::compute-focus-binder node (w::stack ui) ui)))
     (list (when binder (parse:name binder))
-          (and (w::lexical-symbol-ref node (w::focus ui))
+          (and (parse:lexical-symbol-ref node (w::focus ui))
                (not (w::symbol-ref-boundp node (w::stack ui) ui))))))
 
 (defun resolution-at (source namespace &rest path)
@@ -1205,3 +1205,49 @@ second\"" (parse:str (parse::docstring code)))
       (send :drag 8 13)
       (is = 11 (w::buffer-x pane))
       (is = 6 (w::buffer-y pane)))))
+
+(define-test adaptive-ref-list-layout :parent editing
+  (let* ((buffer (ui-for "a"))
+         (loc (w::focus buffer))
+         (rect (tui:make-rect :x 0 :y 0 :rows 20 :cols 70)))
+    (flet ((spec (&rest forms)
+             (w::ref-list-indentation
+              (mapcar #'parse forms) (constantly loc) nil buffer rect nil)))
+      (is equal '((0 . 3)) (spec "a" "b" "c"))
+      (let ((w::*column-limit* 3))
+        (is equal '((0 . 2) (0 . 1)) (spec "a" "b" "c")))
+      (is equal '((0 . 1)) (spec "a" "\"first
+second\"" "c"))
+      (is equal '((0 . nil)) (spec "a" "\"first
+second\"")))))
+
+(define-test reader-marker-spacing-only-at-head :parent editing
+  (let* ((buffer (ui-for "a"))
+         (loc (w::focus buffer))
+         (marker (make-instance 'parse:reader-marker :name "READ-QUOTE"
+                                                     :home-package (find-package :weave-parser)))
+         (rect (tui:make-rect :x 0 :y 0 :rows 4 :cols 20)))
+    (flet ((positions (elements)
+             (let ((positions nil)
+                   (tui::*put-buffer* (w::make-cell-buffer 4 20)))
+               (w::render-elements
+                elements '((0 . nil)) (constantly loc) nil buffer rect nil
+                (lambda (node stack context rect &key)
+                  (declare (ignore node stack context))
+                  (push (tui:rect-x rect) positions)
+                  (make-instance 'tui:view :rect (tui:copy-rect rect :rows 1 :cols 1))))
+               (nreverse positions))))
+      (is equal '(0 1 3) (positions (list marker 'a 'b)))
+      (is equal '(0 2 4) (positions (list 'a marker 'b)))
+      (dolist (type '(parse::label-ref parse::dot-marker))
+        (let ((node (make-instance type :name (if (eq type 'parse::label-ref) "1" ".")
+                                        :home-package nil)))
+          (is equal '(0 2 4) (positions (list node 'a 'b))))))))
+
+(define-test unary-reader-prefixes :parent editing
+  (dolist (symbol '(cl:quote cl:function eclector.reader:quasiquote
+                    eclector.reader:unquote eclector.reader:unquote-splicing
+                    parse:read-eval))
+    (is eq t (not (null (parse:unary-reader-marker-p (parse::wrap-marker symbol))))))
+  (is eq nil (parse:unary-reader-marker-p (sym "QUOTE")))
+  (is eq nil (parse:unary-reader-marker-p (parse::wrap-marker 'cl:progn))))

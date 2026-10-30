@@ -18,7 +18,12 @@
 
            #:eval-form #:symbol-ref #:binder #:literal
            #:reader-marker #:read-quasiquote #:read-quote #:read-function #:read-eval
+           #:string-and-package= #:unary-reader-marker-p
            #:resolve
+           #:value-at-path
+           #:function-position-p #:block-position-p
+           #:lexical-symbol-ref
+           #:unexpanded-macro-op-p
 
            #:function-call
 
@@ -82,6 +87,11 @@
    (home-package :type (or null package)))
   (:documentation "Represents a symbol, possibly referring to a symbol macro."))
 
+(defun string-and-package= (node sym)
+  "Suitable as a comparison predicate between symbol-ref, symbol"
+  (and (string= (name node) sym)
+       (eq (home-package node) (symbol-package sym))))
+
 (defrecord binder (symbol-ref)
   ()
   (:documentation "Represents a binder, NOT a reference in evaluation position."))
@@ -139,6 +149,15 @@
 (defrecord reader-marker (symbol-ref)
   ()
   (:documentation "A symbol inserted to represent reader syntax"))
+
+(defun unary-reader-marker-p (node)
+  "Whether `node' denotes a unary reader prefix rather than ordinary list syntax."
+  (and (typep node 'reader-marker)
+       (some (lambda (symbol) (string-and-package= node symbol))
+             '(cl:quote cl:function eclector.reader:quasiquote
+               eclector.reader:unquote eclector.reader:unquote-splicing
+               read-quote read-function read-quasiquote
+               read-eval))))
 
 (defrecord comment ()
   ((str :mutable t :type string)
@@ -3665,3 +3684,44 @@ passed with dynamic extent."
         (let ((result (parse-syntax form)))
           (setf (leading result) (append leading-comments (leading result)))
           (values result end)))))
+
+;;; AST location queries
+
+(defun value-at-path (loc path)
+  "The thing at `path' from the list at `loc' or NIL if there is none."
+  (let ((node (location-node loc))
+        (list (node-at loc)))
+    (assert (gen-list-p list))
+    (if (typep node 'macro-call)
+        (reduce (lambda (value id) (node-at (make-location :node value :id id)))
+                (path-at node
+                               (reduce #'append-id path :initial-value (location-id loc)))
+                :initial-value node)
+        (gen-tree-ref list path))))
+
+(defun function-position-p (loc)
+  (let ((node (location-node loc))
+        (id (location-id loc)))
+    (or (and (typep node 'function-call) (eq id 'name))
+        (and (typep node 'macro-call) (eq id 'op))
+        (and (typep node 'function-form) (eq id 'fun-designator)))))
+
+(defun block-position-p (loc)
+  (and (typep (location-node loc) 'return-from-form)
+       (eq (location-id loc) 'name)))
+
+(defun lexical-symbol-ref (node loc)
+  (and (typep node 'symbol-ref)
+       (or (eq (locsort loc) 'eval-form)
+           (eq (locsort loc) 'fun-designator)
+           (function-position-p loc)
+           (block-position-p loc))))
+
+(defun unexpanded-macro-op-p (loc)
+  "Whether `loc' is the name of a macro call that failed to expand."
+  (let ((node (location-node loc)))
+    (and (typep node 'macro-call)
+         (eq (location-id loc) 'op)
+         ;; a hole op has no name to blame
+         (typep (op node) 'symbol-ref)
+         (not (expanded node)))))

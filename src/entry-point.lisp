@@ -94,7 +94,8 @@
       (format *terminal-io* "~c]10;#ffffff~c" #\esc (code-char 7))
       (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))
       (unwind-protect
-           (tui:run tui :redisplay-on-input t :mouse :hover)
+           (tui:run tui :redisplay-on-input t ; :mouse :hover
+                    )
         (slog *log-stop*)))))
 
 (defun main (&optional (file (first (uiop:command-line-arguments))))

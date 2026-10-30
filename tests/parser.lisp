@@ -1308,11 +1308,11 @@
          (inner (car (gethash (parse:gen-tree-ref (parse:body call) '(0 1)) (parse:subforms call))))
          (edited (parse:update call '(parse:body 0 1) (parse:update inner 'parse:name (sym "G"))))
          (list (w::make-location :node edited :id '(parse:body 0))))
-    (is equal "(G XS)" (sx (w::value-at-path list '(1))))
-    (is equal "G" (sx (w::value-at-path list '(1 0))))
-    (is equal nil (w::value-at-path list '(5)))
-    (is equal nil (w::value-at-path list '(0 0)))
-    (fail (w::value-at-path (w::make-location :node (parse "(let ((a 1)) a)") :id 'parse:op)
+    (is equal "(G XS)" (sx (parse:value-at-path list '(1))))
+    (is equal "G" (sx (parse:value-at-path list '(1 0))))
+    (is equal nil (parse:value-at-path list '(5)))
+    (is equal nil (parse:value-at-path list '(0 0)))
+    (fail (parse:value-at-path (w::make-location :node (parse "(let ((a 1)) a)") :id 'parse:op)
                             '(0)))))
 
 (define-test default-list-contents :parent parser

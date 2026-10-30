@@ -69,8 +69,8 @@ If this returns NIL, propagate up the cursor stack.")
    (selection :init 0 :type (integer 0))))
 
 (defun copy-completion-state (state &key (anchor (anchor state))
-                                        (candidates (candidates state))
-                                        (selection (selection state)))
+                                      (candidates (candidates state))
+                                      (selection (selection state)))
   (make-completion-state :anchor anchor :candidates candidates :selection selection))
 
 (defrecord selection ()
@@ -332,8 +332,7 @@ Plain list bodies are skipped since they are never focused."
                  (cdr stack)))
           ;; do not reach toplevel
           ((= 1 (length stack)) nil)
-          (t
-           (cdr stack)))))
+          (t (cdr stack)))))
 
 ;;
 ;;; editing operations
@@ -394,24 +393,12 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
              (append-id (location-id loc) (max 0 (1- index)))
              buffer stack))
 
-(defun value-at-path (loc path)
-  "The thing at `path' from the list at `loc' or NIL if there is none."
-  (let ((node (location-node loc))
-        (list (node-at loc)))
-    (assert (gen-list-p list))
-    (if (typep node 'parse:macro-call)
-        (reduce (lambda (value id) (node-at (make-location :node value :id id)))
-                (parse:path-at node
-                               (reduce #'append-id path :initial-value (location-id loc)))
-                :initial-value node)
-        (gen-tree-ref list path))))
-
 (defun insert-or-jump (loc index buffer stack &key (item (hole)) tail)
-  "Moves to the hole at `index' of the list at `loc' and down the indices `tail' if passed,
+  "Moves to the hole at `index' of the list at `loc' and down the ids in `tail' if passed,
 otherwise inserts `item' at `index' and focuses down `tail' within it. `stack' is the
 part of the buffer stack starting from the node of `loc'."
   (let ((path (cons index tail)))
-    (if (typep (value-at-path loc path) 'parse:hole)
+    (if (typep (parse:value-at-path loc path) 'parse:hole)
         (progn
           (setf (stack buffer) stack)
           (refocus buffer (reduce #'append-id path :initial-value (location-id loc))))
@@ -471,30 +458,12 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
       (when (member (locsort loc) '(parse:eval-form parse:function-code))
         (setf env (parse:location-env (location-node loc) (location-id loc) env))))))
 
-(defun function-position-p (loc)
-  (let ((node (location-node loc))
-        (id (location-id loc)))
-    (or (and (typep node 'parse:function-call) (eq id 'parse:name))
-        (and (typep node 'parse:macro-call) (eq id 'parse:op))
-        (and (typep node 'parse:function-form) (eq id 'parse:fun-designator)))))
-
-(defun block-position-p (loc)
-  (and (typep (location-node loc) 'parse:return-from-form)
-       (eq (location-id loc) 'parse:name)))
-
-(defun lexical-symbol-ref (node loc)
-  (and (typep node 'parse:symbol-ref)
-       (or (eq (locsort loc) 'parse:eval-form)
-           (eq (locsort loc) 'parse:fun-designator)
-           (function-position-p loc)
-           (block-position-p loc))))
-
 (defun compute-focus-binder (node stack buffer)
   (declare (ignore buffer))
   (let ((loc (car stack)))
-    (when (lexical-symbol-ref node loc)
-      (let ((kind (cond ((function-position-p loc) :function)
-                        ((block-position-p loc) :block)
+    (when (parse:lexical-symbol-ref node loc)
+      (let ((kind (cond ((parse:function-position-p loc) :function)
+                        ((parse:block-position-p loc) :block)
                         (t :variable)))
             (env (environment-at stack)))
         (multiple-value-bind (entry kind) (parse:env-lookup node kind env)
@@ -509,28 +478,20 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
 (defun symbol-ref-boundp (node stack buffer)
   (declare (ignore buffer))
   (or (eq :lexical
-          (nth-value 1 (parse:env-lookup node
-                                         (cond ((function-position-p (car stack)) :function)
-                                               ((block-position-p (car stack)) :block)
-                                               (t :variable))
-                                         (environment-at stack))))
+          (nth-value 1 (parse:env-lookup
+                        node
+                        (cond ((parse:function-position-p (car stack)) :function)
+                              ((parse:block-position-p (car stack)) :block)
+                              (t :variable))
+                        (environment-at stack))))
       ;; blocks are never global
-      (and (not (block-position-p (car stack)))
+      (and (not (parse:block-position-p (car stack)))
            (multiple-value-bind (symbol found)
                (parse:resolve node)
              (and found
-                  (if (function-position-p (car stack))
+                  (if (parse:function-position-p (car stack))
                       (fboundp symbol)
                       (boundp symbol)))))))
-
-(defun unexpanded-macro-op-p (loc)
-  "Whether `loc' is the name of a macro call that failed to expand."
-  (let ((node (location-node loc)))
-    (and (typep node 'parse:macro-call)
-         (eq (location-id loc) 'parse:op)
-         ;; a hole op has no name to blame
-         (typep (parse:op node) 'parse:symbol-ref)
-         (not (parse:expanded node)))))
 
 (defmethod render-node :around (node stack context rect &key)
   (let* ((vals (multiple-value-list (call-next-method)))
@@ -558,7 +519,7 @@ since these aren't a proper location."
   (lambda (view event buffer)
     (slog event)
     (assert (location= location (focus buffer)))
-    (slog (butlast (stack buffer))) ; suppress toplevel list
+    ;; (slog (butlast (stack buffer))) ; suppress toplevel list
     (or (when-let (handler (gethash event *global-key-handlers*))
           (funcall handler view buffer))
         ;; propagate
@@ -1069,11 +1030,6 @@ if none, surround current atom"
     (eclector.reader:unquote-splicing 'unquote-splicing)
     (t name)))
 
-(defun string-and-package= (node sym)
-  "Suitable as a comparison predicate between symbol-ref, symbol"
-  (and (string= (parse:name node) sym)
-       (eq (parse:home-package node) (symbol-package sym))))
-
 (defun symbol-ref-text (node package &optional use-mappings)
   (let ((name (parse:name node))
         (home (parse:home-package node)))
@@ -1083,8 +1039,8 @@ if none, surround current atom"
            (string name)))
       ((eq home (find-package :keyword)) (format nil ":~(~a~)" name))
       ((and use-mappings
-            (assoc-value *symbol-mappings* node :test #'string-and-package=))
-       (string (assoc-value *symbol-mappings* node :test #'string-and-package=)))
+            (assoc-value *symbol-mappings* node :test #'parse:string-and-package=))
+       (string (assoc-value *symbol-mappings* node :test #'parse:string-and-package=)))
       ((null home) (format nil "#:~(~a~)" name))
       ((or (eq home package)
            (multiple-value-bind (symbol found) (find-symbol name package)
@@ -1234,7 +1190,9 @@ convention."
                            do (let ((element (funcall transform (pop remaining)))
                                     (loc (funcall locate index)))
                                 (incf index)
-                                (unless (or (zerop i) (typep last-elt 'parse:reader-marker))
+                                (unless (or (zerop i)
+                                            (and (= index 2)
+                                                 (parse:unary-reader-marker-p last-elt)))
                                   (tui:pad 1))
                                 (tui:place (rect)
                                   (apply render element (cons loc stack) context rect keys))
@@ -1247,24 +1205,100 @@ convention."
     (let ((r (tui:rect view)))
       (values (tui:rect-x2 r) (tui:rect-y r)))))
 
+(defparameter *column-limit* 92)
+
+(defvar *measurement-scratch* nil)
+
+(defun ensure-measurement-scratch (rect)
+  "Grows the shared scratch array without invalidating recursive bindings to it."
+  (let* ((cells *measurement-scratch*)
+         (old-rows (array-dimension cells 0))
+         (old-cols (array-dimension cells 1))
+         (rows (max old-rows (tui:rect-y2 rect)))
+         (cols (max old-cols (tui:rect-x2 rect))))
+    (unless (and (= rows old-rows) (= cols old-cols))
+      (adjust-array cells (list rows cols))
+      (loop for y below rows
+            do (loop for x from (if (< y old-rows) old-cols 0) below cols
+                     do (setf (aref cells y x) (tui::make-cell)))))
+    cells))
+
+(defun measure-node (node stack context rect &rest keys)
+  "Renders geometry into shared scratch cells and clears the touched rect on exit."
+  (let* ((*measurement-scratch* (or *measurement-scratch*
+                                    (make-array '(0 0) :adjustable t)))
+         (tui::*put-buffer* (ensure-measurement-scratch rect))
+         (touched rect))
+    (unwind-protect
+         (let ((view (apply #'render-node node stack context rect keys)))
+           (setf touched (tui:clamp-rect (tui:rect view) rect))
+           view)
+      (loop for y from (tui:rect-y touched) below (tui:rect-y2 touched)
+            do (loop for x from (tui:rect-x touched) below (tui:rect-x2 touched)
+                     for cell = (aref tui::*put-buffer* y x)
+                     do (setf (tui::cell-string cell) " "
+                              (tui::cell-style cell) tui::*default-style*))))))
+
+(defun ref-list-indentation (elements locate stack context rect keys)
+  "Measures children privately, stopping at the first multiline child."
+  (let* ((max-width (max 1 (min (tui:rect-cols rect)
+                                (- *column-limit* (tui:rect-x rect)))))
+         (measuring (make-buffer :buffer-ui (buffer-ui context)
+                                 :buffer-id (buffer-id context)
+                                 :buffer-state (buffer-state context)))
+         (bounds (tui:copy-rect rect :y 0 :rows 2 :cols max-width))
+         (transform (or (getf keys :transform) #'identity))
+         (rows nil)
+         (used 0)
+         (count 0)
+         (previous nil))
+    (when (and (= (length elements) 2)
+               (let ((head (apply #'measure-node (funcall transform (car elements))
+                                  (cons (funcall locate 0) stack)
+                                  measuring bounds keys)))
+                 (< (tui:rect-cols (tui:rect head)) 10)))
+      (return-from ref-list-indentation '((0 . nil))))
+    (loop for original in elements
+          for index from 0
+          for element = (funcall transform original)
+          for view = (apply #'measure-node element (cons (funcall locate index) stack)
+                            measuring bounds keys)
+          for size = (tui:rect-cols (tui:rect view))
+          for gap = (if (or (zerop count)
+                            (and (= index 1) (parse:unary-reader-marker-p previous)))
+                        0 1)
+          do (when (> (tui:rect-rows (tui:rect view)) 1)
+               (return-from ref-list-indentation '((0 . 1))))
+             ;; line wrap
+             (when (and (plusp count) (> (+ used gap size) max-width))
+               (push (cons 0 count) rows)
+               (setf count 0
+                     used 0
+                     gap 0))
+             (incf count)
+             (incf used (+ gap size))
+             (setf previous element))
+    (when (plusp count) (push (cons 0 count) rows))
+    (or (nreverse rows) '((0 . nil)))))
+
 (defmethod render-node ((l parse:ref-list) stack context rect
-                        &key (indent *horizontal*) delimited (transform #'identity))
+                        &key indent delimited (transform #'identity))
   "A `delimited' list is drawn with `*list-delimiters*' around it, recursively unless
 `delimited' is :shallow. It's opening parens is selectable."
   (let* ((location (car stack))
          (focused (location= location (focus context)))
          (head (first (elements l))))
     (flet ((contents (rect)
-             (render-elements
-              (elements l) indent (list-locator location)
-              (cdr stack) context rect
-              `(,@(when (eq delimited t) '(:delimited t))
-                ,@(when transform `(:transform ,transform))
-                ;; raw specs are not meant to be recursively applied
-                ;; to nested syntax. note: propagation should stop at any
-                ;; evaluated form, which supplies its own drawing rules
-                ,@(when (functionp indent) `(:indent ,indent))))))
-      (if (and delimited (not (typep head 'parse:reader-marker)))
+             (let* ((keys `(,@(when (eq delimited t) '(:delimited t))
+                            :transform ,transform
+                            ,@(when (functionp indent) `(:indent ,indent))))
+                    (spec (if indent indent
+                              (ref-list-indentation
+                               (elements l) (list-locator location) (cdr stack)
+                               context rect keys))))
+               (render-elements (elements l) spec (list-locator location)
+                                (cdr stack) context rect keys))))
+      (if (and delimited (not (parse:unary-reader-marker-p head)))
           (let* ((handle (make-location :node l :id :open))
                  (open (render-delimiter (car *list-delimiters*) handle
                                          (cons handle stack) rect
@@ -1421,14 +1455,76 @@ convention."
 (setf (gethash (tui-sys:make-event :kind #\rubout) *fun-key-handlers*)
       #'rubout-eval-form)
 
-;; (define-constant +top-left+ (name-char "U1CE16") :test #'equal)
-;; (define-constant +bot-left+ (name-char "U1CE17") :test #'equal)
-;; (define-constant +top-right+ (name-char "U1CE18") :test #'equal)
-;; (define-constant +bot-right+ (name-char "U1CE19") :test #'equal)
 ;; - unary operators have space removed
 ;; - for 2 arguments, draw *arb-arity-binops* infix
 ;;   - higher arity duplicated op views break invariant: always a single focused view
-;; - for 2 arg division, draw horizontally. maybe future: (f)floor/ceiling/truncate
+(defun function-keyword-start (node stack)
+  "Returns the positional argument count before &key, or NIL if not present."
+  (let ((name (parse:name node)))
+    (unless (typep name 'parse:symbol-ref)
+      (return-from function-keyword-start nil))
+    (when (eq :lexical (nth-value 1 (parse:env-lookup name :function
+                                                      (environment-at stack))))
+      (return-from function-keyword-start nil))
+    (let* ((symbol (parse:resolve name))
+           (arglist (when (and symbol (fboundp symbol))
+                      (slynk-backend:arglist symbol))))
+      (when (proper-list-p arglist)
+        (loop with count = 0
+              for tail on arglist
+              for parameter = (car tail)
+              do (case parameter
+                   (&key (return count))
+                   ((&rest &body &whole &environment) (pop tail))
+                   (&aux (return nil))
+                   ((&optional &allow-other-keys))
+                   (otherwise
+                    (when (member parameter lambda-list-keywords) (return nil))
+                    (incf count))))))))
+
+(defun function-call-indentation (node stack context rect)
+  "Packs arguments by width, keeping the &key tail paired per line."
+  (let* ((arguments (parse:body node))
+         (limit (max 1 (min (tui:rect-cols rect)
+                            (- *column-limit* (tui:rect-x rect)))))
+         (measuring (make-buffer :buffer-ui (buffer-ui context)
+                                 :buffer-id (buffer-id context)
+                                 :buffer-state (buffer-state context)))
+         (bounds (tui:copy-rect rect :y 0 :cols limit))
+         (widths (loop for arg in arguments for index from 0
+                       collect (tui:rect-cols
+                                (tui:rect
+                                 (measure-node arg
+                                              (cons (make-location
+                                                     :node node
+                                                     :id (list 'parse:body index))
+                                                    stack)
+                                              measuring bounds)))))
+         (keyword-start (function-keyword-start node stack)))
+    (labels ((fits (widths)
+               (<= (+ (reduce #'+ widths :initial-value 0)
+                      (max 0 (1- (length widths)))) limit))
+             (greedy (widths)
+               (loop with used = 0 with count = 0 with rows = nil
+                     for width in widths
+                     do (when (and (plusp count) (> (+ used 1 width) limit))
+                          (push (cons 0 count) rows)
+                          (setf used 0 count 0))
+                        (incf used (+ width (if (plusp count) 1 0)))
+                        (incf count)
+                     finally (when (plusp count) (push (cons 0 count) rows))
+                             (return (nreverse rows)))))
+      (cond ((fits widths) '((0 . nil)))
+            ((or (null keyword-start) (>= keyword-start (length widths)))
+             (greedy widths))
+            (t
+             (let ((keywords (nthcdr keyword-start widths)))
+               (append (greedy (subseq widths 0 keyword-start))
+                       (if (fits keywords)
+                           (list (cons 0 (length keywords)))
+                           ;; dangling kw
+                           '((0 . 2))))))))))
+
 (defmethod render-node ((node parse:function-call) stack context rect &key)
   (trivia:match (and (= 2 (length (parse:body node))) (is-binop-call node))
     ;; note this case must go first since division is a binop
@@ -1564,15 +1660,14 @@ convention."
                                     (cons (make-location :node node :id 'parse:name) stack)
                                     context rect))
             (name-rect (tui:rect name-view))
+            (args-bounds (tui:clamp-rect
+                          (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect))) rect))
             (args-view
-              (render-elements (parse:body node) *vertical*
+              (render-elements (parse:body node)
+                               (function-call-indentation node stack context args-bounds)
                                (list-locator
                                 (make-location :node node :id 'parse:body))
-                               stack context
-                               (tui:clamp-rect
-                                (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
-                                rect)
-                               nil))
+                               stack context args-bounds nil))
             (args-rect (tui:rect args-view))
             (fun-rect (tui:clamp-rect
                        (tui:copy-rect rect :rows (max 1 (tui:rect-rows args-rect))
@@ -1605,7 +1700,7 @@ convention."
 for every clause keyword, except those following and/else. Forms of a do-like clause after
 its first are aligned with the first, and a loop without keywords has a line per form."
   (let* ((indent 1)
-         (rows (list '(0 . 1)))
+         (rows (list (cons 0 1)))
          (column indent)
          (body-column nil)
          (body-started nil)
@@ -1636,7 +1731,7 @@ its first are aligned with the first, and a loop without keywords has a line per
                     (incf (cdar rows))
                     (setf body-started t)))
              (setf previous element))
-    (reverse rows)))
+    (nreverse rows)))
 
 (defun macro-call-indentation (op &optional (package *package*))
   "`loop-indentation' for loop. Note `op' can be a hole"
@@ -1668,11 +1763,51 @@ its first are aligned with the first, and a loop without keywords has a line per
           (t *horizontal*))
     *horizontal*))
 
+(defun setf-indentation (node stack context rect)
+  "Keeps place/value pairs together unless their combined width exceeds the limit."
+  (let* ((indent (1+ (length (symbol-ref-text (parse:op node)
+                                              (buffer-package context)))))
+         (available (max 0 (min (tui:rect-cols rect)
+                                (- *column-limit* (tui:rect-x rect)))))
+         (measuring (make-buffer :buffer-ui (buffer-ui context)
+                                 :buffer-id (buffer-id context)
+                                 :buffer-state (buffer-state context)))
+         (bounds (tui:copy-rect rect :x (+ (tui:rect-x rect) (min indent available))
+                                     :y 0 :cols (max 0 (- available indent))))
+         (rows nil))
+    (labels ((width (form index)
+               (let* ((parsed (or (car (gethash form (parse:subforms node))) form))
+                      (view (measure-node
+                             parsed (cons (make-location :node node
+                                                         :id (list 'parse:body index))
+                                          stack)
+                             measuring bounds :delimited t
+                             :transform (lambda (elt)
+                                          (or (car (gethash elt (parse:subforms node)))
+                                              elt)))))
+                 (tui:rect-cols (tui:rect view)))))
+      (loop for tail on (parse:body node) by #'cddr
+            for index from 0 by 2
+            for firstp = (zerop index)
+            for count = (if firstp 2 1)
+            for row-indent = (if firstp 0 indent)
+            do (if (and (cdr tail)
+                        (> (+ indent (width (car tail) index) 1
+                              (width (cadr tail) (1+ index)))
+                           available))
+                   (progn (push (cons row-indent count) rows)
+                          (push (cons indent 1) rows))
+                   (push (cons row-indent (+ count (if (cdr tail) 1 0))) rows))))
+    (or (nreverse rows) '((0 . 1)))))
+
 (defmethod render-node ((node parse:macro-call) stack context rect &key)
   (let* ((location (car stack))
          (view (render-elements
                 (cons (parse:op node) (parse:body node))
-                (macro-call-indentation (parse:op node) (buffer-package context))
+                (if (and (typep (parse:op node) 'parse:symbol-ref)
+                         (eq (parse:resolve (parse:op node)) 'cl:setf))
+                    (setf-indentation node stack context rect)
+                    (macro-call-indentation (parse:op node) (buffer-package context)))
                 (lambda (index)
                   (make-location :node node
                                  :id (if (zerop index)
@@ -2922,9 +3057,7 @@ buffer."
 ;;
 
 ;; using oklab
-(defparameter *early-grayramp* #(0 7 #xb))
-(defparameter *mid-grayramp* #(#x10 #x16 #x1c #x20 #x28 #x2e #x34 #x3b #x41 #x48 #x4e #x50
-                               #x5c #x63 #x6a #x71))
+(defparameter *grayramp* #(0 7 #x16 #x20 #x2e #x3b #x48 #x50 #x63 #x71))
 
 (defun transform-rect-to-screen (rect offset screen-rect)
   (let* ((origin (tui:rect-y screen-rect))
@@ -2953,14 +3086,12 @@ buffer."
               (rect (transform-rect-to-screen (tui:rect view) offset screen-rect))
               (real-stack-len (1- (length stack)))
               (i (cond
-                   ((<= real-stack-len 2)
-                    (truncate (svref *early-grayramp* (min 2 real-stack-len))))
-                   ((<= 3 real-stack-len (1- (length *mid-grayramp*)))
-                    (truncate (svref *mid-grayramp* (min (1- (length *mid-grayramp*))
+                   ((<= 0 real-stack-len (1- (length *grayramp*)))
+                    (truncate (svref *grayramp* (min (1- (length *grayramp*))
                                                          real-stack-len))))
                    (t
-                    (min 255 (truncate (+ (last-elt *mid-grayramp*)
-                                          (* (- real-stack-len (1- (length *mid-grayramp*)))
+                    (min 255 (truncate (+ (last-elt *grayramp*)
+                                          (* (- real-stack-len (1- (length *grayramp*)))
                                              10))))))))
          (unless (parse:is-atom node)
            (tui:fill-rect (tui:make-style :bg (tui:color i i i))
@@ -2969,12 +3100,12 @@ buffer."
          (if (eq node (focus-binder buffer))
              (tui:fill-rect (tui:make-style :bg (tui:color #x85 #x99 #x00))
                             (tui:copy-rect rect :x 0 :y 0) rect)
-             (when (and (lexical-symbol-ref node (car stack))
+             (when (and (parse:lexical-symbol-ref node (car stack))
                         (not (symbol-ref-boundp node stack buffer)))
                (tui:fill-rect (tui:make-style :bg (tui:color #xcb #x4b #x16))
                               (tui:copy-rect rect :x 0 :y 0) rect)))
          ;;
-         (when (unexpanded-macro-op-p (car stack))
+         (when (parse:unexpanded-macro-op-p (car stack))
            (tui:fill-rect (tui:make-style :bg (tui:color #xdc #x32 #x2f))
                           (tui:copy-rect rect :x 0 :y 0) rect))))
      t)))
@@ -3025,7 +3156,6 @@ buffer."
          (height 0)
          (width 0))
     (when (and (plusp rows) (plusp cols))
-      ;; measurement uses separate caches; the final render establishes node views.
       (let ((measuring (make-buffer :buffer-ui ui :buffer-id (buffer-id buffer)
                                     :buffer-state (buffer-state buffer))))
         (loop for index below (length (ast buffer))
@@ -3086,6 +3216,11 @@ buffer."
     (draw-buffer working)
     (setf (render-state buffer) (render-state working))))
 
+(defmethod tui:render :around ((ui ui))
+  ;; a recursive redisplay needs to own its scratch space
+  (let ((*measurement-scratch* (make-array '(0 0) :adjustable t)))
+    (call-next-method)))
+
 (defmethod tui:render ((ui ui))
   (tui::clear-buffer tui::*put-buffer*)
   (dolist (buffer (buffers ui))
@@ -3100,12 +3235,13 @@ buffer."
 ;; note: must go below definitions, next to tui:redisplay
 (let ((render-node-methods (closer-mop:generic-function-methods #'render-node))
       (old-render-method (find-method #'tui:render nil '(ui)))
-      (fnames '(render-buffer draw-buffer draw-buffer-border fit-floating-buffer buffer-rect
-                buffer-outer-rect render-toplevel-window
-                symbol-ref-text render-literal-text render-literal-line
+      (fnames '(render-toplevel-window render-buffer draw-buffer draw-buffer-border
+                measure-node
+                function-call-indentation
+                ref-list-indentation symbol-ref-text render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements
                 render-layout-slot slot-render-keys
-                macro-call-indentation loop-indentation
+                macro-call-indentation setf-indentation loop-indentation
                 draw-semantic-backgrounds draw-highlights
                 render-completion-window render-completion))
       (funs (make-hash-table :test 'eq)))
@@ -3161,8 +3297,10 @@ buffer."
                (rect-contains-point-p
                 (if (floating buffer)
                     (buffer-outer-rect buffer)
-                    (tui:clamp-rect (tui:rect view) (buffer-rect buffer))) row col)))
-           (reverse (buffers ui))))
+                    (tui:clamp-rect (tui:rect view) (buffer-rect buffer)))
+                row col)))
+           (buffers ui)
+           :from-end t))
 
 (defrecord ui-effects ()
   ((pane-drag :init nil :type (or null pane-drag))
@@ -3227,8 +3365,7 @@ buffer."
          (not (null drag)))
         (drag
          (when (eq state :drag)
-           (when-let (buffer (find (pane-drag-buffer-id drag) (buffers ui)
-                                  :key #'buffer-id))
+           (when-let (buffer (find (pane-drag-buffer-id drag) (buffers ui) :key #'buffer-id))
              (let ((rect (buffer-outer-rect buffer)))
                (setf (buffer-x buffer)
                      (max 0 (min (- (tui:mouse-data-col mouse) (pane-drag-offset-x drag))
@@ -3297,7 +3434,9 @@ buffer."
              (tui:event-controlp event))
         (tui:stop ui)
         (call-next-method))
-    (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled))))
+    (unless (and (tui:mouse-event-p event)
+                 (eq :hover (tui:mouse-data-button (tui:event-kind event))))
+      (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled)))))
 
 (defmethod tui:dispatch-event :after ((ui ui) event)
   (declare (ignore event))
