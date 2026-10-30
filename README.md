@@ -28,9 +28,11 @@ In emacs, sly-connect to 4005 and
 ### Keybindings:
 * `Space` inserts or moves to the next hole
 * `Enter` selects a completion/expands the symbol at point into a call
-* `C-n/p/b/f` move by atom and goal column
-* `M-n/p` move by parent stack
+* `Ctrl-n/p/b/f` move by atom and goal column
+* `Alt-n/p` move by parent stack
 
 * `Shift+left/right` starts a selection
 * `Shift+up/down` adjusts a zipper selection
-* `C-x/c/v` cut, copy and paste
+* `Ctrl-x/c/v` cut, copy and paste
+
+* `Ctrl-e` evaluation

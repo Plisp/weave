@@ -2,9 +2,6 @@
 ;;;; terminal frontend
 ;;;;
 ;;
-;; anchored selection of subtrees
-;; highlight lexical occurrences of the symbol under cursor using envmaps
-;; need to convert method applications
 
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
@@ -67,57 +64,47 @@ If this returns NIL, propagate up the cursor stack.")
   (:method (node view location context event) nil))
 
 (defrecord completion-state ()
-  ((anchor :mutable t)
-   (candidates :mutable t :type list)
-   (selection :init 0 :mutable t :type (integer 0))))
+  ((anchor)
+   (candidates :type list)
+   (selection :init 0 :type (integer 0))))
 
-;; TODO currently uses change-class, make struct once settled
-(defclass selection ()
-  (;; tracks the stack during selection-mode, for growing and shrinking zippers
-   (context :initarg :context
-            :initform (error "no context")
-            :accessor selection-context
-            :type list)
-   ;; the location of the child where the selection was started
-   (location :initarg :location
-             :initform (error "no location")
-             :reader selection-location
-             :type location)
-   (point :initarg :point
-          :initform (error "no point")
-          :accessor selection-point
-          :type integer)
-   (activep :initform t
-            :accessor selection-activep
-            :type boolean)))
+(defun copy-completion-state (state &key (anchor (anchor state))
+                                        (candidates (candidates state))
+                                        (selection (selection state)))
+  (make-completion-state :anchor anchor :candidates candidates :selection selection))
 
-(defclass zipper (selection)
-  ;; from the selection start location out to the top of the zipper
-  ((stack :initarg :stack
-          :initform (error "no stack")
-          :reader zipper-stack
-          :type list)))
+(defrecord selection ()
+  ((buffer-id)
+   (context :type list)
+   (location :type location)
+   (point :type integer)
+   (activep :init t :type boolean))
+  (:representation :struct))
+
+(defrecord zipper (selection)
+  ((stack :type list))
+  (:representation :struct))
+
+(defun copy-selection (selection &key (point (selection-point selection))
+                                   (activep (selection-activep selection))
+                                   (stack (when (typep selection 'zipper)
+                                            (zipper-stack selection))))
+  "Returns a selection with updated fields. A nonempty `stack' makes it into a zipper."
+  (apply (if stack #'make-zipper #'make-selection)
+         :buffer-id (selection-buffer-id selection)
+         :context (selection-context selection)
+         :location (selection-location selection)
+         :point point :activep activep
+         (when stack (list :stack stack))))
 
 (defrecord undo-state ()
   ((ast)
    (stack :type list))
   (:representation :struct))
 
-;; (defrecord selection ()
-;;   (;; tracks the stack during selection-mode, for growing and shrinking zippers
-;;    (context :mutable t)
-;;    ;; the location of the child where the selection was started
-;;    (location)
-;;    (point :mutable t :type integer)
-;;    (activep :init t :mutable t)))
-
-;; (defrecord zipper (selection)
-;;   ;; from the selection start location out to the top of the zipper
-;;   ((stack :type list)))
-
 (defun end-selection-mode (buffer)
   (when-let (selection (selection buffer))
-    (setf (selection-activep selection) nil)))
+    (setf (selection buffer) (copy-selection selection :activep nil))))
 
 (defun selection-anchor (selection)
   (id-index (location-id (selection-location selection))))
@@ -185,7 +172,6 @@ If this returns NIL, propagate up the cursor stack.")
    (row :init 0 :type (integer 0)))
   (:representation :struct))
 
-;;XXX flag
 (defrecord scroll-state ()
   ((position :type scroll-position)
    ;; total number of rows
@@ -199,131 +185,124 @@ If this returns NIL, propagate up the cursor stack.")
   (make-cutbuffer :forms (mapcar (lambda (loc) (parse:copy-node (node-at loc))) locations)
                   :sorts (mapcar #'locsort locations)))
 
-(defclass ui (tui:elemental)
-  ((buffers :initform nil :accessor buffers :type list)
-   (focused-buffer :initform nil :accessor focused-buffer)
-   ;; selection
-   (selection :initform nil
-              :accessor selection
-              :type (or null selection))
-   (zipper :initform nil
-           :accessor zipper
-           :type (or null zipper))
-   (cutbuffer :initform nil
-              :accessor cutbuffer
-              :type (or null cutbuffer))
-   (redisplayed-since-input :initform nil
-                            :accessor redisplayed-since-input
-                            :type boolean)))
+(defrecord pane-drag ()
+  ((buffer-id) (offset-x :type integer) (offset-y :type integer))
+  (:representation :struct))
 
-(defclass buffer ()
-  ((owner :initarg :owner :reader buffer-ui)
-   (package :initarg :package :initform *package* :accessor buffer-package
-            :type package)
-   (source :initarg :source :initform nil :accessor buffer-source
-           :type (or null pathname))
-   (x :initarg :x :initform 0 :accessor buffer-x :type (integer 0))
-   (y :initarg :y :initform 0 :accessor buffer-y :type (integer 0))
-   (view :initform nil :accessor buffer-view :type (or null tui:view))
-   (ast :initarg :ast ; this slot exists to cache the back of the stack (root)
-        :initform (error "no ast")
-        :accessor ast)
-   (edit-loc :initarg :edit-loc
-             :initform nil
-             :accessor edit-loc
-             :type (or null location))
-   (goal-col :initform 1
-             :accessor goal-col
-             :type positive-fixnum)
-   (completion-state :initform nil
-                     :accessor completion-state
-                     :type (or null completion-state))
-   ;; undo
-   (history :initform (list)
-            :accessor history
-            :type list)
-   (future :initform (list)
-           :accessor future
-           :type list)
-   ;; maintained by every edit and cursor move
-   (stack :initarg :stack
-          :initform nil
-          :accessor stack ; stack is always non-empty
-          :type list)
-   (goal-stacks :initform nil
-                :accessor goal-stacks
-                :type list
-                :documentation "The stacks at each node alt+p moved up from.")
-   ;; recomputed on every redisplay
-   (stage-cache :initform (make-hash-table :test #'eq) ; caching staged sizes
-                :reader stage-cache
-                :type hash-table)
-   (redisplay-cache :initform (make-hash-table :test #'equal)
-                    :reader redisplay-cache
-                    :type hash-table)
-   (scroll-state :initform (make-scroll-state :position (make-scroll-position :index 0)
-                                              :rows 0
-                                              :viewport-row 0
-                                              :segments nil)
-                 :accessor scroll-state
-                 :type scroll-state)
-   (focus-rect :initform nil
-               :accessor focus-rect
-               :type (or null tui:rect))
-   (node-views :initform (make-hash-table)
-               :accessor node-views
-               :type hash-table)))
+(defrecord ui (tui:elemental)
+  ((pane-drag :init nil :mutable t :type (or null pane-drag))
+   (buffers :init nil :mutable t :type list)
+   (focused-buffer :init nil :mutable t)
+   (selection :init nil :mutable t :type (or null selection))
+   (zipper :init nil :mutable t :type (or null zipper))
+   (cutbuffer :init nil :mutable t :type (or null cutbuffer))
+   (redisplayed-since-input :init nil :mutable t :type boolean)
+   (revision :init 0 :mutable t :type (integer 0)))
+  (:representation :class))
 
-(defun make-buffer (ui &key (ast (list (hole))) source (x 0) (y 0) (package *package*))
+;; MUST BE shallow copyable, always update immutably
+(defrecord buffer-state ()
+  ((floating :init nil :mutable t :type boolean)
+   (buffer-package :init *package* :mutable t :type package)
+   (buffer-source :init nil :mutable t :type (or null pathname))
+   (buffer-x :init 0 :mutable t :type (integer 0))
+   (buffer-y :init 0 :mutable t :type (integer 0))
+   (ast :mutable t)
+   (edit-loc :init nil :mutable t :type (or null location))
+   (goal-col :init 1 :mutable t :type positive-fixnum)
+   (completion-state :init nil :mutable t :type (or null completion-state))
+   (history :init nil :mutable t :type list)
+   (future :init nil :mutable t :type list)
+   (stack :init nil :mutable t :type list)
+   (goal-stacks :init nil :mutable t :type list))
+  (:representation :class))
+
+(defun copy-buffer-state (state)
+  (shallow-copy-record state))
+
+;; mutable per-render cache, needed for movement commands
+(defrecord render-state ()
+  ((floating-rect :init nil :mutable t :type (or null tui:rect))
+   (buffer-view :init nil :mutable t :type (or null tui:view))
+   (stage-cache :init (make-hash-table :test #'eq) :type hash-table)
+   (redisplay-cache :init (make-hash-table :test #'equal) :type hash-table)
+   (scroll-state :init (make-scroll-state :position (make-scroll-position :index 0)
+                                          :rows 0 :viewport-row 0 :segments nil)
+                 :mutable t :type scroll-state)
+   (focus-rect :init nil :mutable t :type (or null tui:rect))
+   (node-views :init (make-hash-table) :type hash-table))
+  (:representation :class))
+
+(defrecord buffer ()
+  ((buffer-ui)
+   (buffer-id :init (gensym "BUFFER-"))
+   (buffer-state :mutable t :type buffer-state)
+   (render-state :init (make-render-state) :mutable t :type render-state))
+  (:representation :class))
+
+(macrolet ((buffer-state-accessors (state readers &rest accessors)
+             `(progn
+                ,@(loop for name in (append readers accessors)
+                        collect `(defmethod ,name ((buffer buffer))
+                                   (,name (,state buffer))))
+                ,@(loop for name in accessors
+                        collect `(defmethod (setf ,name) (value (buffer buffer))
+                                   (setf (,name (,state buffer)) value))))))
+
+  (buffer-state-accessors
+   buffer-state ()
+   floating buffer-package buffer-source buffer-x buffer-y ast edit-loc goal-col
+   completion-state
+   history future stack goal-stacks)
+  (buffer-state-accessors
+   render-state (stage-cache redisplay-cache node-views)
+   floating-rect buffer-view scroll-state focus-rect))
+
+(defun add-buffer (ui &key (ast (list (hole))) (x 0) (y 0)
+                        source (package "CL-USER") floating)
   "Adds a buffer containing `ast' to `ui', optionally associated with `source'."
   (check-type ast cons)
-  (let ((buffer (make-instance 'buffer :owner ui :ast ast
-                                       :source (when source (pathname source)) :x x :y y
-                                       :package (or (find-package package)
-                                                    (error "Unknown package ~s" package)))))
-    (setf (stack buffer) (list (make-location :node ast :id 0)
-                               (make-location :node buffer :id nil))
+  (let ((buffer (make-buffer
+                 :buffer-ui ui
+                 :buffer-state (make-buffer-state
+                                :floating floating :ast ast
+                                :buffer-source (when source (pathname source))
+                                :buffer-x x :buffer-y y
+                                :buffer-package (or (find-package package)
+                                                    (error "Unknown package ~s" package))))))
+    (setf (stack buffer) (list (make-location :node ast :id 0))
           (buffers ui) (append (buffers ui) (list buffer)))
     (unless (focused-buffer ui)
       (setf (focused-buffer ui) buffer))
     buffer))
 
 (defun buffer-focused-p (buffer)
-  (eq buffer (focused-buffer (buffer-ui buffer))))
+  (eq (buffer-id buffer) (buffer-id (focused-buffer (buffer-ui buffer)))))
 
 (defmethod (setf focused-buffer) :before (buffer (ui ui))
   (assert (member buffer (buffers ui)))
   (setf (redisplayed-since-input ui) nil)
   (when (and (not (eq buffer (focused-buffer ui))) (selection ui))
-    (setf (selection-activep (selection ui)) nil)))
+    (setf (selection ui) (copy-selection (selection ui) :activep nil))))
 
 (defmethod selection ((buffer buffer))
   (let ((selection (selection (buffer-ui buffer))))
     (when (and selection
-               (eq buffer (location-node (lastcar (selection-context selection)))))
+               (eq (buffer-id buffer) (selection-buffer-id selection)))
       selection)))
-
 (defmethod (setf selection) (value (buffer buffer))
   (setf (selection (buffer-ui buffer)) value))
 
 (defmethod zipper ((buffer buffer)) (zipper (buffer-ui buffer)))
 (defmethod (setf zipper) (value (buffer buffer))
   (setf (zipper (buffer-ui buffer)) value))
+
 (defmethod cutbuffer ((buffer buffer)) (cutbuffer (buffer-ui buffer)))
 (defmethod (setf cutbuffer) (value (buffer buffer))
   (setf (cutbuffer (buffer-ui buffer)) value))
 
 (defun focus (buffer)
   (car (stack buffer)))
-
-;; no update
-(defmethod parse:get-location ((node buffer) id)
-  (declare (ignore id))
-  (ast node))
-
-(defmethod parse:location-sort ((buffer buffer) id)
-  (declare (ignore id))
-  'parse:eval-form)
 
 (defun refocus (buffer id)
   "Moves the focus to another location in the node it is already within."
@@ -352,33 +331,31 @@ Plain list bodies are skipped since they are never focused."
            (cons (make-location :node (location-node loc) :id (parent-id id))
                  (cdr stack)))
           ;; do not reach toplevel
-          ((= 2 (length stack)) nil)
+          ((= 1 (length stack)) nil)
           (t
            (cdr stack)))))
 
 ;;
 ;;; editing operations
 ;;
-;; - a stack tracks locations from the focus outward to the root, ending in `buffer'
+;; - a stack tracks locations from the focus outward to the indexed top-level form
 ;; - ast-delete/insert/replace are stack-respecting edit operations
 ;;
 (defun rebuild-spine (loc updater stack)
   "Requires that (location-node `loc') = (location-node (car `stack'))
-Functionally rebuilds the path from `loc' out to the buffer or root, applying `updater' to
+Functionally rebuilds the path from `loc' out to the root, applying `updater' to
 the value at `loc', but retaining the current focus. Returns the new stack and root."
   (assert (eq (location-node loc) (location-node (car stack))))
   (labels ((rebuild (stack newnode newstack)
              (if (null stack)
-                 (values (reverse newstack) newnode)
-                 (let ((this (car stack)))
-                   (if (typep (location-node this) 'buffer) ; no need to update buffer
-                       (values (reverse (cons this newstack)) newnode)
-                       (let* ((id (location-id this))
-                              (new-parent (update (location-node this) id newnode)))
-                         (rebuild (cdr stack)
-                                  new-parent
-                                  (cons (make-location :node new-parent :id id)
-                                        newstack))))))))
+                 (values (nreverse newstack) newnode)
+                 (let* ((this (car stack))
+                        (id (location-id this))
+                        (new-parent (update (location-node this) id newnode)))
+                   (rebuild (cdr stack)
+                            new-parent
+                            (cons (make-location :node new-parent :id id)
+                                  newstack))))))
     (rebuild (cons loc (cdr stack))
              (funcall updater (node-at loc))
              (list))))
@@ -576,12 +553,12 @@ since these aren't a proper location."
          (eq '&body (cdr (assoc id (parse:form-slot-kinds
                                     (type-of (location-node location)))))))))
 
-(defun global-key-handler (node location buffer)
-  "handler may return t to stop propagation up the stack"
-  (lambda (view event)
+(defun global-key-handler (node location)
+  "Handler receives its working buffer explicitly at dispatch time."
+  (lambda (view event buffer)
     (slog event)
     (assert (location= location (focus buffer)))
-    (slog (butlast (stack buffer) 2)) ; depends on toplevel list
+    (slog (butlast (stack buffer))) ; suppress toplevel list
     (or (when-let (handler (gethash event *global-key-handlers*))
           (funcall handler view buffer))
         ;; propagate
@@ -596,24 +573,19 @@ since these aren't a proper location."
           (funcall handler view buffer)))
     ;; state updates here
     (when-let (completion (completion-state buffer))
-      ;; edit: with-accessors to let
-      (with-accessors ((candidates candidates)
-                       (anchor anchor))
-          completion
-        (if (not (eq (node-at (focus buffer)) anchor))
-            (setf (completion-state buffer) nil)
-            (progn ;; note: if we're typing then we've already converted symbol->string
-              (let* ((name (parse:name anchor))
+      (setf (completion-state buffer)
+            (when (eq (node-at (focus buffer)) (anchor completion))
+              (let* ((name (parse:name (anchor completion)))
                      (valid (delete-if-not (lambda (s) (starts-with-subseq name (string s)))
-                                           candidates))
-                     (exact-match (find name valid :test #'string=)))
-                (if exact-match
-                    (setf candidates
-                          (sort valid #'<
-                                :key (lambda (s)
-                                       (mk-string-metrics:damerau-levenshtein
-                                        name (string s)))))
-                    (setf candidates valid)))))))
+                                           (copy-list (candidates completion)))))
+                (copy-completion-state
+                 completion
+                 :candidates (if (find name valid :test #'string=)
+                                 (sort valid #'<
+                                       :key (lambda (s)
+                                              (mk-string-metrics:damerau-levenshtein
+                                               name (string s))))
+                                 valid))))))
     (assert (not (plain-body-location-p (focus buffer))) ()
             "focused the body ~a of ~a" (location-id (focus buffer))
             (type-of (location-node (focus buffer))))))
@@ -669,15 +641,19 @@ if none, surround current atom"
       (lambda (view buffer)
         (declare (ignore view))
         (when-let (state (completion-state buffer))
-          (setf (selection state) (mod (1+ (selection state))
-                                       (length (candidates state)))))))
+          (setf (completion-state buffer)
+                (copy-completion-state
+                 state :selection (mod (1+ (selection state))
+                                       (length (candidates state))))))))
 
 (setf (gethash (tui-sys:make-event :kind #\tab :shiftp t) *global-key-handlers*)
       (lambda (view buffer)
         (declare (ignore view))
         (when-let (state (completion-state buffer))
-          (setf (selection state) (mod (1- (selection state))
-                                       (length (candidates state)))))))
+          (setf (completion-state buffer)
+                (copy-completion-state
+                 state :selection (mod (1- (selection state))
+                                       (length (candidates state))))))))
 
 
 ;; ASSUME leaf nodes are non-overlapping
@@ -804,10 +780,10 @@ if none, surround current atom"
          (id (location-id loc)))
     (when (bodylike-id id)
       (setf (selection buffer)
-            (make-instance 'selection
-                           :context (stack buffer)
-                           :location loc
-                           :point (id-index id))))))
+            (make-selection :buffer-id (buffer-id buffer)
+                            :context (stack buffer)
+                            :location loc
+                            :point (id-index id))))))
 
 (defun extend-selection (buffer delta)
   (when-let (selection (or (current-selection buffer) (begin-selection buffer)))
@@ -815,12 +791,10 @@ if none, surround current atom"
       (when (<= 0 point (1- (length (elements
                                      (node-at (selection-list-location selection))))))
         ;; when the underlying range is reselected, forget the zipper
-        (when (typep selection 'zipper)
-          (change-class selection 'selection))
-        (setf (selection-point selection) point)
         ;; keep selection active after move
         (refocus buffer (append-id (selection-parent-id selection) point))
-        (setf (selection-activep selection) t)))
+        (setf (selection buffer)
+              (copy-selection selection :point point :activep t :stack nil))))
     t))
 
 (defun eval-list-position-p (location)
@@ -847,9 +821,7 @@ if none, surround current atom"
             for level from (1+ depth)
             do (when (zipper-target-p location)
                  (let ((stack (subseq (selection-context selection) 0 level)))
-                   (if (plusp depth)
-                       (reinitialize-instance selection :stack stack)
-                       (change-class selection 'zipper :stack stack)))
+                   (setf (selection buffer) (copy-selection selection :stack stack)))
                  (return t))))))
 
 (defun shrink-selection (buffer)
@@ -858,11 +830,12 @@ if none, surround current atom"
       (loop for level from (1- (zipper-depth selection)) downto 1
             for location = (nth level (selection-context selection))
             do (when (zipper-target-p location)
-                 (reinitialize-instance
-                  selection :stack (subseq (selection-context selection) 0 level))
+                 (setf (selection buffer)
+                       (copy-selection
+                        selection :stack (subseq (selection-context selection) 0 level)))
                  (return t))
             finally ;; normal selection
-                    (change-class selection 'selection)
+                    (setf (selection buffer) (copy-selection selection :stack nil))
                     (return t)))))
 
 (setf (gethash (tui-sys:make-event :kind :up-arrow :shiftp t) *default-key-handlers*)
@@ -897,7 +870,7 @@ if none, surround current atom"
   (end-selection-mode buffer)
   (let ((old (stack buffer)))
     (when-let (new-stack (parent-stack old))
-      (slog* `(moving to ,(butlast new-stack 2))) ; depends on toplevel list
+      (slog* `(moving to ,(butlast new-stack)))
       (setf (goal-stacks buffer) (cons old (when (goal-valid-p buffer)
                                              (goal-stacks buffer)))
             (stack buffer) new-stack))))
@@ -975,7 +948,7 @@ if none, surround current atom"
                      :hoverable t
                      ;; leaf handler never called unless focused
                      :key-handler (when focused
-                                    (global-key-handler node location context))
+                                    (global-key-handler node location))
                      :focused focused))))
 
 (defun is-regular-char-event (event)
@@ -1056,7 +1029,8 @@ if none, surround current atom"
                                     :home-package (parse:home-package node))))
                (swap-node location newnode buffer)
                (if-let (state (completion-state buffer))
-                 (setf (anchor state) newnode)
+                 (setf (completion-state buffer)
+                       (copy-completion-state state :anchor newnode))
                  (when (plusp (length s)) ; now length 2, completion for if
                    (setf (completion-state buffer)
                          (make-completion-state
@@ -1136,7 +1110,7 @@ if none, surround current atom"
                    :location location
                    :hoverable t
                    :key-handler (when focused
-                                  (global-key-handler node location context))
+                                  (global-key-handler node location))
                    :focused focused)))
 
 ;;; binders
@@ -1172,7 +1146,7 @@ if none, surround current atom"
                    :location location
                    :hoverable t
                    :key-handler (when focused
-                                  (global-key-handler node location context))
+                                  (global-key-handler node location))
                    :focused focused)))
 
 (defun render-symbol-space (op loc stack context rect)
@@ -1189,7 +1163,7 @@ with a space after it unless specified."
                           :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
                           :location loc
                           :hoverable t
-                          :key-handler (when focused (global-key-handler op loc context))
+                          :key-handler (when focused (global-key-handler op loc))
                           :focused focused)))
     (tui:puts* text 1 1 rect)
     (setf (view-stack view) (cons loc stack))
@@ -1246,25 +1220,25 @@ convention."
                  (if (eql n 0)
                      (tui:pad 1)
                      (tui:place (rect)
-                                (tui:with-horizontal (rect)
-                                  (when (plusp indent)
-                                    (tui:pad indent))
-                                  (loop
-                                    with count = (case n
-                                                   ((t) 1)
-                                                   ((nil) (length remaining))
-                                                   (otherwise n))
-                                    for i from 0 below count
-                                    with last-elt = nil
-                                    while remaining
-                                    do (let ((element (funcall transform (pop remaining)))
-                                             (loc (funcall locate index)))
-                                         (incf index)
-                                         (unless (or (zerop i) (typep last-elt 'parse:reader-marker))
-                                           (tui:pad 1))
-                                         (tui:place (rect)
-                                                    (apply render element (cons loc stack) context rect keys))
-                                         (setf last-elt element)))))))))))
+                       (tui:with-horizontal (rect)
+                         (when (plusp indent)
+                           (tui:pad indent))
+                         (loop
+                           with count = (case n
+                                          ((t) 1)
+                                          ((nil) (length remaining))
+                                          (otherwise n))
+                           for i from 0 below count
+                           with last-elt = nil
+                           while remaining
+                           do (let ((element (funcall transform (pop remaining)))
+                                    (loc (funcall locate index)))
+                                (incf index)
+                                (unless (or (zerop i) (typep last-elt 'parse:reader-marker))
+                                  (tui:pad 1))
+                                (tui:place (rect)
+                                  (apply render element (cons loc stack) context rect keys))
+                                (setf last-elt element)))))))))))
 
 (defun view-end (view)
   "For placing parens."
@@ -1304,12 +1278,12 @@ convention."
                                              (tui:copy-rect rect :x end-x :y end-y)
                                              rect)))))
             (when (location= handle (focus context))
-              (setf (tui:key-handler open) (global-key-handler l handle context)
+              (setf (tui:key-handler open) (global-key-handler l handle)
                     (tui:focused open) t
                     (gethash :focus-view (redisplay-cache context)) open))
             (make-instance 'ast-view
                            :location (car stack)
-                           :key-handler (global-key-handler l location context)
+                           :key-handler (global-key-handler l location)
                            :focused focused
                            :rect (tui:copy-rect
                                   rect :rows (max 1 (tui:rect-rows (tui:rect inner)))
@@ -1322,7 +1296,7 @@ convention."
                            (make-instance
                             'ast-view
                             :location (car stack)
-                            :key-handler (global-key-handler l location context)
+                            :key-handler (global-key-handler l location)
                             :focused focused
                             :rect (tui:copy-rect
                                    rect :rows (max 1 (tui:rect-rows (tui:rect content)))
@@ -1332,7 +1306,7 @@ convention."
                            (render-delimiter (format nil "~a~a" (car *list-delimiters*)
                                                      (cdr *list-delimiters*))
                                              location stack rect :hoverable t))))
-            (setf (tui:key-handler view) (global-key-handler l location context)
+            (setf (tui:key-handler view) (global-key-handler l location)
                   (tui:focused view) focused)
             view)))))
 
@@ -1343,7 +1317,7 @@ convention."
          (view (render-elements l indent (list-locator location)
                                 (cdr stack) context rect
                                 (when delimited (list :delimited delimited)))))
-    (setf (tui:key-handler view) (global-key-handler l location context)
+    (setf (tui:key-handler view) (global-key-handler l location)
           (tui:focused view) (location= location (focus context)))
     view))
 
@@ -1391,7 +1365,7 @@ convention."
                    :children (list contents)
                    :hoverable t
                    :key-handler (when focused
-                                  (global-key-handler node location context))
+                                  (global-key-handler node location))
                    :focused focused)))
 
 (defmethod render-node ((node parse:literal) stack context rect &key)
@@ -1482,7 +1456,7 @@ convention."
                              :rect (tui:copy-rect rect :rows 1 :cols width
                                                        :y (tui:rect-y2 arg1-rect))
                              :key-handler (global-key-handler (parse:name node)
-                                                              div-loc context)
+                                                              div-loc)
                              :focused (location= div-loc (focus context)))))
        (setf (gethash (parse:name node) (node-views context)) line-view)
        (setf (view-stack line-view) (cons div-loc stack))
@@ -1497,7 +1471,7 @@ convention."
                                                 :rows (+ (tui:rect-rows arg1-rect)
                                                          1 (tui:rect-rows arg2-rect)))
                       :children (list arg1-view line-view arg2-view)
-                      :key-handler (global-key-handler node location context)
+                      :key-handler (global-key-handler node location)
                       :focused (location= location (focus context)))))
     ;; need wrapper for args
     ((and op (not nil))
@@ -1582,7 +1556,7 @@ convention."
                                                       (tui:rect-cols arg2-rect)
                                                       (if arg2-bracketed 1 0)))
                         :children (list arg1-view op-view arg2-view)
-                        :key-handler (global-key-handler node location context)
+                        :key-handler (global-key-handler node location)
                         :focused (location= location (focus context))))))
     (_
      (let* ((location (car stack))
@@ -1609,7 +1583,7 @@ convention."
                       :location location
                       :rect fun-rect
                       :children (list name-view args-view)
-                      :key-handler (global-key-handler node location context)
+                      :key-handler (global-key-handler node location)
                       :focused (location= location (focus context)))))))
 
 ;;; macro calls
@@ -1713,7 +1687,7 @@ its first are aligned with the first, and a loop without keywords has a line per
                    :location location
                    :children (list view)
                    :rect (tui:rect view)
-                   :key-handler (global-key-handler node location context)
+                   :key-handler (global-key-handler node location)
                    :focused (location= location (focus context)))))
 
 (defparameter *macro-call-key-handlers* (make-hash-table :test #'equal))
@@ -1801,7 +1775,7 @@ already and focuses the hole."
                                               :cols (+ (tui:rect-cols op-rect)
                                                        (tui:rect-cols view-rect)))
                           rect)
-                   :key-handler (global-key-handler node location context)
+                   :key-handler (global-key-handler node location)
                    :focused (location= location (focus context)))))
 
 ;;
@@ -1945,7 +1919,7 @@ pairs building new elements of &rest and &body slots."))
                    :location location
                    :children (list vertical)
                    :rect (tui:rect vertical)
-                   :key-handler (global-key-handler node location context)
+                   :key-handler (global-key-handler node location)
                    :focused (location= location (focus context)))))
 
 (defparameter *layout-key-handlers* (make-hash-table :test #'equal)
@@ -2363,7 +2337,7 @@ ASSUMES we never focus a plain list body."
             rect
             :rows (reduce #'+   children :key (lambda (c) (tui:rect-rows (tui:rect c))))
             :cols (reduce #'max children :key (lambda (c) (tui:rect-cols (tui:rect c)))))
-     :key-handler (global-key-handler node location context)
+     :key-handler (global-key-handler node location)
      :focused (location= location (focus context)))))
 
 ;;; global key handlers
@@ -2439,7 +2413,7 @@ addressed by indices."
       (lambda (view buffer)
         (declare (ignore view))
         (let ((stack (stack buffer)))
-          (when (= (length stack) 2)
+          (when (= (length stack) 1)
             (let* ((toplevel (car stack))
                    (i (location-id toplevel)))
               (assert (integerp i))
@@ -2510,16 +2484,36 @@ addressed by indices."
               (focus-first-hole buffer)
               t)))))
 
-;; TODO support a different (debugger) buffer type that uses different key handlers
-;; evaluation TODO display popup evaluated buffer using view anchoring
+(defun reify (object)
+  (typecase object
+    (number (make-instance 'parse:literal :str (princ-to-string object)))
+    (string (make-instance 'parse:literal :str (princ-to-string object)))
+    (character (make-instance 'parse:literal :str (princ-to-string object)))
+    (list (make-instance 'parse:quote-form
+                         :op 'parse:read-quote
+                         :thing (apply #'ref-list (mapcar #'reify object))))
+    (t (ref-list))))
+
+;; TODO capture i/o using gray streams
 (setf (gethash (tui-sys:make-event :kind #\e :altp t) *global-key-handlers*)
       (lambda (view buffer)
-        (declare (ignore view))
-        (let ((stack (stack buffer)))
+        (let ((stack (stack buffer))
+              (rect (transform-rect-to-screen
+                     (tui:rect view) (scroll-state-viewport-row (scroll-state buffer))
+                     (buffer-rect buffer))))
           (handler-bind ((warning #'muffle-warning))
             (parse::with-temporary-interning (interned)
-              (slog (eval (parse::strip-wrappers (parse:to-syntax (node-at (car stack)))
-                                                 interned))))))))
+              (let* ((raw (parse::strip-wrappers
+                           (parse:to-syntax (node-at (car stack)))
+                           interned))
+                     (*standard-output* (make-broadcast-stream))
+                     (res (eval raw)))
+                (slog* (format nil "eval produced ~a" res))
+                (add-buffer
+                 (buffer-ui buffer)
+                 :ast (list (reify res)) :floating t
+                 :package (buffer-package buffer)
+                 :x (tui:rect-x2 rect) :y (tui:rect-y rect))))))))
 
 ;; convert back to hole
 (setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
@@ -2793,7 +2787,7 @@ modifying the ast."
     (dotimes (i (array-total-size buffer) buffer)
       (setf (row-major-aref buffer i) (tui::make-cell)))))
 
-(defun render-one-toplevel (index start forms root-stack buffer rows cols)
+(defun render-one-toplevel (index start forms buffer rows cols)
   "Renders the form at `index' into a segment placed at `start'."
   (loop with form = (nth index forms)
         for capacity = (max 2 (gethash form (stage-cache buffer) rows))
@@ -2803,7 +2797,7 @@ modifying the ast."
                   (rect (tui:make-rect :x 0 :y 0 :rows capacity :cols cols))
                   (location (make-location :node forms :id index)))
              (tui:fill-rect (tui:make-style :bg #x0) rect rect)
-             (let* ((view (render-node form (cons location root-stack) buffer rect))
+             (let* ((view (render-node form (list location) buffer rect))
                     (used (tui:rect-y2 (tui:rect view))))
                ;; equality can mean clipping; require spare space
                (when (< used capacity)
@@ -2820,13 +2814,12 @@ modifying the ast."
   "Returns staged segments and the viewport row revealing the focus."
   (let* ((forms (ast buffer))
          (count (length forms))
-         (index (scroll-position-index scroll))
-         (root-stack (last (stack buffer))))
+         (index (scroll-position-index scroll)))
     ;; keep a predecessor above both anchor and focus for upward movement.
     (loop with viewport = 0
           for i from (max 0 (1- (min index focus-index))) below count
           for start = 0 then (segment-end segment count)
-          for segment = (render-one-toplevel i start forms root-stack buffer
+          for segment = (render-one-toplevel i start forms buffer
                                              screen-rows screen-cols)
           do (translate-view-y (segment-view segment) start)
              (when (and (= i index) (<= index focus-index))
@@ -2855,8 +2848,7 @@ modifying the ast."
 (defun top-level-focus-index (buffer)
   "Returns the top-level index containing the focus in `buffer'. Assumes the toplevel
 is a list and never focused."
-  (let ((len (length (stack buffer))))
-    (location-id (nth (- len 2) (stack buffer)))))
+  (location-id (lastcar (stack buffer))))
 
 (defun translate-view-y (view delta)
   "Moves `view' and its descendants down by `delta' rows."
@@ -2897,7 +2889,7 @@ buffer."
                                                        :y (tui:rect-y bounds)
                                                        :rows height :cols cols)
                                   :children (mapcar #'segment-view segments)
-                                  :key-handler (global-key-handler forms location buffer)
+                                  :key-handler (global-key-handler forms location)
                                   :focused nil))
              (focus-view (gethash :focus-view (redisplay-cache buffer)))
              (rect (tui:rect focus-view))
@@ -2959,7 +2951,7 @@ buffer."
        (let* ((stack (view-stack view))
               (node (node-at (car stack)))
               (rect (transform-rect-to-screen (tui:rect view) offset screen-rect))
-              (real-stack-len (- (length stack) 2))
+              (real-stack-len (1- (length stack)))
               (i (cond
                    ((<= real-stack-len 2)
                     (truncate (svref *early-grayramp* (min 2 real-stack-len))))
@@ -3006,21 +2998,69 @@ buffer."
       (tui:fill-rect (tui:make-style :bg #xb58900)
                      (tui:copy-rect rect :x 0 :y 0) rect :blend 0.7))))
 
-(defun buffer-rect (buffer)
+(defun buffer-outer-rect (buffer)
   "The screen area available to `buffer'"
+  (when (and (floating buffer) (floating-rect buffer))
+    (return-from buffer-outer-rect (floating-rect buffer)))
   (let ((ui (buffer-ui buffer)))
     (tui:make-rect :x (min (buffer-x buffer) (tui:cols ui))
                    :y (min (buffer-y buffer) (tui:rows ui))
                    :rows (max 0 (- (tui:rows ui) (buffer-y buffer)))
                    :cols (max 0 (- (tui:cols ui) (buffer-x buffer))))))
 
-(defun render-buffer (buffer)
-  ;; clear previous redisplay caches
-  (clrhash (node-views buffer))
-  (clrhash (redisplay-cache buffer))
-  (setf (focus-rect buffer) nil
-        (buffer-view buffer) nil)
-  ;; draw
+(defun buffer-rect (buffer)
+  (let* ((rect (buffer-outer-rect buffer))
+         (inset (if (floating buffer) 1 0)))
+    (tui:copy-rect rect
+                   :x (+ (tui:rect-x rect) (min inset (tui:rect-cols rect)))
+                   :y (+ (tui:rect-y rect) (min inset (tui:rect-rows rect)))
+                   :rows (max 0 (- (tui:rect-rows rect) (* 2 inset)))
+                   :cols (max 0 (- (tui:rect-cols rect) (* 2 inset))))))
+
+(defun fit-floating-buffer (buffer)
+  "Fits `buffer' to its contents, keeping its border inside the screen."
+  (let* ((ui (buffer-ui buffer))
+         (rows (max 0 (- (tui:rows ui) 2)))
+         (cols (max 0 (- (tui:cols ui) 2)))
+         (height 0)
+         (width 0))
+    (when (and (plusp rows) (plusp cols))
+      ;; measurement uses separate caches; the final render establishes node views.
+      (let ((measuring (make-buffer :buffer-ui ui :buffer-id (buffer-id buffer)
+                                    :buffer-state (buffer-state buffer))))
+        (loop for index below (length (ast buffer))
+              for segment = (render-one-toplevel index 0 (ast buffer) measuring rows cols)
+              do (incf height (+ (segment-rows segment) (if (zerop index) 0 1)))
+                 (setf width (max width (tui:rect-x2 (tui:rect (segment-view segment))))))))
+    (let ((height (min (tui:rows ui) (+ height 2)))
+          (width (min (tui:cols ui) (+ width 2))))
+      (setf (floating-rect buffer)
+            (tui:make-rect :x (min (buffer-x buffer) (- (tui:cols ui) width))
+                           :y (min (buffer-y buffer) (- (tui:rows ui) height))
+                           :rows height :cols width)))))
+
+(defun draw-buffer-border (buffer)
+  (let* ((rect (buffer-outer-rect buffer))
+         (rows (tui:rect-rows rect))
+         (cols (tui:rect-cols rect))
+         (style (tui:make-style :fg (if (buffer-focused-p buffer) #xb0b0b0 #x606060)
+                                :bg 0)))
+    (when (and (>= rows 2) (>= cols 2))
+      (loop for col from 2 below cols
+            do (tui:put #\─ 1 col rect style)
+               (tui:put #\─ rows col rect style))
+      (loop for row from 2 below rows
+            do (tui:put #\│ row 1 rect style)
+               (tui:put #\│ row cols rect style))
+      (tui:put #\┌ 1 1 rect style)
+      (tui:put #\┐ 1 cols rect style)
+      (tui:put #\└ rows 1 rect style)
+      (tui:put #\┘ rows cols rect style))))
+
+(defun draw-buffer (buffer)
+  (when (floating buffer)
+    (fit-floating-buffer buffer)
+    (draw-buffer-border buffer))
   (let ((bounding-rect (buffer-rect buffer)))
     (when (and (plusp (tui:rect-rows bounding-rect))
                (plusp (tui:rect-cols bounding-rect)))
@@ -3033,6 +3073,18 @@ buffer."
         (draw-semantic-backgrounds buffer content offset bounding-rect)
         (draw-highlights buffer content offset bounding-rect)
         (setf (buffer-view buffer) content)))))
+
+(defun render-buffer (buffer)
+  (let* ((old (render-state buffer))
+         (working (make-buffer
+                   :buffer-ui (buffer-ui buffer)
+                   :buffer-id (buffer-id buffer)
+                   :buffer-state (buffer-state buffer)
+                   :render-state (make-render-state
+                                  :stage-cache (copy-hash-table (stage-cache old))
+                                  :scroll-state (scroll-state old)))))
+    (draw-buffer working)
+    (setf (render-state buffer) (render-state working))))
 
 (defmethod tui:render ((ui ui))
   (tui::clear-buffer tui::*put-buffer*)
@@ -3048,7 +3100,8 @@ buffer."
 ;; note: must go below definitions, next to tui:redisplay
 (let ((render-node-methods (closer-mop:generic-function-methods #'render-node))
       (old-render-method (find-method #'tui:render nil '(ui)))
-      (fnames '(render-buffer render-toplevel-window
+      (fnames '(render-buffer draw-buffer draw-buffer-border fit-floating-buffer buffer-rect
+                buffer-outer-rect render-toplevel-window
                 symbol-ref-text render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements
                 render-layout-slot slot-render-keys
@@ -3069,7 +3122,7 @@ buffer."
           do (setf (fdefinition name) (gethash name funs)))))
 
 (let ((redisplay-failing nil))
-  (defmethod tui:redisplay :around ((ui ui))
+  (defmethod tui:redisplay-internal :around ((ui ui))
     (restart-case
         (unless (redisplayed-since-input ui)
           (call-next-method)
@@ -3106,42 +3159,135 @@ buffer."
   (find-if (lambda (buffer)
              (when-let (view (buffer-view buffer))
                (rect-contains-point-p
-                (tui:clamp-rect (tui:rect view) (buffer-rect buffer)) row col)))
+                (if (floating buffer)
+                    (buffer-outer-rect buffer)
+                    (tui:clamp-rect (tui:rect view) (buffer-rect buffer))) row col)))
            (reverse (buffers ui))))
 
+(defrecord ui-effects ()
+  ((pane-drag :init nil :type (or null pane-drag))
+   (selection :type (or null selection))
+   (zipper :type (or null zipper))
+   (cutbuffer :type (or null cutbuffer))
+   (focused-buffer)
+   (new-buffers :init nil :type list))
+  (:representation :class))
+
+(defun handle-ui-event (ui event)
+  "Returns working buffers and global effects without changing the published `ui'."
+  (let* ((working (shallow-copy-record ui))
+         (originals (buffers ui))
+         (copies (mapcar (lambda (buffer)
+                           (make-buffer :buffer-ui working :buffer-id (buffer-id buffer)
+                                        :buffer-state
+                                        (copy-buffer-state (buffer-state buffer))
+                                        :render-state (render-state buffer)))
+                         originals)))
+    (setf (buffers working) copies
+          (slot-value working 'focused-buffer) (nth (position (focused-buffer ui) originals)
+                                                    copies))
+    (dispatch-ui-event working event)
+    (let ((new (mapcar (lambda (buffer)
+                         (make-buffer :buffer-ui ui :buffer-id (buffer-id buffer)
+                                      :buffer-state (buffer-state buffer)))
+                       (nthcdr (length copies) (buffers working)))))
+      (values copies
+              (make-ui-effects
+               :selection (selection working) :zipper (zipper working)
+               :cutbuffer (cutbuffer working) :new-buffers new
+               :pane-drag (pane-drag working)
+               :focused-buffer (find (buffer-id (focused-buffer working))
+                                     (append originals new) :key #'buffer-id))))))
+
 (defmethod tui:dispatch-event ((ui ui) event)
+  (let ((revision (revision ui)))
+    (multiple-value-bind (copies effects) (handle-ui-event ui event)
+      ;; This is necessary to handle reentrancy as recursive dispatch may
+      ;; already have published a newer state, in which case we don't commit
+      (when (= revision (revision ui))
+        (loop for buffer in (buffers ui) for copy in copies
+              do (setf (buffer-state buffer) (buffer-state copy)))
+        (setf (buffers ui) (append (buffers ui) (new-buffers effects)))
+        (setf (pane-drag ui) (pane-drag effects)
+              (selection ui) (selection effects)
+              (zipper ui) (zipper effects)
+              (cutbuffer ui) (cutbuffer effects)
+              (slot-value ui 'focused-buffer) (focused-buffer effects))
+        (incf (revision ui))))))
+
+(defun handle-pane-drag (ui event target)
+  "Moves a captured pane until mouse release, consuming the associated events."
+  (when (tui:mouse-event-p event)
+    (let* ((mouse (tui:event-kind event))
+           (state (tui:mouse-data-state mouse))
+           (drag (pane-drag ui)))
+      (cond
+        ((eq state :release)
+         (setf (pane-drag ui) nil)
+         (not (null drag)))
+        (drag
+         (when (eq state :drag)
+           (when-let (buffer (find (pane-drag-buffer-id drag) (buffers ui)
+                                  :key #'buffer-id))
+             (let ((rect (buffer-outer-rect buffer)))
+               (setf (buffer-x buffer)
+                     (max 0 (min (- (tui:mouse-data-col mouse) (pane-drag-offset-x drag))
+                                 (- (tui:cols ui)
+                                    (if (floating buffer) (tui:rect-cols rect) 1)))))
+               (setf (buffer-y buffer)
+                     (max 0 (min (- (tui:mouse-data-row mouse) (pane-drag-offset-y drag))
+                                 (- (tui:rows ui)
+                                    (if (floating buffer) (tui:rect-rows rect) 1))))))))
+         t)
+        ((and target (eq state :click) (eq (tui:mouse-data-button mouse) :left)
+              (tui:event-altp event))
+         (let ((rect (buffer-outer-rect target)))
+           (setf (focused-buffer ui) target)
+           (setf (pane-drag ui)
+                 (make-pane-drag
+                  :buffer-id (buffer-id target)
+                  :offset-x (- (tui:mouse-data-col mouse) (tui:rect-x rect))
+                  :offset-y (- (tui:mouse-data-row mouse) (tui:rect-y rect)))))
+         t)))))
+
+(defun dispatch-ui-event (ui event)
   (let* ((mouse (when (tui:mouse-event-p event) (tui:event-kind event)))
+         ;; currently only completion
          (overlay (when (and mouse (tui:root-view ui))
                     (find-if (lambda (view)
                                (rect-contains-point-p (tui:rect view)
                                                       (tui:mouse-data-row mouse)
                                                       (tui:mouse-data-col mouse)))
-                             (reverse (tui:children (tui:root-view ui))))))
+                             (tui:children (tui:root-view ui)))))
          (target (when mouse
                    (buffer-at-point ui (tui:mouse-data-row mouse)
                                     (tui:mouse-data-col mouse)))))
+    (when (handle-pane-drag ui event (unless overlay target))
+      (return-from dispatch-ui-event))
+    ;; completion should capture events early
     (when overlay
-      (tui:view-traverse overlay
-                         (lambda (view)
-                           (funcall (tui:mouse-handler view) view event)
-                           t))
-      (return-from tui:dispatch-event nil))
+      (tui:view-traverse overlay (lambda (view)
+                                   (funcall (tui:mouse-handler view) view event)
+                                   t))
+      (return-from dispatch-ui-event))
+    ;;
     (when (and target (eq (tui:mouse-data-state mouse) :click)
                (member (tui:mouse-data-button mouse) '(:left :middle :right)))
       (setf (focused-buffer ui) target))
+    ;;
     (when-let* ((buffer (focused-buffer ui))
                 (view (buffer-view buffer)))
       (when (or (not mouse) (eq target buffer))
         (let ((event (translate-mouse-event
                       event (- (scroll-state-viewport-row (scroll-state buffer))
-                               (buffer-y buffer))
-                      (- (buffer-x buffer)))))
+                               (tui:rect-y (buffer-rect buffer)))
+                      (- (tui:rect-x (buffer-rect buffer))))))
           (tui:view-traverse
            view (lambda (view)
                   (if mouse
                       (funcall (tui:mouse-handler view) view event)
                       (when (tui:focused view)
-                        (funcall (tui:key-handler view) view event)))
+                        (funcall (tui:key-handler view) view event buffer)))
                   t)))))))
 
 (defmethod tui:dispatch-event :around ((ui ui) event)
@@ -3156,8 +3302,7 @@ buffer."
 (defmethod tui:dispatch-event :after ((ui ui) event)
   (declare (ignore event))
   (setf (redisplayed-since-input ui) nil)
-  (tui:redisplay ui)
-  (setf (redisplayed-since-input ui) t))
+  (setf (redisplayed-since-input ui) (tui:redisplay ui)))
 
 (defmethod tui:handle-resize :after ((ui ui))
   (setf (redisplayed-since-input ui) nil))

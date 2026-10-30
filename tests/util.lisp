@@ -27,13 +27,12 @@
                     ((listp parsed) parsed)
                     (t (list parsed))))
          (ui (make-instance 'w::ui)))
-    (w::make-buffer ui :ast ast)))
+    (w::add-buffer ui :ast ast :package *package*)))
 
 (defun goto (ui &rest path)
   "Focuses `path' from the first root"
   (setf (w::stack ui) (last (w::stack ui)))
-  (when (= 1 (length (w::ast ui)))
-    (w::descend ui 0))
+  (w::refocus ui (if (= 1 (length (w::ast ui))) 0 (pop path)))
   (dolist (id path ui)
     (w::descend ui id)))
 
@@ -88,11 +87,11 @@
 (defun press (ui &rest keys)
   (dolist (key keys ui)
     (lines ui)
-    (funcall (w::global-key-handler (w::node-at (w::focus ui)) (w::focus ui) ui)
-             nil (event key))))
+    (funcall (w::global-key-handler (w::node-at (w::focus ui)) (w::focus ui))
+             nil (event key) ui)))
 
 (defun focus-path (ui)
-  (let ((path (reverse (mapcar #'w::location-id (butlast (w::stack ui))))))
+  (let ((path (reverse (mapcar #'w::location-id (w::stack ui)))))
     (if (= 1 (length (w::ast ui))) (rest path) path)))
 
 (defun focused (ui)

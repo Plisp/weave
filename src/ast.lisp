@@ -1935,8 +1935,8 @@ Any binding forces a symbol match.
                  (append ,@(loop for tag in optional-slots
                                  collect `(unless ,tag (list ',tag))))
                  :op (if (typep (gen-car rawform) 'reader-marker)
-                                     ',(symbolicate "READ-" name)
-                                     ',name)
+                         ',(symbolicate "READ-" name)
+                         ',name)
                  ,@(loop
                     for tag in slots
                     for entries := (plist-alist (cdr (assoc tag binds)))

@@ -89,12 +89,12 @@
     (check-type ast-list cons)
     (let ((tui (make-instance 'ui)))
       (setf *state* tui)
-      (make-buffer tui :ast ast-list :source source :package package)
+      (add-buffer tui :ast ast-list :source source :package package)
       ;; set default background to black and foreground to pure white (xterm extension)
       (format *terminal-io* "~c]10;#ffffff~c" #\esc (code-char 7))
       (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))
       (unwind-protect
-           (tui:run tui :redisplay-on-input t)
+           (tui:run tui :redisplay-on-input t :mouse :hover)
         (slog *log-stop*)))))
 
 (defun main (&optional (file (first (uiop:command-line-arguments))))

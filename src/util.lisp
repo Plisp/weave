@@ -11,7 +11,7 @@
            #:string-drop #:split-string
            #:flex-vector
            #:external-symbol-p
-           #:defrecord
+           #:defrecord #:shallow-copy-record
            ))
 (in-package #:weave-utils)
 
@@ -194,3 +194,11 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
                     collect `(,slot-name ,initform :type ,slot-type
                                                    :read-only ,(not mutable))))
               ',name)))))))
+
+(defun shallow-copy-record (record)
+  "Copies the bound slots of the class-backed `record', sharing their values."
+  (let ((copy (allocate-instance (class-of record))))
+    (dolist (slot (closer-mop:class-slots (class-of record)) copy)
+      (let ((name (closer-mop:slot-definition-name slot)))
+        (when (slot-boundp record name)
+          (setf (slot-value copy name) (slot-value record name)))))))
