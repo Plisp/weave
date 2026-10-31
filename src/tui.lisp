@@ -452,11 +452,61 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
              ,value
              (setf (gethash ,key (redisplay-cache ,buffer)) (progn ,@body)))))))
 
-(defun environment-at (stack)
+(defvar *render-environments*)
+
+(defun environment-table (node)
+  (or (gethash node *render-environments*)
+      (setf (gethash node *render-environments*) (make-hash-table :test #'equal))))
+
+(defun prepare-form-environments (location)
+  "Visits a staged form once, associating its locations with lexical environments."
+  (when (not (nth-value 1 (gethash (location-id location)
+                                   (environment-table (location-node location)))))
+    (labels ((visit (loc outer)
+               (let* ((node (location-node loc))
+                      (id (location-id loc))
+                      (table (environment-table node))
+                      ;; body elements of ordinary forms share a scope
+                      (scope-id (if (and (consp id) (eq (car id) 'parse:body)
+                                         (not (typep node 'parse:macro-call)))
+                                    '(parse:body 0) id))
+                      (env (if (member (locsort loc) '(parse:eval-form parse:function-code))
+                               (or (gethash scope-id table)
+                                   (setf (gethash scope-id table)
+                                         (parse:location-env node id outer)))
+                               outer))
+                      (value (node-at loc)))
+                 (setf (gethash id table) env)
+                 (cond
+                   ((gen-list-p value)
+                    (loop for i below (length (elements value))
+                          do (visit (make-location :node node :id (append-id id i)) env)))
+                   ((typep value 'parse:function-code)
+                    (dolist (slot '(parse:lambda-list parse:body))
+                      (visit (make-location :node value :id slot) env)))
+                   (t
+                    (dolist (slot (remove-duplicates
+                                   (append (mapcar #'car (parse:form-slot-kinds
+                                                          (type-of value)))
+                                           (typecase value
+                                             (parse:function-call '(parse:name))
+                                             (parse:macro-call '(parse:op))))))
+                      (when (slot-boundp value slot)
+                        (visit (make-location :node value :id slot) env))))))))
+      (visit location (parse:make-env)))))
+
+(defun uncached-environment-at (stack)
   (let ((env (parse:make-env)))
-    (dolist (loc (reverse stack) env)
+    (dolist (loc (reverse stack))
       (when (member (locsort loc) '(parse:eval-form parse:function-code))
-        (setf env (parse:location-env (location-node loc) (location-id loc) env))))))
+        (setf env (parse:location-env (location-node loc) (location-id loc) env))))
+    env))
+
+(defun environment-at (stack)
+  (declare (type list stack))
+  (let ((loc (car stack)))
+    (or (gethash (location-id loc) (environment-table (location-node loc)))
+        (uncached-environment-at stack))))
 
 (defun compute-focus-binder (node stack buffer)
   (declare (ignore buffer))
@@ -1207,7 +1257,7 @@ convention."
 
 (defparameter *column-limit* 92)
 
-(defvar *measurement-scratch* nil)
+(defvar *measurement-scratch*)
 
 (defun ensure-measurement-scratch (rect)
   "Grows the shared scratch array without invalidating recursive bindings to it."
@@ -1225,9 +1275,7 @@ convention."
 
 (defun measure-node (node stack context rect &rest keys)
   "Renders geometry into shared scratch cells and clears the touched rect on exit."
-  (let* ((*measurement-scratch* (or *measurement-scratch*
-                                    (make-array '(0 0) :adjustable t)))
-         (tui::*put-buffer* (ensure-measurement-scratch rect))
+  (let* ((tui::*put-buffer* (ensure-measurement-scratch rect))
          (touched rect))
     (unwind-protect
          (let ((view (apply #'render-node node stack context rect keys)))
@@ -1493,13 +1541,12 @@ convention."
          (bounds (tui:copy-rect rect :y 0 :cols limit))
          (widths (loop for arg in arguments for index from 0
                        collect (tui:rect-cols
-                                (tui:rect
-                                 (measure-node arg
-                                              (cons (make-location
-                                                     :node node
-                                                     :id (list 'parse:body index))
-                                                    stack)
-                                              measuring bounds)))))
+                                (tui:rect (measure-node arg
+                                                        (cons (make-location
+                                                               :node node
+                                                               :id (list 'parse:body index))
+                                                              stack)
+                                                        measuring bounds)))))
          (keyword-start (function-keyword-start node stack)))
     (labels ((fits (widths)
                (<= (+ (reduce #'+ widths :initial-value 0)
@@ -2924,6 +2971,7 @@ modifying the ast."
 
 (defun render-one-toplevel (index start forms buffer rows cols)
   "Renders the form at `index' into a segment placed at `start'."
+  (prepare-form-environments (make-location :node forms :id index))
   (loop with form = (nth index forms)
         for capacity = (max 2 (gethash form (stage-cache buffer) rows))
           then (* 2 capacity)
@@ -3162,6 +3210,7 @@ buffer."
               for segment = (render-one-toplevel index 0 (ast buffer) measuring rows cols)
               do (incf height (+ (segment-rows segment) (if (zerop index) 0 1)))
                  (setf width (max width (tui:rect-x2 (tui:rect (segment-view segment))))))))
+    ;; add back border and render for real after measuring
     (let ((height (min (tui:rows ui) (+ height 2)))
           (width (min (tui:cols ui) (+ width 2))))
       (setf (floating-rect buffer)
@@ -3218,7 +3267,8 @@ buffer."
 
 (defmethod tui:render :around ((ui ui))
   ;; a recursive redisplay needs to own its scratch space
-  (let ((*measurement-scratch* (make-array '(0 0) :adjustable t)))
+  (let ((*measurement-scratch* (make-array '(0 0) :adjustable t))
+        (*render-environments* (make-hash-table :test #'eq)))
     (call-next-method)))
 
 (defmethod tui:render ((ui ui))
@@ -3261,9 +3311,12 @@ buffer."
   (defmethod tui:redisplay-internal :around ((ui ui))
     (restart-case
         (unless (redisplayed-since-input ui)
-          (call-next-method)
-          (setf redisplay-failing nil)
-          (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'redisplay-done)))
+          (with-timing (lambda (time)
+                         (slog* (format nil "~aRedisplay done in ~Ams"
+                                        (make-string 70 :initial-element #\-)
+                                        (truncate time 1000))))
+            (call-next-method))
+          (setf redisplay-failing nil))
       (restore-ui-fallback ()
         :report "restore broken redisplay methods, exit if still failing"
         (reset-ui)

@@ -12,6 +12,7 @@
            #:flex-vector
            #:external-symbol-p
            #:defrecord #:shallow-copy-record
+           #:with-timing
            ))
 (in-package #:weave-utils)
 
@@ -202,3 +203,9 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
       (let ((name (closer-mop:slot-definition-name slot)))
         (when (slot-boundp record name)
           (setf (slot-value copy name) (slot-value record name)))))))
+
+(defmacro with-timing (printer &body body)
+  (with-gensyms (begin)
+    `(let ((,begin (get-internal-real-time)))
+       ,@body
+       (funcall ,printer (- (get-internal-real-time) ,begin)))))
