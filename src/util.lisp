@@ -90,8 +90,8 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
 
 (define-constant +fail+ (list t) :test 'equal)
 
-(defun string-drop (s n)
-  (subseq s 0 (- (length s) n)))
+(defun string-drop (string n)
+  (subseq string 0 (- (length string) n)))
 
 (defun split-string (text c)
   (loop for start = 0 then (1+ end)
@@ -102,8 +102,8 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
 (defun flex-vector ()
   (make-array 0 :fill-pointer t :adjustable t))
 
-(defun external-symbol-p (s p)
-  (eq :external (nth-value 1 (find-symbol s p))))
+(defun external-symbol-p (sym package)
+  (eq :external (nth-value 1 (find-symbol sym package))))
 
 (defmacro defrecord (name superclasses slots &rest options)
   "Define `name' with `superclasses' and `slots', using classes unless :REPRESENTATION

@@ -2,6 +2,10 @@
 ;;;; terminal frontend
 ;;;;
 ;;
+;; note: if a function takes a single rect argument, then any geometry it returns is in the
+;; same space as the supplied bounds unless specified.
+;; Importantly, the render-* functions produce rendered views with rects relative to
+;; their parent buffer's top left corner.
 
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
@@ -159,25 +163,31 @@ If this returns NIL, propagate up the cursor stack.")
 
 ;; computed during redisplay from current toplevel
 (defrecord segment ()
+  ;; toplevel ast index
   ((index :type (integer 0))
+   ;; starting y-offset relative to staging coordinates
    (start :type (integer 0))
    (rows :type (integer 1))
+   ;; local buffer containing only this segment for blitting
    (buffer :type (array tui::cell (* *)))
+   ;; has staging coordinates
    (view :type tui:view))
   (:representation :struct))
 
-;; segment index + relative row offset
+;; top of screen view anchor
 (defrecord scroll-position ()
+  ;; toplevel ast index
   ((index :type (integer 0))
+   ;; row offset from start of rendered toplevel form
    (row :init 0 :type (integer 0)))
   (:representation :struct))
 
 (defrecord scroll-state ()
   ((position :type scroll-position)
-   ;; total number of rows
+   ;; total rows staged
    (rows :type (integer 0))
-   ;; start of viewport
-   (viewport-row :type (integer 0))
+   ;; viewport: an offset relative to staging coordinates
+   (viewport :type (integer 0))
    (segments :type list))
   (:representation :struct))
 
@@ -205,6 +215,7 @@ If this returns NIL, propagate up the cursor stack.")
   ((floating :init nil :mutable t :type boolean)
    (buffer-package :init *package* :mutable t :type package)
    (buffer-source :init nil :mutable t :type (or null pathname))
+   ;; screen coordinates
    (buffer-x :init 0 :mutable t :type (integer 0))
    (buffer-y :init 0 :mutable t :type (integer 0))
    (ast :mutable t)
@@ -222,13 +233,16 @@ If this returns NIL, propagate up the cursor stack.")
 
 ;; mutable per-render cache, needed for movement commands
 (defrecord render-state ()
+  ;; rect has absolute coordinates
   ((floating-rect :init nil :mutable t :type (or null tui:rect))
+   ;; has staging coordinates
    (buffer-view :init nil :mutable t :type (or null tui:view))
    (stage-cache :init (make-hash-table :test #'eq) :type hash-table)
    (redisplay-cache :init (make-hash-table :test #'equal) :type hash-table)
    (scroll-state :init (make-scroll-state :position (make-scroll-position :index 0)
-                                          :rows 0 :viewport-row 0 :segments nil)
+                                          :rows 0 :viewport 0 :segments nil)
                  :mutable t :type scroll-state)
+   ;; both below use staging coordinates
    (focus-rect :init nil :mutable t :type (or null tui:rect))
    (node-views :init (make-hash-table) :type hash-table))
   (:representation :class))
@@ -260,7 +274,8 @@ If this returns NIL, propagate up the cursor stack.")
 
 (defun add-buffer (ui &key (ast (list (hole))) (x 0) (y 0)
                         source (package "CL-USER") floating)
-  "Adds a buffer containing `ast' to `ui', optionally associated with `source'."
+  "Adds a buffer containing `ast' to `ui', optionally associated with `source'.
+The anchor coordinates X, Y are absolute."
   (check-type ast cons)
   (let ((buffer (make-buffer
                  :buffer-ui ui
@@ -441,7 +456,8 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
           (edit-loc buffer) newloc)))
 
 ;;; rendering helpers
-(defgeneric render-node (node stack context rect &key &allow-other-keys))
+(defgeneric render-node (node stack context rect &key &allow-other-keys)
+  (:documentation "Drawn contents MUST fit within the provided `rect'."))
 
 (defmacro with-redisplay-cache ((buffer key) &body body)
   "The value of `body', computed once per redisplay of `buffer' for `key'."
@@ -458,8 +474,8 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
   (or (gethash node *render-environments*)
       (setf (gethash node *render-environments*) (make-hash-table :test #'equal))))
 
-(defun prepare-form-environments (location)
-  "Visits a staged form once, associating its locations with lexical environments."
+(defun precompute-form-environments (location)
+  "Visits a staged toplevel form once, associating its locations with lexical environments."
   (when (not (nth-value 1 (gethash (location-id location)
                                    (environment-table (location-node location)))))
     (labels ((visit (loc outer)
@@ -670,6 +686,7 @@ if none, surround current atom"
 ;; ASSUME leaf nodes are non-overlapping
 ;; we index them into an array of blocks sorted by line then column
 (defun build-atom-array (tree rows)
+  "Coordinates produced are in staging coordinates."
   (let ((rows (make-array rows :initial-element (list))))
     (tui:view-traverse tree (lambda (view)
                               (when (and (typep view 'ast-view)
@@ -681,8 +698,9 @@ if none, surround current atom"
               rows)))
 
 (defun view-below (atom-array y col)
-  "Takes a y-offset from 0 to rows, this way it's possible to search the first row.
-`col' should essentially indicate some preferred column. Returns NIL if not found."
+  "Takes a y-offset from 0 to rows (relative to staging coordinates),
+this way it's possible to search the first row. `col' should indicate some preferred
+column. Returns NIL if not found."
   ;; note: must bounds-check y first
   (let ((new-y (position-if-not #'null atom-array :start y)))
     (or new-y (return-from view-below nil))
@@ -954,7 +972,9 @@ if none, surround current atom"
                                    (tui:make-style :fg #x0 :underlinep t)
                                    (tui:make-style :fg (tui:color 30 200 0) :underlinep t)))
       (make-instance 'ast-view
-                     :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                     :rect (tui:clamp-rect
+                            (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                            rect)
                      :location location
                      :hoverable t
                      ;; leaf handler never called unless focused
@@ -1112,7 +1132,9 @@ if none, surround current atom"
          (focused (location= location (focus context))))
     (tui:puts* str 1 1 rect)
     (make-instance 'ast-view
-                   :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                   :rect (tui:clamp-rect
+                          (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                          rect)
                    :location location
                    :hoverable t
                    :key-handler (when focused
@@ -1148,7 +1170,9 @@ if none, surround current atom"
          (focused (location= location (focus context))))
     (tui:puts* str 1 1 rect (tui:make-style :italicp t))
     (make-instance 'ast-view
-                   :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                   :rect (tui:clamp-rect
+                          (tui:copy-rect rect :rows 1 :cols (tui:display-width str))
+                          rect)
                    :location location
                    :hoverable t
                    :key-handler (when focused
@@ -1166,7 +1190,9 @@ with a space after it unless specified."
          (focused (location= loc (focus context)))
          (view
            (make-instance 'ast-view
-                          :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                          :rect (tui:clamp-rect
+                                 (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                                 rect)
                           :location loc
                           :hoverable t
                           :key-handler (when focused (global-key-handler op loc))
@@ -1194,7 +1220,9 @@ with a space after it unless specified."
 (defun render-delimiter (text loc stack rect &key hoverable)
   (let ((view
           (make-instance 'ast-view
-                         :rect (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                         :rect (tui:clamp-rect
+                                (tui:copy-rect rect :rows 1 :cols (tui:display-width text))
+                                rect)
                          :location loc
                          :hoverable hoverable)))
     (tui:puts* text 1 1 rect)
@@ -1249,7 +1277,7 @@ convention."
                                 (setf last-elt element)))))))))))
 
 (defun view-end (view)
-  "For placing parens."
+  "For placing parens, relative to staging coordinates."
   (if-let (children (tui:children view))
     (view-end (lastcar children))
     (let ((r (tui:rect view)))
@@ -1257,10 +1285,11 @@ convention."
 
 (defparameter *column-limit* 92)
 
+;; note: must be adjustable, bound to *put-buffer* during measurement
 (defvar *measurement-scratch*)
 
 (defun ensure-measurement-scratch (rect)
-  "Grows the shared scratch array without invalidating recursive bindings to it."
+  "Grows the shared scratch array at least to the size of `rect'."
   (let* ((cells *measurement-scratch*)
          (old-rows (array-dimension cells 0))
          (old-cols (array-dimension cells 1))
@@ -1274,13 +1303,12 @@ convention."
     cells))
 
 (defun measure-node (node stack context rect &rest keys)
-  "Renders geometry into shared scratch cells and clears the touched rect on exit."
+  "Returns the rendered rectangle in the same coordinate space as `rect'.
+Uses shared scratch cells and clears the touched scratch area on exit."
   (let* ((tui::*put-buffer* (ensure-measurement-scratch rect))
          (touched rect))
     (unwind-protect
-         (let ((view (apply #'render-node node stack context rect keys)))
-           (setf touched (tui:clamp-rect (tui:rect view) rect))
-           view)
+         (setf touched (tui:rect (apply #'render-node node stack context rect keys)))
       (loop for y from (tui:rect-y touched) below (tui:rect-y2 touched)
             do (loop for x from (tui:rect-x touched) below (tui:rect-x2 touched)
                      for cell = (aref tui::*put-buffer* y x)
@@ -1304,18 +1332,18 @@ convention."
                (let ((head (apply #'measure-node (funcall transform (car elements))
                                   (cons (funcall locate 0) stack)
                                   measuring bounds keys)))
-                 (< (tui:rect-cols (tui:rect head)) 10)))
+                 (< (tui:rect-cols head) 10)))
       (return-from ref-list-indentation '((0 . nil))))
     (loop for original in elements
           for index from 0
           for element = (funcall transform original)
-          for view = (apply #'measure-node element (cons (funcall locate index) stack)
+          for measured = (apply #'measure-node element (cons (funcall locate index) stack)
                             measuring bounds keys)
-          for size = (tui:rect-cols (tui:rect view))
+          for size = (tui:rect-cols measured)
           for gap = (if (or (zerop count)
                             (and (= index 1) (parse:unary-reader-marker-p previous)))
                         0 1)
-          do (when (> (tui:rect-rows (tui:rect view)) 1)
+          do (when (> (tui:rect-rows measured) 1)
                (return-from ref-list-indentation '((0 . 1))))
              ;; line wrap
              (when (and (plusp count) (> (+ used gap size) max-width))
@@ -1367,11 +1395,13 @@ convention."
                            :location (car stack)
                            :key-handler (global-key-handler l location)
                            :focused focused
-                           :rect (tui:copy-rect
-                                  rect :rows (max 1 (tui:rect-rows (tui:rect inner)))
-                                  :cols (- (max (tui:rect-x2 (tui:rect inner))
-                                                (tui:rect-x2 (tui:rect close)))
-                                           (tui:rect-x rect)))
+                           :rect (tui:clamp-rect
+                                  (tui:copy-rect
+                                   rect :rows (max 1 (tui:rect-rows (tui:rect inner)))
+                                   :cols (- (max (tui:rect-x2 (tui:rect inner))
+                                                 (tui:rect-x2 (tui:rect close)))
+                                            (tui:rect-x rect)))
+                                  rect)
                            :children (list open inner close)))
           (let* ((content (contents rect))
                  (view (if (elements l)
@@ -1380,10 +1410,12 @@ convention."
                             :location (car stack)
                             :key-handler (global-key-handler l location)
                             :focused focused
-                            :rect (tui:copy-rect
-                                   rect :rows (max 1 (tui:rect-rows (tui:rect content)))
-                                        :cols (- (tui:rect-x2 (tui:rect content))
-                                                 (tui:rect-x rect)))
+                            :rect (tui:clamp-rect
+                                   (tui:copy-rect
+                                    rect :rows (max 1 (tui:rect-rows (tui:rect content)))
+                                         :cols (- (tui:rect-x2 (tui:rect content))
+                                                  (tui:rect-x rect)))
+                                   rect)
                             :children (list content))
                            (render-delimiter (format nil "~a~a" (car *list-delimiters*)
                                                      (cdr *list-delimiters*))
@@ -1426,8 +1458,10 @@ convention."
 (defun render-literal-line (line stack context rect &key style)
   (declare (ignore stack context))
   (tui:puts* line 1 1 rect style)
-  (make-instance 'tui:view :rect (tui:copy-rect rect :rows 1
-                                                     :cols (tui:display-width line))))
+  (make-instance 'tui:view
+                 :rect (tui:clamp-rect
+                        (tui:copy-rect rect :rows 1 :cols (tui:display-width line))
+                        rect)))
 
 (defparameter *horizontal* '((0 . nil)))
 (defparameter *vertical* '((0 . t)))
@@ -1541,12 +1575,12 @@ convention."
          (bounds (tui:copy-rect rect :y 0 :cols limit))
          (widths (loop for arg in arguments for index from 0
                        collect (tui:rect-cols
-                                (tui:rect (measure-node arg
-                                                        (cons (make-location
-                                                               :node node
-                                                               :id (list 'parse:body index))
-                                                              stack)
-                                                        measuring bounds)))))
+                                (measure-node arg
+                                              (cons (make-location
+                                                     :node node
+                                                     :id (list 'parse:body index))
+                                                    stack)
+                                              measuring bounds))))
          (keyword-start (function-keyword-start node stack)))
     (labels ((fits (widths)
                (<= (+ (reduce #'+ widths :initial-value 0)
@@ -1596,8 +1630,10 @@ convention."
               (make-instance 'ast-view
                              :location div-loc
                              :hoverable t
-                             :rect (tui:copy-rect rect :rows 1 :cols width
+                             :rect (tui:clamp-rect
+                                    (tui:copy-rect rect :rows 1 :cols width
                                                        :y (tui:rect-y2 arg1-rect))
+                                    rect)
                              :key-handler (global-key-handler (parse:name node)
                                                               div-loc)
                              :focused (location= div-loc (focus context)))))
@@ -1610,9 +1646,11 @@ convention."
        ;;
        (make-instance 'ast-view
                       :location location
-                      :rect (tui:copy-rect rect :cols width
+                      :rect (tui:clamp-rect
+                             (tui:copy-rect rect :cols width
                                                 :rows (+ (tui:rect-rows arg1-rect)
                                                          1 (tui:rect-rows arg2-rect)))
+                             rect)
                       :children (list arg1-view line-view arg2-view)
                       :key-handler (global-key-handler node location)
                       :focused (location= location (focus context)))))
@@ -1690,7 +1728,8 @@ convention."
                    (tui:put* #\⎠ (tui:rect-rows arg2-rect) rcol rect)))))
          (make-instance 'ast-view
                         :location location
-                        :rect (tui:copy-rect rect
+                        :rect (tui:clamp-rect
+                               (tui:copy-rect rect
                                              :rows (max (tui:rect-rows arg1-rect)
                                                         (tui:rect-rows arg2-rect))
                                              :cols (+ (tui:rect-cols arg1-rect)
@@ -1698,6 +1737,7 @@ convention."
                                                       2 (tui:rect-cols op-rect)
                                                       (tui:rect-cols arg2-rect)
                                                       (if arg2-bracketed 1 0)))
+                               rect)
                         :children (list arg1-view op-view arg2-view)
                         :key-handler (global-key-handler node location)
                         :focused (location= location (focus context))))))
@@ -1824,7 +1864,7 @@ its first are aligned with the first, and a loop without keywords has a line per
          (rows nil))
     (labels ((width (form index)
                (let* ((parsed (or (car (gethash form (parse:subforms node))) form))
-                      (view (measure-node
+                      (measured (measure-node
                              parsed (cons (make-location :node node
                                                          :id (list 'parse:body index))
                                           stack)
@@ -1832,7 +1872,7 @@ its first are aligned with the first, and a loop without keywords has a line per
                              :transform (lambda (elt)
                                           (or (car (gethash elt (parse:subforms node)))
                                               elt)))))
-                 (tui:rect-cols (tui:rect view)))))
+                 (tui:rect-cols measured))))
       (loop for tail on (parse:body node) by #'cddr
             for index from 0 by 2
             for firstp = (zerop index)
@@ -2515,10 +2555,12 @@ ASSUMES we never focus a plain list body."
      'ast-view
      :location location
      :children children
-     :rect (tui:copy-rect
-            rect
-            :rows (reduce #'+   children :key (lambda (c) (tui:rect-rows (tui:rect c))))
-            :cols (reduce #'max children :key (lambda (c) (tui:rect-cols (tui:rect c)))))
+     :rect (tui:clamp-rect
+            (tui:copy-rect
+             rect
+             :rows (reduce #'+   children :key (lambda (c) (tui:rect-rows (tui:rect c))))
+             :cols (reduce #'max children :key (lambda (c) (tui:rect-cols (tui:rect c)))))
+            rect)
      :key-handler (global-key-handler node location)
      :focused (location= location (focus context)))))
 
@@ -2680,8 +2722,8 @@ addressed by indices."
 (setf (gethash (tui-sys:make-event :kind #\e :altp t) *global-key-handlers*)
       (lambda (view buffer)
         (let ((stack (stack buffer))
-              (rect (transform-rect-to-screen
-                     (tui:rect view) (scroll-state-viewport-row (scroll-state buffer))
+              (rect (staging-to-absolute-coordinates ; screen-absolute coordinates
+                     (tui:rect view) (scroll-state-viewport (scroll-state buffer))
                      (buffer-rect buffer))))
           (handler-bind ((warning #'muffle-warning))
             (parse::with-temporary-interning (interned)
@@ -2937,7 +2979,7 @@ modifying the ast."
                                :italicp nil
                                :reversep nil
                                :underlinep nil)))
-        (tui:fill-rect (style nil) (tui:copy-rect rect :x 0 :y 0 :rows 1) rect
+        (tui:fill-rect (style nil) (tui:copy-rect rect :rows 1)
                        :char #\space)
         (tui:puts* (string-downcase prefix) 1 1 rect (style t))
         (tui:puts* (string-downcase
@@ -2969,43 +3011,63 @@ modifying the ast."
     (dotimes (i (array-total-size buffer) buffer)
       (setf (row-major-aref buffer i) (tui::make-cell)))))
 
-(defun render-one-toplevel (index start forms buffer rows cols)
-  "Renders the form at `index' into a segment placed at `start'."
-  (prepare-form-environments (make-location :node forms :id index))
+(defun render-one-toplevel (index start forms buffer screen-rows cols)
+  "Renders the form at `index' into a segment placed at `start', relative to the staging
+coordinates. `cols' is a strict bound on the render's width.
+`screen-rows' is a hint, as staging may draw clipped portions beyond the screen's limits.
+The returned view uses staging coordinates but all drawing is done to a local buffer."
+  (precompute-form-environments (make-location :node forms :id index))
   (loop with form = (nth index forms)
-        for capacity = (max 2 (gethash form (stage-cache buffer) rows))
+        ;; cap=1 would always retry since the render will use a positive number of rows
+        for capacity = (max 2 (gethash form (stage-cache buffer) screen-rows))
           then (* 2 capacity)
         for cells = (make-cell-buffer capacity cols)
         do (let* ((tui::*put-buffer* cells)
                   (rect (tui:make-rect :x 0 :y 0 :rows capacity :cols cols))
                   (location (make-location :node forms :id index)))
-             (tui:fill-rect (tui:make-style :bg #x0) rect rect)
+             (tui:fill-rect (tui:make-style :bg #x0) rect)
              (let* ((view (render-node form (list location) buffer rect))
                     (used (tui:rect-y2 (tui:rect view))))
                ;; equality can mean clipping; require spare space
                (when (< used capacity)
+                 ;; slightly >1 to avoid thrashing on insertions
                  (setf (gethash form (stage-cache buffer)) (ceiling (* 1.2 used)))
+                 (tui:view-traverse
+                  view
+                  (lambda (v)
+                    (setf (tui:rect v)
+                          (tui:copy-rect (tui:rect v)
+                                         :y (+ start (tui:rect-y (tui:rect v)))))))
                  (return (make-segment :index index :start start :rows used
                                        :buffer cells :view view)))))))
 
 (defun segment-end (segment toplevel-count)
-  "Returns the absolute buffer row after `segment', including its inter-form separator."
+  "Returns the staging-relative row after `segment', including its inter-form separator."
   (+ (segment-start segment) (segment-rows segment)
      (if (< (segment-index segment) (1- toplevel-count)) 1 0)))
 
-(defun stage-toplevel-window (buffer scroll focus-index screen-rows screen-cols)
+(defun reveal-focus-row (viewport rect rows)
+  "Returns the minimum viewport adjustment needed to show `rect'."
+  (cond ((< (tui:rect-y rect) viewport) (tui:rect-y rect))
+        ((> (tui:rect-y2 rect) (+ viewport rows))
+         (if (> (tui:rect-rows rect) rows)
+             (tui:rect-y rect)
+             (- (tui:rect-y2 rect) rows)))
+        (t viewport)))
+
+(defun stage-toplevel-window (buffer scroll focus-index bounds)
   "Returns staged segments and the viewport row revealing the focus."
   (let* ((forms (ast buffer))
          (count (length forms))
+         (screen-rows (tui:rect-rows bounds))
          (index (scroll-position-index scroll)))
     ;; keep a predecessor above both anchor and focus for upward movement.
     (loop with viewport = 0
           for i from (max 0 (1- (min index focus-index))) below count
           for start = 0 then (segment-end segment count)
           for segment = (render-one-toplevel i start forms buffer
-                                             screen-rows screen-cols)
-          do (translate-view-y (segment-view segment) start)
-             (when (and (= i index) (<= index focus-index))
+                                             screen-rows (tui:rect-cols bounds))
+          do (when (and (= i index) (<= index focus-index))
                (setf viewport (+ start (min (scroll-position-row scroll)
                                             (segment-rows segment)))))
              (when (= i focus-index)
@@ -3018,64 +3080,44 @@ modifying the ast."
           until (and (> i focus-index) (>= start (+ viewport screen-rows)))
           finally (return (values segments viewport)))))
 
-(defun scroll-position-at-row (segments row)
-  "Returns the file position at staged `row' in `segments'."
+(defun scroll-position-at-row (segments y-offset)
+  "Returns the index of the toplevel form and the offset we're at, given a `y-offset'
+ relative to staged `segments'."
   (let* ((segment (or (find-if (lambda (segment)
-                                 (<= row (+ (segment-start segment) (segment-rows segment))))
+                                 (<= y-offset
+                                     (+ (segment-start segment) (segment-rows segment))))
                                segments)
                       (lastcar segments)))
-         (offset (max 0 (- row (segment-start segment)))))
+         (offset (max 0 (- y-offset (segment-start segment)))))
     (make-scroll-position :index (segment-index segment)
                           :row (min offset (segment-rows segment)))))
 
-(defun top-level-focus-index (buffer)
-  "Returns the top-level index containing the focus in `buffer'. Assumes the toplevel
-is a list and never focused."
-  (location-id (lastcar (stack buffer))))
-
-(defun translate-view-y (view delta)
-  "Moves `view' and its descendants down by `delta' rows."
-  (tui:view-traverse
-   view (lambda (v)
-          (setf (tui:rect v)
-                (tui:copy-rect (tui:rect v) :y (+ delta (tui:rect-y (tui:rect v)))))))
-  view)
-
-(defun reveal-focus-row (viewport rect rows)
-  "Returns the minimum viewport adjustment needed to show `rect'."
-  (cond ((< (tui:rect-y rect) viewport) (tui:rect-y rect))
-        ((> (tui:rect-y2 rect) (+ viewport rows))
-         (if (> (tui:rect-rows rect) rows)
-             (tui:rect-y rect)
-             (- (tui:rect-y2 rect) rows)))
-        (t viewport)))
-
-(defun render-toplevel-window (buffer bounds)
-  "Stages a window, resolves focus geometry and copies its visible cells to uncursed's
-buffer."
+(defun render-toplevel-window (buffer buffer-rect)
+  "Stages a window, clamps to focus and copies its *visible* cells to uncursed's screen
+relative to `buffer-rect'. Returns a view rendered with staging coordinates.
+note: the returned view includes unseen forms not clipped to `buffer-rect'."
   (let* ((forms (ast buffer))
-         (rows (tui:rect-rows bounds))
-         (cols (tui:rect-cols bounds))
+         (rows (tui:rect-rows buffer-rect))
+         (cols (tui:rect-cols buffer-rect))
          (state (scroll-state buffer))
-         (focus-index (top-level-focus-index buffer))
+         (focus-index (location-id (lastcar (stack buffer))))
          (scroll (if (not (find focus-index (scroll-state-segments state)
                                 :key #'segment-index))
                      ;; for large forward jumps, reset
                      (make-scroll-position :index focus-index)
                      (scroll-state-position state))))
     (multiple-value-bind (segments initial-viewport)
-        (stage-toplevel-window buffer scroll focus-index rows cols)
+        (stage-toplevel-window buffer scroll focus-index buffer-rect)
       (let* ((height (segment-end (lastcar segments) (length forms)))
              (location (lastcar (stack buffer)))
              (root (make-instance 'ordered-view
-                                  :rect (tui:make-rect :x (tui:rect-x bounds)
-                                                       :y (tui:rect-y bounds)
-                                                       :rows height :cols cols)
+                                  :rect (tui:make-rect :x 0 :y 0 :rows height :cols cols)
                                   :children (mapcar #'segment-view segments)
                                   :key-handler (global-key-handler forms location)
                                   :focused nil))
              (focus-view (gethash :focus-view (redisplay-cache buffer)))
              (rect (tui:rect focus-view))
+             ;; y-offset relative to the staging coordinates
              (viewport (max 0 (min initial-viewport (- height rows)))))
         ;; copy segments to the screen
         (flet ((blit-segment (segment viewport)
@@ -3085,8 +3127,8 @@ buffer."
                        below (min (segment-rows segment) (+ rows start))
                      do (loop for col below cols
                               do (setf (aref tui::*put-buffer*
-                                             (- (+ row (tui:rect-y bounds)) start)
-                                             (+ (tui:rect-x bounds) col))
+                                             (- (+ row (tui:rect-y buffer-rect)) start)
+                                             (+ (tui:rect-x buffer-rect) col))
                                        (aref (segment-buffer segment) row col)))))))
           (dolist (segment segments)
             (blit-segment segment viewport)))
@@ -3094,7 +3136,7 @@ buffer."
               (make-scroll-state :position (scroll-position-at-row segments viewport)
                                  :rows height
                                  :segments segments
-                                 :viewport-row viewport))
+                                 :viewport viewport))
         ;; edit: split up setf
         (setf (focus-rect buffer) rect
               (gethash forms (node-views buffer)) root)
@@ -3107,31 +3149,36 @@ buffer."
 ;; using oklab
 (defparameter *grayramp* #(0 7 #x16 #x20 #x2e #x3b #x48 #x50 #x63 #x71))
 
-(defun transform-rect-to-screen (rect offset screen-rect)
-  (let* ((origin (tui:rect-y screen-rect))
-         (y (max origin (+ origin (- (tui:rect-y rect) offset))))
-         (bottom (+ origin (- (tui:rect-y2 rect) offset))))
+(defun staging-to-absolute-coordinates (rect viewport buffer-rect)
+  "Transforms `rect' from staging coordinates for `buffer-rect' to absolute
+screen coordinates, given the top of the buffer's visual content in staging coordinates
+as `viewport'."
+  (let* ((origin (tui:rect-y buffer-rect))
+         (y (max origin (+ origin (- (tui:rect-y rect) viewport))))
+         (bottom (+ origin (- (tui:rect-y2 rect) viewport))))
     ;; rect coordinates are unsigned; clip first
     (tui:clamp-rect
-     (tui:copy-rect rect :x (+ (tui:rect-x screen-rect) (tui:rect-x rect))
+     (tui:copy-rect rect :x (+ (tui:rect-x buffer-rect) (tui:rect-x rect))
                          :y y :rows (max 0 (- bottom y)))
-     screen-rect)))
+     buffer-rect)))
 
 (defun node-screen-rect (buffer node)
-  "Returns the clipped screen rect for `node' in `buffer' or nil if not staged."
-  (when-let (view (gethash node (node-views buffer)))
-    (transform-rect-to-screen
-     (tui:rect view) (scroll-state-viewport-row (scroll-state buffer))
-     (buffer-rect buffer))))
+  "Returns the clipped screen rect for `node' in `buffer'."
+  (if-let (view (gethash node (node-views buffer)))
+    (staging-to-absolute-coordinates
+     (tui:rect view) (scroll-state-viewport (scroll-state buffer))
+     (buffer-rect buffer))
+    (error "no staged view corresponding to ~a" node)))
 
-(defun draw-semantic-backgrounds (buffer view offset screen-rect)
+(defun draw-semantic-backgrounds (buffer view viewport buffer-rect)
+  "`viewport' is relative to the `buffer's staging area and hence all rendered node views."
   (tui:view-traverse
    view
    (lambda (view)
      (when (typep view 'ast-view)
        (let* ((stack (view-stack view))
               (node (node-at (car stack)))
-              (rect (transform-rect-to-screen (tui:rect view) offset screen-rect))
+              (rect (staging-to-absolute-coordinates (tui:rect view) viewport buffer-rect))
               (real-stack-len (1- (length stack)))
               (i (cond
                    ((<= 0 real-stack-len (1- (length *grayramp*)))
@@ -3143,42 +3190,40 @@ buffer."
                                              10))))))))
          (unless (parse:is-atom node)
            (tui:fill-rect (tui:make-style :bg (tui:color i i i))
-                          (tui:copy-rect rect :x 0 :y 0) rect))
+                          rect))
          ;;
          (if (eq node (focus-binder buffer))
              (tui:fill-rect (tui:make-style :bg (tui:color #x85 #x99 #x00))
-                            (tui:copy-rect rect :x 0 :y 0) rect)
+                            rect)
              (when (and (parse:lexical-symbol-ref node (car stack))
                         (not (symbol-ref-boundp node stack buffer)))
                (tui:fill-rect (tui:make-style :bg (tui:color #xcb #x4b #x16))
-                              (tui:copy-rect rect :x 0 :y 0) rect)))
+                              rect)))
          ;;
          (when (parse:unexpanded-macro-op-p (car stack))
            (tui:fill-rect (tui:make-style :bg (tui:color #xdc #x32 #x2f))
-                          (tui:copy-rect rect :x 0 :y 0) rect))))
+                          rect))))
      t)))
 
-(defun draw-highlights (buffer view offset screen-rect)
+(defun draw-highlights (buffer view viewport buffer-rect)
+  "`viewport' is the top of the buffer's visual content in staging coordinates."
   (tui:view-traverse
    view
    (lambda (view)
      (when (typep view 'ast-view)
        (let ((stack (view-stack view))
-             (rect (transform-rect-to-screen (tui:rect view) offset screen-rect)))
+             (rect (staging-to-absolute-coordinates (tui:rect view) viewport buffer-rect)))
          (when (zipper-top-p buffer stack)
-           (tui:fill-rect (tui:make-style :bg #xb58900)
-                          (tui:copy-rect rect :x 0 :y 0) rect :blend 0.35))
+           (tui:fill-rect (tui:make-style :bg #xb58900) rect :blend 0.35))
          (when (location-selected-p buffer stack)
-           (tui:fill-rect (tui:make-style :bg #x6c71c4)
-                          (tui:copy-rect rect :x 0 :y 0) rect :blend 0.35))))
+           (tui:fill-rect (tui:make-style :bg #x6c71c4) rect :blend 0.35))))
      t))
   (when-let (focus-rect (and (buffer-focused-p buffer) (focus-rect buffer)))
-    (let ((rect (transform-rect-to-screen focus-rect offset screen-rect)))
-      (tui:fill-rect (tui:make-style :bg #xb58900)
-                     (tui:copy-rect rect :x 0 :y 0) rect :blend 0.7))))
+    (let ((rect (staging-to-absolute-coordinates focus-rect viewport buffer-rect)))
+      (tui:fill-rect (tui:make-style :bg #xb58900) rect :blend 0.7))))
 
 (defun buffer-outer-rect (buffer)
-  "The screen area available to `buffer'"
+  "The absolute screen area available to `buffer'."
   (when (and (floating buffer) (floating-rect buffer))
     (return-from buffer-outer-rect (floating-rect buffer)))
   (let ((ui (buffer-ui buffer)))
@@ -3188,6 +3233,7 @@ buffer."
                    :cols (max 0 (- (tui:cols ui) (buffer-x buffer))))))
 
 (defun buffer-rect (buffer)
+  "Returns an absolute coordinate rect bounding the content viewport of `buffer'."
   (let* ((rect (buffer-outer-rect buffer))
          (inset (if (floating buffer) 1 0)))
     (tui:copy-rect rect
@@ -3218,11 +3264,15 @@ buffer."
                            :y (min (buffer-y buffer) (- (tui:rows ui) height))
                            :rows height :cols width)))))
 
+(defparameter *buffer-focus-border* #xb0b0b0)
+(defparameter *buffer-unfocus-border* #x606060)
 (defun draw-buffer-border (buffer)
   (let* ((rect (buffer-outer-rect buffer))
          (rows (tui:rect-rows rect))
          (cols (tui:rect-cols rect))
-         (style (tui:make-style :fg (if (buffer-focused-p buffer) #xb0b0b0 #x606060)
+         (style (tui:make-style :fg (if (buffer-focused-p buffer)
+                                        *buffer-focus-border*
+                                        *buffer-unfocus-border*)
                                 :bg 0)))
     (when (and (>= rows 2) (>= cols 2))
       (loop for col from 2 below cols
@@ -3240,17 +3290,16 @@ buffer."
   (when (floating buffer)
     (fit-floating-buffer buffer)
     (draw-buffer-border buffer))
-  (let ((bounding-rect (buffer-rect buffer)))
-    (when (and (plusp (tui:rect-rows bounding-rect))
-               (plusp (tui:rect-cols bounding-rect)))
+  (let ((buffer-rect (buffer-rect buffer)))
+    (when (and (plusp (tui:rect-rows buffer-rect))
+               (plusp (tui:rect-cols buffer-rect)))
       (tui:fill-rect (tui:make-style :bg #x0)
-                     (tui:copy-rect bounding-rect :x 0 :y 0)
-                     bounding-rect
+                     buffer-rect
                      :char #\space)
-      (let* ((content (render-toplevel-window buffer bounding-rect))
-             (offset (scroll-state-viewport-row (scroll-state buffer))))
-        (draw-semantic-backgrounds buffer content offset bounding-rect)
-        (draw-highlights buffer content offset bounding-rect)
+      (let* ((content (render-toplevel-window buffer buffer-rect))
+             (offset (scroll-state-viewport (scroll-state buffer))))
+        (draw-semantic-backgrounds buffer content offset buffer-rect)
+        (draw-highlights buffer content offset buffer-rect)
         (setf (buffer-view buffer) content)))))
 
 (defun render-buffer (buffer)
@@ -3263,6 +3312,7 @@ buffer."
                                   :stage-cache (copy-hash-table (stage-cache old))
                                   :scroll-state (scroll-state old)))))
     (draw-buffer working)
+    ;; commit only after success, old version can be used recursively by debugging
     (setf (render-state buffer) (render-state working))))
 
 (defmethod tui:render :around ((ui ui))
@@ -3275,7 +3325,7 @@ buffer."
   (tui::clear-buffer tui::*put-buffer*)
   (dolist (buffer (buffers ui))
     (render-buffer buffer))
-  ;; buffer views use local coordinates. Global overlays use screen coordinates.
+  ;; completion is global
   (let ((completion (when-let (buffer (focused-buffer ui))
                       (when (buffer-view buffer)
                         (render-completion-window buffer)))))
@@ -3326,31 +3376,16 @@ buffer."
             (progn (setf redisplay-failing t)
                    (tui:redisplay ui)))))))
 
-(defun translate-mouse-event (event row-offset &optional (col-offset 0))
-  (if (tui:mouse-event-p event)
-      (let ((data (copy-structure (tui:event-kind event))))
-        (incf (tui:mouse-data-row data) row-offset)
-        (incf (tui:mouse-data-col data) col-offset)
-        (tui-sys:make-event :kind data
-                            :shiftp (tui:event-shiftp event)
-                            :altp (tui:event-altp event)
-                            :controlp (tui:event-controlp event)
-                            :metap (tui:event-metap event)))
-      event))
-
-(defun rect-contains-point-p (rect row col)
-  "Whether `rect' contains the one-based screen point `row', `col'."
-  (and (< (tui:rect-y rect) row (1+ (tui:rect-y2 rect)))
-       (< (tui:rect-x rect) col (1+ (tui:rect-x2 rect)))))
-
 (defun buffer-at-point (ui row col)
-  "Finds the last drawn buffer containing the screen point `row', `col' (one-based)."
+  "Finds the *last drawn* buffer containing the absolute point `row', `col' (1-based)."
   (find-if (lambda (buffer)
              (when-let (view (buffer-view buffer))
-               (rect-contains-point-p
+               (tui:rect-has-point-p
                 (if (floating buffer)
                     (buffer-outer-rect buffer)
-                    (tui:clamp-rect (tui:rect view) (buffer-rect buffer)))
+                    (staging-to-absolute-coordinates
+                     (tui:rect view) (scroll-state-viewport (scroll-state buffer))
+                     (buffer-rect buffer)))
                 row col)))
            (buffers ui)
            :from-end t))
@@ -3364,50 +3399,8 @@ buffer."
    (new-buffers :init nil :type list))
   (:representation :class))
 
-(defun handle-ui-event (ui event)
-  "Returns working buffers and global effects without changing the published `ui'."
-  (let* ((working (shallow-copy-record ui))
-         (originals (buffers ui))
-         (copies (mapcar (lambda (buffer)
-                           (make-buffer :buffer-ui working :buffer-id (buffer-id buffer)
-                                        :buffer-state
-                                        (copy-buffer-state (buffer-state buffer))
-                                        :render-state (render-state buffer)))
-                         originals)))
-    (setf (buffers working) copies
-          (slot-value working 'focused-buffer) (nth (position (focused-buffer ui) originals)
-                                                    copies))
-    (dispatch-ui-event working event)
-    (let ((new (mapcar (lambda (buffer)
-                         (make-buffer :buffer-ui ui :buffer-id (buffer-id buffer)
-                                      :buffer-state (buffer-state buffer)))
-                       (nthcdr (length copies) (buffers working)))))
-      (values copies
-              (make-ui-effects
-               :selection (selection working) :zipper (zipper working)
-               :cutbuffer (cutbuffer working) :new-buffers new
-               :pane-drag (pane-drag working)
-               :focused-buffer (find (buffer-id (focused-buffer working))
-                                     (append originals new) :key #'buffer-id))))))
-
-(defmethod tui:dispatch-event ((ui ui) event)
-  (let ((revision (revision ui)))
-    (multiple-value-bind (copies effects) (handle-ui-event ui event)
-      ;; This is necessary to handle reentrancy as recursive dispatch may
-      ;; already have published a newer state, in which case we don't commit
-      (when (= revision (revision ui))
-        (loop for buffer in (buffers ui) for copy in copies
-              do (setf (buffer-state buffer) (buffer-state copy)))
-        (setf (buffers ui) (append (buffers ui) (new-buffers effects)))
-        (setf (pane-drag ui) (pane-drag effects)
-              (selection ui) (selection effects)
-              (zipper ui) (zipper effects)
-              (cutbuffer ui) (cutbuffer effects)
-              (slot-value ui 'focused-buffer) (focused-buffer effects))
-        (incf (revision ui))))))
-
 (defun handle-pane-drag (ui event target)
-  "Moves a captured pane until mouse release, consuming the associated events."
+  "Moves a alt-clicked buffer until mouse release, consuming the associated events."
   (when (tui:mouse-event-p event)
     (let* ((mouse (tui:event-kind event))
            (state (tui:mouse-data-state mouse))
@@ -3445,9 +3438,7 @@ buffer."
          ;; currently only completion
          (overlay (when (and mouse (tui:root-view ui))
                     (find-if (lambda (view)
-                               (rect-contains-point-p (tui:rect view)
-                                                      (tui:mouse-data-row mouse)
-                                                      (tui:mouse-data-col mouse)))
+                               (tui:mouse-within mouse (tui:rect view)))
                              (tui:children (tui:root-view ui)))))
          (target (when mouse
                    (buffer-at-point ui (tui:mouse-data-row mouse)
@@ -3468,10 +3459,20 @@ buffer."
     (when-let* ((buffer (focused-buffer ui))
                 (view (buffer-view buffer)))
       (when (or (not mouse) (eq target buffer))
-        (let ((event (translate-mouse-event
-                      event (- (scroll-state-viewport-row (scroll-state buffer))
-                               (tui:rect-y (buffer-rect buffer)))
-                      (- (tui:rect-x (buffer-rect buffer))))))
+        (let ((event
+                (if mouse
+                    (let ((data (copy-structure mouse))
+                          (rect (buffer-rect buffer)))
+                      (incf (tui:mouse-data-row data)
+                            (- (scroll-state-viewport (scroll-state buffer))
+                               (tui:rect-y rect)))
+                      (decf (tui:mouse-data-col data) (tui:rect-x rect))
+                      (tui-sys:make-event :kind data
+                                          :shiftp (tui:event-shiftp event)
+                                          :altp (tui:event-altp event)
+                                          :controlp (tui:event-controlp event)
+                                          :metap (tui:event-metap event)))
+                    event)))
           (tui:view-traverse
            view (lambda (view)
                   (if mouse
@@ -3479,6 +3480,49 @@ buffer."
                       (when (tui:focused view)
                         (funcall (tui:key-handler view) view event buffer)))
                   t)))))))
+
+(defun handle-ui-event (ui event)
+  "Returns working buffers and global effects without changing the published `ui'."
+  (let* ((working (shallow-copy-record ui))
+         (originals (buffers ui))
+         (copies (mapcar (lambda (buffer)
+                           (make-buffer :buffer-ui working :buffer-id (buffer-id buffer)
+                                        :buffer-state
+                                        (copy-buffer-state (buffer-state buffer))
+                                        :render-state (render-state buffer)))
+                         originals)))
+    (setf (buffers working) copies
+          (slot-value working 'focused-buffer) (nth (position (focused-buffer ui) originals)
+                                                    copies))
+    (dispatch-ui-event working event)
+    (let ((new (mapcar (lambda (buffer)
+                         (make-buffer :buffer-ui ui :buffer-id (buffer-id buffer)
+                                      :buffer-state (buffer-state buffer)))
+                       (nthcdr (length copies) (buffers working)))))
+      (values copies
+              (make-ui-effects
+               :selection (selection working) :zipper (zipper working)
+               :cutbuffer (cutbuffer working) :new-buffers new
+               :pane-drag (pane-drag working)
+               :focused-buffer (find (buffer-id (focused-buffer working))
+                                     (append originals new) :key #'buffer-id))))))
+
+(defmethod tui:dispatch-event ((ui ui) event)
+  (let ((revision (revision ui)))
+    (multiple-value-bind (copies effects)
+        (handle-ui-event ui event)
+      ;; This is necessary to handle reentrancy as recursive dispatch may
+      ;; already have published a newer state, in which case we don't commit
+      (when (= revision (revision ui))
+        (loop for buffer in (buffers ui) for copy in copies
+              do (setf (buffer-state buffer) (buffer-state copy)))
+        (setf (buffers ui) (append (buffers ui) (new-buffers effects)))
+        (setf (pane-drag ui) (pane-drag effects)
+              (selection ui) (selection effects)
+              (zipper ui) (zipper effects)
+              (cutbuffer ui) (cutbuffer effects)
+              (slot-value ui 'focused-buffer) (focused-buffer effects))
+        (incf (revision ui))))))
 
 (defmethod tui:dispatch-event :around ((ui ui) event)
   (with-simple-restart (nil "ignore event-handling error")
