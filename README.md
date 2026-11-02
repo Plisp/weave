@@ -35,4 +35,5 @@ In emacs, sly-connect to 4005 and
 * `Shift+up/down` adjusts a zipper selection
 * `Ctrl-x/c/v` cut, copy and paste
 
-* `Ctrl-e` evaluation
+* `Ctrl+w` close buffer
+* `Alt-e` evaluation

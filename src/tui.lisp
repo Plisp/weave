@@ -62,12 +62,6 @@ construction, do not modify."))
    (view-stack :init nil :mutable t :type list)
    (hoverable :init nil :mutable t :type boolean)))
 
-(defgeneric handle-key (node view location ui event)
-  (:documentation "event is a uncursed key event. If this node is active then
-adjust cursor state in the context, specialized for the `cursor'.
-If this returns NIL, propagate up the cursor stack.")
-  (:method (node view location context event) nil))
-
 (defrecord completion-state ()
   ((anchor)
    (candidates :type list)
@@ -107,10 +101,6 @@ If this returns NIL, propagate up the cursor stack.")
    (stack :type list))
   (:representation :struct))
 
-(defun end-selection-mode (buffer)
-  (when-let (selection (selection buffer))
-    (setf (selection buffer) (copy-selection selection :activep nil))))
-
 (defun selection-anchor (selection)
   (id-index (location-id (selection-location selection))))
 
@@ -121,26 +111,11 @@ If this returns NIL, propagate up the cursor stack.")
 (defun selection-parent-id (selection)
   (parent-id (location-id (selection-location selection))))
 
-(defun selection-locations (selection)
-  (let ((loc (selection-location selection)))
-    (assert (bodylike-id (location-id loc)))
-    (multiple-value-bind (low high)
-        (selection-range selection)
-      (loop for i from low to high
-            collect (make-location :node (location-node loc)
-                                   :id (append-id (selection-parent-id selection) i))))))
-
-(defun selection-forms (selection)
-  (mapcar #'node-at (selection-locations selection)))
-
 (defun zipper-top-p (buffer stack)
   (when-let (selection (selection buffer))
     (and (typep selection 'zipper)
          (eq (node-at (car stack)) ; top of zipper
              (location-node (lastcar (zipper-stack selection)))))))
-
-(defun zipper-depth (zipper)
-  (length (zipper-stack zipper)))
 
 (defun location-selected-p (buffer stack)
   (when-let* ((selection (selection buffer))
@@ -152,10 +127,6 @@ If this returns NIL, propagate up the cursor stack.")
          (multiple-value-bind (low high)
              (selection-range selection)
            (<= low (id-index id) high)))))
-
-(defun selection-at-focus (buffer)
-  (when (location-selected-p buffer (stack buffer))
-    (selection buffer)))
 
 (defrecord cutbuffer ()
   ((forms :type list)
@@ -191,10 +162,6 @@ If this returns NIL, propagate up the cursor stack.")
    (viewport :type (integer 0))
    (segments :type list))
   (:representation :struct))
-
-(defun copy-locations (locations)
-  (make-cutbuffer :forms (mapcar (lambda (loc) (parse:copy-node (node-at loc))) locations)
-                  :sorts (mapcar #'locsort locations)))
 
 (defrecord pane-drag ()
   ((buffer-id) (offset-x :type integer) (offset-y :type integer))
@@ -256,7 +223,10 @@ If this returns NIL, propagate up the cursor stack.")
   (:representation :class))
 
 (defrecord debug-state ()
+  ;; a stack of conditions on which the debugger has been invoked
   ((debug-conditions :init () :mutable t :type list)
+   ;; a parallel list to debug-conditions, whose elements are lists of restarts
+   ;; captured by compute-restarts at time of handling the error, innermost first
    (debug-restarts :init () :mutable t :type list)
    (buffer-x :init 0 :mutable t :type (integer 0))
    (buffer-y :init 0 :mutable t :type (integer 0)))
@@ -282,30 +252,12 @@ If this returns NIL, propagate up the cursor stack.")
    render-state (stage-cache redisplay-cache node-views)
    floating-rect buffer-view scroll-state focus-rect))
 
-(defun add-buffer (ui &key (ast (list (hole))) (x 0) (y 0)
-                        source (package "CL-USER") floating)
-  "Adds a buffer containing `ast' to `ui', optionally associated with `source'.
-The anchor coordinates X, Y are absolute."
-  (check-type ast cons)
-  (let ((buffer (make-buffer
-                 :buffer-ui ui
-                 :buffer-state (make-buffer-state
-                                :floating floating :ast ast
-                                :buffer-source (when source (pathname source))
-                                :buffer-x x :buffer-y y
-                                :buffer-package (or (find-package package)
-                                                    (error "Unknown package ~s" package))))))
-    (setf (stack buffer) (list (make-location :node ast :id 0))
-          (buffers ui) (append (buffers ui) (list buffer)))
-    (unless (focused-buffer ui)
-      (setf (focused-buffer ui) buffer))
-    buffer))
-
 (defun buffer-focused-p (buffer)
-  (eq (buffer-id buffer) (buffer-id (focused-buffer (buffer-ui buffer)))))
+  (when-let (focused (focused-buffer (buffer-ui buffer)))
+    (eq (buffer-id buffer) (buffer-id focused))))
 
 (defmethod (setf focused-buffer) :before (buffer (ui ui))
-  (assert (member buffer (buffers ui)))
+  (assert (or (null buffer) (member buffer (buffers ui))))
   (setf (redisplayed-since-input ui) nil)
   (when (and (not (eq buffer (focused-buffer ui))) (selection ui))
     (setf (selection ui) (copy-selection (selection ui) :activep nil))))
@@ -315,155 +267,9 @@ The anchor coordinates X, Y are absolute."
     (when (and selection
                (eq (buffer-id buffer) (selection-buffer-id selection)))
       selection)))
-(defmethod (setf selection) (value (buffer buffer))
-  (setf (selection (buffer-ui buffer)) value))
-
-(defmethod zipper ((buffer buffer)) (zipper (buffer-ui buffer)))
-(defmethod (setf zipper) (value (buffer buffer))
-  (setf (zipper (buffer-ui buffer)) value))
-
-(defmethod cutbuffer ((buffer buffer)) (cutbuffer (buffer-ui buffer)))
-(defmethod (setf cutbuffer) (value (buffer buffer))
-  (setf (cutbuffer (buffer-ui buffer)) value))
 
 (defun focus (buffer)
   (car (stack buffer)))
-
-(defun refocus (buffer id)
-  "Moves the focus to another location in the node it is already within."
-  (end-selection-mode buffer)
-  (let ((loc (make-location :node (location-node (focus buffer)) :id id)))
-    (setf (stack buffer) (cons loc (cdr (stack buffer))))
-    loc))
-
-(defun descend (buffer id)
-  "Moves the focus to a location-id inside the currently focused node."
-  (end-selection-mode buffer)
-  (let ((loc (make-location :node (node-at (focus buffer)) :id id)))
-    (push loc (stack buffer))
-    loc))
-
-(defun parent-stack (stack)
-  "relies on ids being either 'symbol or ('symbol integer*) for list addressing.
-Plain list bodies are skipped since they are never focused."
-  (let* ((loc (car stack))
-         (id (location-id loc)))
-    (cond ((and (listp id)
-                (listp (node-at (make-location :node (location-node loc)
-                                               :id (parent-id id)))))
-           (cdr stack))
-          ((listp id)
-           (cons (make-location :node (location-node loc) :id (parent-id id))
-                 (cdr stack)))
-          ;; do not reach toplevel
-          ((= 1 (length stack)) nil)
-          (t (cdr stack)))))
-
-;;
-;;; editing operations
-;;
-;; - a stack tracks locations from the focus outward to the indexed top-level form
-;; - ast-delete/insert/replace are stack-respecting edit operations
-;;
-(defun rebuild-spine (loc updater stack)
-  "Requires that (location-node `loc') = (location-node (car `stack'))
-Functionally rebuilds the path from `loc' out to the root, applying `updater' to
-the value at `loc', but retaining the current focus. Returns the new stack and root."
-  (assert (eq (location-node loc) (location-node (car stack))))
-  (labels ((rebuild (stack newnode newstack)
-             (if (null stack)
-                 (values (nreverse newstack) newnode)
-                 (let* ((this (car stack))
-                        (id (location-id this))
-                        (new-parent (update (location-node this) id newnode)))
-                   (rebuild (cdr stack)
-                            new-parent
-                            (cons (make-location :node new-parent :id id)
-                                  newstack))))))
-    (rebuild (cons loc (cdr stack))
-             (funcall updater (node-at loc))
-             (list))))
-
-(defun commit-edit (buffer stack root)
-  (end-selection-mode buffer)
-  (setf (ast buffer) root
-        (stack buffer) stack)
-  (focus buffer))
-
-(defun save-history (buffer)
-  (push (make-undo-state :stack (stack buffer) :ast (ast buffer))
-        (history buffer)))
-
-(defun ast-replace (loc updater buffer &optional (stack (stack buffer)))
-  (if (typep (location-node loc) 'parse:macro-call)
-      (replace-in-macro-call loc (funcall updater (node-at loc)) buffer)
-      (multiple-value-call #'commit-edit buffer (rebuild-spine loc updater stack))))
-
-(defun edit-list (loc updater focus-id buffer stack)
-  "Replaces the list at `loc' using `updater' and focuses `focus-id'."
-  (if (typep (location-node loc) 'parse:macro-call)
-      (replace-in-macro-call loc (funcall updater (node-at loc)) buffer focus-id)
-      (progn (multiple-value-call #'commit-edit buffer (rebuild-spine loc updater stack))
-             (refocus buffer focus-id))))
-
-(defun ast-insert (item loc index buffer &optional (stack (stack buffer)) tail)
-  "Focuses the inserted item, optionally descends the path `tail'."
-  (edit-list loc (lambda (body) (list-insert (elements body) item index))
-             (reduce #'append-id (cons index tail) :initial-value (location-id loc))
-             buffer stack))
-
-(defun ast-delete (loc index buffer &optional (stack (stack buffer)))
-  "assumes that list has length > 1"
-  (edit-list loc (lambda (body) (list-remove (elements body) index))
-             (append-id (location-id loc) (max 0 (1- index)))
-             buffer stack))
-
-(defun insert-or-jump (loc index buffer stack &key (item (hole)) tail)
-  "Moves to the hole at `index' of the list at `loc' and down the ids in `tail' if passed,
-otherwise inserts `item' at `index' and focuses down `tail' within it. `stack' is the
-part of the buffer stack starting from the node of `loc'."
-  (let ((path (cons index tail)))
-    (if (typep (parse:value-at-path loc path) 'parse:hole)
-        (progn
-          (setf (stack buffer) stack)
-          (refocus buffer (reduce #'append-id path :initial-value (location-id loc))))
-        (progn
-          (save-history buffer)
-          (ast-insert item loc index buffer stack tail)))))
-
-(defun replace-in-macro-call (location newnode buffer &optional focus-id)
-  "Replaces the syntax at `location' in a macro call, which may reparse part of it into a
-form. Pop the cursor to the call's location so the parsed call can be inserted,
-then descend to the original cursor position, or to the syntax at `focus-id' if given."
-  (let* ((call (location-node location))
-         (outer (cdr (member-if (lambda (l) (eq (location-node l) call)) (stack buffer)))))
-    (multiple-value-bind (new-call path)
-        (parse:update call (location-id location) newnode)
-      (multiple-value-call #'commit-edit buffer
-        (rebuild-spine (car outer) (constantly new-call) outer))
-      ;;
-      (dolist (id (if focus-id
-                      (parse:path-at new-call focus-id)
-                      (or path ; translated path or vvv fast path
-                          (list (location-id location)))))
-        (push (make-location :node (node-at (focus buffer)) :id id) (stack buffer)))
-      (focus buffer))))
-
-(defun swap-node (location newnode buffer)
-  "saves undo history"
-  (when (eq (location-id location) :open)
-    (setf location (second (member location (stack buffer) :test #'location=))))
-  (when (or (null (edit-loc buffer)) (not (location= location (edit-loc buffer))))
-    (save-history buffer))
-  ;; perform the insertion
-  (let ((newloc (if (typep (location-node location) 'parse:macro-call)
-                    (replace-in-macro-call location newnode buffer)
-                    (ast-replace location (constantly newnode) buffer
-                                 (member-if (lambda (l) (eq (location-node location)
-                                                       (location-node l)))
-                                            (stack buffer))))))
-    (setf (future buffer) nil
-          (edit-loc buffer) newloc)))
 
 ;;; rendering helpers
 (defgeneric render-node (node stack context rect &key &allow-other-keys)
@@ -581,6 +387,8 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
     (values-list vals)))
 
 (defparameter *default-key-handlers* (make-hash-table :test #'equal))
+(defparameter *ui-key-handlers* (make-hash-table :test #'equal))
+
 (defparameter *global-key-handlers* (make-hash-table :test #'equal))
 (defun plain-body-location-p (location)
   "Whether `location' addresses a whole evaluated body, which is an invariant violation
@@ -643,338 +451,6 @@ since these aren't a proper location."
        (typep (parse:name node) 'parse:symbol-ref)
        (find (parse:resolve (parse:name node)) *arb-arity-binops*)))
 
-(defun wrap-arith (op buffer)
-  "take first arithmetic operator with greater precedence than `op'
-if none, surround current atom"
-  (when (eq (locsort (car (stack buffer))) 'parse:eval-form)
-    (loop for stack = (stack buffer) then (cdr stack)
-          for loc in (stack buffer)
-          for node = (location-node loc)
-          while (and (is-binop-call node)
-                     (> (binop-precedence (parse:name node)) (binop-precedence op)))
-          finally (let ((sym (make-instance 'parse:symbol-ref
-                                            :name (symbol-name op)
-                                            :home-package (symbol-package op)))
-                        (loc (car stack)))
-                    (swap-node loc
-                               (make-instance 'parse:function-call
-                                              :name sym
-                                              :body (list (node-at loc) (hole)))
-                               buffer)
-                    (descend buffer '(parse:body 1)))
-                  (return t))))
-
-(loop for sym across *arb-arity-binops*
-      for s = (string s)
-      do (when (= 1 (length (string s)))
-           (setf (gethash (tui-sys:make-event :kind (schar s 0) :altp t)
-                          *global-key-handlers*)
-                 ;; oops old bug if we don't compute from s prior to its mutation by loop
-                 (lambda (view buffer)
-                   (declare (ignore view))
-                   (wrap-arith sym buffer)))))
-
-(setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (when-let (state (completion-state buffer))
-          (setf (completion-state buffer)
-                (copy-completion-state
-                 state :selection (mod (1+ (selection state))
-                                       (length (candidates state))))))))
-
-(setf (gethash (tui-sys:make-event :kind #\tab :shiftp t) *global-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (when-let (state (completion-state buffer))
-          (setf (completion-state buffer)
-                (copy-completion-state
-                 state :selection (mod (1- (selection state))
-                                       (length (candidates state))))))))
-
-
-;; ASSUME leaf nodes are non-overlapping
-;; we index them into an array of blocks sorted by line then column
-(defun build-atom-array (tree rows)
-  "Coordinates produced are in staging coordinates."
-  (let ((rows (make-array rows :initial-element (list))))
-    (tui:view-traverse tree (lambda (view)
-                              (when (and (typep view 'ast-view)
-                                         (hoverable view))
-                                (let ((rect (tui:rect view)))
-                                  (push view (aref rows (tui:rect-y rect)))))
-                              t))
-    (map-into rows (lambda (row) (sort row #'< :key (lambda (v) (tui:rect-x (tui:rect v)))))
-              rows)))
-
-(defun view-below (atom-array y col)
-  "Takes a y-offset from 0 to rows (relative to staging coordinates),
-this way it's possible to search the first row. `col' should indicate some preferred
-column. Returns NIL if not found."
-  ;; note: must bounds-check y first
-  (let ((new-y (position-if-not #'null atom-array :start y)))
-    (or new-y (return-from view-below nil))
-    ;; if offset y has no views after it then we will find our current view
-    (loop for view in (aref atom-array new-y)
-          for x1 = (tui:rect-x (tui:rect view))
-          for x2 = (tui:rect-x2 (tui:rect view))
-          do (when (<= col x2)
-               (loop-finish))
-          finally (return view))))
-
-(defun view-above (atom-array y col)
-  "Same as `view-below'"
-  (let ((new-y (position-if-not #'null atom-array :end y :from-end t)))
-    (or new-y (return-from view-above nil))
-    ;; if offset y has no views after it then we will find our current view
-    (loop for view in (aref atom-array new-y)
-          for x1 = (tui:rect-x (tui:rect view))
-          for x2 = (tui:rect-x2 (tui:rect view))
-          do (when (<= col x2)
-               (loop-finish))
-          finally (return view))))
-
-(defun view-left (atom-array y x)
-  (if-let (res (find-if (lambda (view) (<= (tui:rect-x2 (tui:rect view)) x))
-                        (slog (aref atom-array y))
-                        :from-end t))
-    res ; most-positive-fixnum = very last
-    (view-above atom-array y most-positive-fixnum)))
-
-(defun view-right (atom-array y x)
-  (if-let (res (find-if (lambda (view) (<= x (tui:rect-x (tui:rect view))))
-                        (aref atom-array y)))
-    res
-    (view-below atom-array (1+ y) 1)))
-
-(defun atom-move (view-finder view buffer)
-  (end-selection-mode buffer)
-  (let* ((rows (scroll-state-rows (scroll-state buffer)))
-         (atom-array (build-atom-array (buffer-view buffer) rows))
-         (this-rect (tui:rect view)))
-    (multiple-value-bind (new-view new-goal)
-        (funcall view-finder atom-array this-rect)
-      (when new-view ; assumes atoms are all ast-views
-        (setf (stack buffer) (view-stack new-view))
-        (when new-goal
-          (slog* (format nil "goal col is ~d" new-goal))
-          (setf (goal-col buffer) new-goal))))))
-
-(defun move-down (view buffer)
-  (atom-move (lambda (atom-array this-rect)
-               (view-below atom-array (1+ (tui:rect-y this-rect)) (goal-col buffer)))
-             view buffer))
-
-(setf (gethash (tui-sys:make-event :kind #\n :controlp t) *default-key-handlers*)
-      #'move-down)
-(setf (gethash (tui-sys:make-event :kind :down-arrow) *default-key-handlers*)
-      #'move-down)
-
-(defun move-up (view buffer)
-  (atom-move (lambda (atom-array this-rect)
-               (view-above atom-array (tui:rect-y this-rect) (goal-col buffer)))
-             view buffer))
-
-(setf (gethash (tui-sys:make-event :kind #\p :controlp t) *default-key-handlers*)
-      #'move-up)
-(setf (gethash (tui-sys:make-event :kind :up-arrow) *default-key-handlers*)
-      #'move-up)
-
-(setf (gethash (tui-sys:make-event :kind #\e :controlp t) *default-key-handlers*)
-      (lambda (&rest args)
-        (declare (ignore args))
-        (break)))
-
-(defun move-left (view buffer)
-  (atom-move
-   (lambda (atom-array this-rect)
-     (let ((view (view-left atom-array
-                            (tui:rect-y this-rect) (tui:rect-x this-rect))))
-       (values view (when view (tui:rect-x2 (tui:rect view))))))
-   view buffer))
-
-(setf (gethash (tui-sys:make-event :kind #\b :controlp t) *default-key-handlers*)
-      #'move-left)
-(setf (gethash (tui-sys:make-event :kind :left-arrow) *default-key-handlers*)
-      #'move-left)
-
-(defun move-right (view buffer)
-  (atom-move
-   (lambda (atom-array this-rect)
-     (let ((view (view-right atom-array
-                             (tui:rect-y this-rect) (tui:rect-x2 this-rect))))
-       (values view (when view (tui:rect-x2 (tui:rect view))))))
-   view buffer))
-
-(setf (gethash (tui-sys:make-event :kind #\f :controlp t) *default-key-handlers*)
-      #'move-right)
-(setf (gethash (tui-sys:make-event :kind :right-arrow) *default-key-handlers*)
-      #'move-right)
-
-(defun selection-list-location (selection)
-  (make-location :node (location-node (selection-location selection))
-                 :id (selection-parent-id selection)))
-
-(defun current-selection (buffer)
-  (when-let (selection (selection buffer))
-    (and (selection-activep selection) selection)))
-
-(defun begin-selection (buffer)
-  (let* ((loc (focus buffer))
-         (id (location-id loc)))
-    (when (bodylike-id id)
-      (setf (selection buffer)
-            (make-selection :buffer-id (buffer-id buffer)
-                            :context (stack buffer)
-                            :location loc
-                            :point (id-index id))))))
-
-(defun extend-selection (buffer delta)
-  (when-let (selection (or (current-selection buffer) (begin-selection buffer)))
-    (let ((point (+ (selection-point selection) delta)))
-      (when (<= 0 point (1- (length (elements
-                                     (node-at (selection-list-location selection))))))
-        ;; when the underlying range is reselected, forget the zipper
-        ;; keep selection active after move
-        (refocus buffer (append-id (selection-parent-id selection) point))
-        (setf (selection buffer)
-              (copy-selection selection :point point :activep t :stack nil))))
-    t))
-
-(defun eval-list-position-p (location)
-  "Whether LOCATION can accept a list of evaluated forms."
-  (let ((id (location-id location)))
-    (and (bodylike-id id)
-         (or (eq 'parse:eval-form
-                 (parse:location-sort (location-node location)
-                                      (append-id (parent-id id) 0)))
-             (and (typep (location-node location) 'parse:macro-call)
-                  (not (eq (location-id location) 'parse:op)))))))
-
-(defun zipper-target-p (location)
-  "Whether a zipper can top out at `location'."
-  (or (eval-list-position-p location)
-      (eq 'parse:eval-form (locsort location))))
-
-(defun expand-selection (buffer)
-  (when-let (selection (or (current-selection buffer) (begin-selection buffer)))
-    (let ((depth (if (typep selection 'zipper) (zipper-depth selection) 0)))
-      ;; skip positions where we cannot copy a usefully pastable zipper
-      ;; e.g. nonevaluated let bindings need more sophisticated sort tracking
-      (loop for location in (nthcdr (1+ depth) (selection-context selection))
-            for level from (1+ depth)
-            do (when (zipper-target-p location)
-                 (let ((stack (subseq (selection-context selection) 0 level)))
-                   (setf (selection buffer) (copy-selection selection :stack stack)))
-                 (return t))))))
-
-(defun shrink-selection (buffer)
-  (when-let (selection (current-selection buffer))
-    (when (typep selection 'zipper)
-      (loop for level from (1- (zipper-depth selection)) downto 1
-            for location = (nth level (selection-context selection))
-            do (when (zipper-target-p location)
-                 (setf (selection buffer)
-                       (copy-selection
-                        selection :stack (subseq (selection-context selection) 0 level)))
-                 (return t))
-            finally ;; normal selection
-                    (setf (selection buffer) (copy-selection selection :stack nil))
-                    (return t)))))
-
-(setf (gethash (tui-sys:make-event :kind :up-arrow :shiftp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (expand-selection buffer)))
-
-(setf (gethash (tui-sys:make-event :kind :down-arrow :shiftp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (shrink-selection buffer)))
-
-(setf (gethash (tui-sys:make-event :kind :left-arrow :shiftp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (extend-selection buffer -1)))
-
-(setf (gethash (tui-sys:make-event :kind :right-arrow :shiftp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (extend-selection buffer 1)))
-
-(defun goal-valid-p (buffer)
-  "Can we still access the same children through the last saved goal?"
-  (when-let (goal (car (goal-stacks buffer)))
-    (let ((parent (parent-stack goal))
-          (stack (stack buffer)))
-      (and (= (length parent) (length stack))
-           (every #'location= parent stack)))))
-
-(defun move-parent (buffer)
-  (end-selection-mode buffer)
-  (let ((old (stack buffer)))
-    (when-let (new-stack (parent-stack old))
-      (slog* `(moving to ,(butlast new-stack)))
-      (setf (goal-stacks buffer) (cons old (when (goal-valid-p buffer)
-                                             (goal-stacks buffer)))
-            (stack buffer) new-stack))))
-
-(defun move-child (buffer)
-  "Steps back down into the goal child."
-  (end-selection-mode buffer)
-  (when (goal-valid-p buffer)
-    (setf (stack buffer) (pop (goal-stacks buffer)))))
-
-(setf (gethash (tui-sys:make-event :kind #\p :altp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (move-parent buffer)))
-
-(setf (gethash (tui-sys:make-event :kind #\n :altp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (move-child buffer)))
-
-(setf (gethash (tui-sys:make-event :kind #\P :altp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        ;; this is really a do-while idiom
-        (prog1 (move-parent buffer)
-          (loop for last-stack = nil then stack
-                for stack = (slog (stack buffer))
-                for loc = (car stack)
-                for node = (node-at loc)
-                while (typep node 'parse:eval-form)
-                do (move-parent buffer)
-                finally (when (slog last-stack)
-                          (setf (stack buffer) last-stack))))))
-
-;;; undo
-
-;; can't pop the one remaining thing
-(defun undo (buffer)
-  (unless (null (history buffer))
-    (let ((prev (pop (history buffer))))
-      (slog 'undo)
-      (push (make-undo-state :ast (ast buffer) :stack (stack buffer))
-            (future buffer))
-      (setf (ast buffer) (undo-state-ast prev)
-            (stack buffer) (undo-state-stack prev)))))
-
-(defun redo (buffer)
-  (unless (null (future buffer))
-    (let ((next (pop (future buffer))))
-      (slog 'redo)
-      (push (make-undo-state :ast (ast buffer) :stack (stack buffer))
-            (history buffer))
-      (setf (ast buffer) (undo-state-ast next)
-            (stack buffer) (undo-state-stack next)))))
-
-(setf (gethash (tui-sys:make-event :kind #\u :controlp t) *global-key-handlers*)
-      (lambda (view buffer) view (undo buffer)))
-(setf (gethash (tui-sys:make-event :kind #\r :controlp t) *global-key-handlers*)
-      (lambda (view buffer) view (redo buffer)))
-
 ;;; hole
 ;; note: holes only replace symbols or evaluation contexts
 
@@ -1005,98 +481,6 @@ column. Returns NIL if not found."
 (defun completion-candidates (context)
   (declare (ignore context))
   (loop for s being the symbols of (find-package "CL") collect s))
-
-(defun symbol-char-p (c)
-  (or (alphanumericp c) (find c "+-*/=<>!?&%$_~^.:@[]{}")))
-
-(defmethod handle-key ((node hole) view location buffer event)
-  (let ((c (tui:event-kind event)))
-    (when (is-regular-char-event event)
-      (trivia:match (slog (locsort location))
-        ((eql 'parse:binder)
-         (when (and (symbol-char-p c) (not (digit-char-p c)))
-           (swap-node location (make-instance 'parse:binder
-                                              :name (string-upcase c)
-                                              :home-package (buffer-package buffer))
-                      buffer)))
-        ((eql 'parse:eval-form)
-         (cond
-           ((and (char= c #\() (not (typep (location-node location) 'parse:macro-call)))
-            (swap-node location (ref-list) buffer))
-           ((and (symbol-char-p c) (not (digit-char-p c)))
-            (let ((newnode (make-instance 'parse:symbol-ref
-                                          :name (string-upcase c)
-                                          :home-package (buffer-package buffer))))
-              (swap-node location newnode buffer)))
-           ((digit-char-p c)
-            (let ((newnode (make-instance 'parse:literal :str (string c))))
-              (swap-node location newnode buffer)))
-           ;; needs to deal with comma depth and insertion
-           ;; ((char= c #\`)
-           ;;  (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
-           ;;    (swap-node location newnode buffer)
-           ;;    (focus-first-hole buffer)
-           ;;    t))
-           ((char= c #\')
-            (let ((newnode (make-instance 'parse:quote-form :op 'parse:read-quote
-                                                            :thing (hole))))
-              (swap-node location newnode buffer)
-              (focus-first-hole buffer)
-              t))))
-        ((or (eql 'parse:fun-designator) (eql 'parse:symbol-ref))
-         (when (and (symbol-char-p c) (not (digit-char-p c)))
-           (let ((newnode (make-instance 'parse:symbol-ref
-                                         :name (string-upcase c)
-                                         :home-package (buffer-package buffer))))
-             (swap-node location newnode buffer))))
-        ((eql 'parse:unevaluated)
-         (cond
-           ((char= c #\()
-            (swap-node location (ref-list (hole)) buffer)
-            (refocus buffer (append-id (location-id (focus buffer)) 0)))
-           ((and (symbol-char-p c) (not (digit-char-p c)))
-            (swap-node location
-                       (make-instance 'parse:symbol-ref
-                                      :name (string-upcase c)
-                                      :home-package (buffer-package buffer))
-                       buffer))
-           ((digit-char-p c)
-            (swap-node location (make-instance 'parse:literal :str (string c)) buffer))))))))
-
-;;; symbol-references
-(defmethod handle-key ((node parse:symbol-ref) view location buffer event)
-  (when (is-regular-char-event event)
-    (let ((s (parse:name node))
-          (c (tui:event-kind event)))
-      (cond ((and (symbol-char-p c) (not (char= c #\:)))
-             (let ((newnode
-                     (make-instance 'parse:symbol-ref
-                                    :name (format nil "~a~a" s (string-upcase c))
-                                    :home-package (parse:home-package node))))
-               (swap-node location newnode buffer)
-               (if-let (state (completion-state buffer))
-                 (setf (completion-state buffer)
-                       (copy-completion-state state :anchor newnode))
-                 (when (plusp (length s)) ; now length 2, completion for if
-                   (setf (completion-state buffer)
-                         (make-completion-state
-                          :anchor newnode
-                          :candidates (completion-candidates buffer))))))
-             t)
-            ((char= c #\Rubout)
-             (let ((s (string s)))
-               (if (< 1 (length s))
-                   (let ((newnode (make-instance 'parse:symbol-ref
-                                                 :name (string-drop s 1)
-                                                 :home-package (parse:home-package node))))
-                     (swap-node location newnode buffer)
-                     (when (completion-state buffer)
-                       (setf (completion-state buffer)
-                             (make-completion-state
-                              :anchor newnode
-                              :candidates (completion-candidates buffer)))))
-                   (swap-node location (hole) buffer)))
-             t)))))
 
 (defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (/= . #\≠) (lambda . "λ")))
 
@@ -1155,29 +539,6 @@ column. Returns NIL if not found."
                    :key-handler (when focused
                                   (global-key-handler node location))
                    :focused focused)))
-
-;;; binders
-(defmethod handle-key ((node parse:binder) view location buffer event)
-  (when (is-regular-char-event event)
-    (let ((s (parse:name node))
-          (c (tui:event-kind event)))
-      (cond ((and (symbol-char-p c) (not (char= c #\:)))
-             (swap-node location
-                        (make-instance 'parse:binder
-                                       :name (format nil "~a~a" s (string-upcase c))
-                                       :home-package (parse:home-package node))
-                        buffer)
-             t)
-            ((char= c #\Rubout)
-             (let ((s (string s)))
-               (if (< 1 (length s))
-                   (swap-node location
-                              (make-instance 'parse:binder
-                                             :name (string-drop s 1)
-                                             :home-package (parse:home-package node))
-                              buffer)
-                   (swap-node location (hole) buffer)))
-             t)))))
 
 (defmethod render-node ((node parse:binder) stack context rect &key)
   (let* ((location (car stack))
@@ -1450,26 +811,6 @@ Uses shared scratch cells and clears the touched scratch area on exit."
           (tui:focused view) (location= location (focus context)))
     view))
 
-;;; literals - no cursor state needed
-(defmethod handle-key ((node parse:literal) view location buffer event)
-  (when (is-regular-char-event event)
-    (let ((s (parse:str node))
-          (c (tui:event-kind event)))
-      (cond ((digit-char-p c)
-             (swap-node location
-                        (make-instance 'parse:literal :str (format nil "~a~a" s c))
-                        buffer)
-             t)
-            ((char= c #\Rubout)
-             (let ((s (string s)))
-               (if (< 1 (length s))
-                   (swap-node location
-                              (make-instance 'parse:literal
-                                             :str (string-drop s 1))
-                              buffer)
-                   (swap-node location (hole) buffer)))
-             t)))))
-
 (defun render-literal-line (line stack context rect &key style)
   (declare (ignore stack context))
   (tui:puts* line 1 1 rect style)
@@ -1505,52 +846,6 @@ Uses shared scratch cells and clears the touched scratch area on exit."
 (defmethod render-node ((node string) stack context rect &key)
   (render-literal-text node (format nil "~s" node) stack context rect))
 
-;;; function call
-(defparameter *fun-key-handlers* (make-hash-table :test #'equal))
-
-(defmethod handle-key ((node parse:function-call) view location buffer event)
-  ;; I don't expect function calls to have any special binds percolated up the tree
-  (when-let ((handler (gethash event *fun-key-handlers*)))
-    (when (and (< 1 (length (stack buffer)))
-               (location= location (second (stack buffer)))) ; we need to be a direct child
-      (funcall handler buffer))))
-
-(setf (gethash (tui-sys:make-event :kind #\space) *fun-key-handlers*)
-      (lambda (buffer)
-        (let* ((fun-loc (car (stack buffer)))
-               (fun-node (location-node fun-loc))
-               (id (location-id fun-loc))
-               (i (if (bodylike-id id) (1+ (id-index id)) 0)))
-          (insert-or-jump (make-location :node fun-node :id 'parse:body) i
-                          buffer (stack buffer)))))
-
-(defun rubout-eval-form (buffer)
-  "Replaces a focused evaluated form with a hole, or deletes a focused body hole."
-  (let* ((location (focus buffer))
-         (focused (node-at location)))
-    (cond ((or (typep focused 'parse:eval-form)
-               (and (typep focused 'parse:ref-list)
-                    (null (elements focused))
-                    (eq 'parse:eval-form (locsort location))))
-           (swap-node location (hole) buffer))
-          ((and (eq 'parse:eval-form (locsort location))
-                (typep focused 'hole))
-           (let ((id (location-id location))
-                 (parent (location-node location)))
-             ;; By default only delete children in a body
-             (when (bodylike-id id)
-               (let ((body-loc (make-location :node parent :id (parent-id id))))
-                 (save-history buffer)
-                 (if (< 1 (length (elements (node-at body-loc))))
-                     (ast-delete body-loc (id-index id) buffer)
-                     (edit-list body-loc
-                                (lambda (body)
-                                  (list-remove (elements body) (id-index id)))
-                                (move-back parent id) buffer (stack buffer)))
-                 t)))))))
-
-(setf (gethash (tui-sys:make-event :kind #\rubout) *fun-key-handlers*)
-      #'rubout-eval-form)
 
 ;; - unary operators have space removed
 ;; - for 2 arguments, draw *arb-arity-binops* infix
@@ -1927,62 +1222,6 @@ its first are aligned with the first, and a loop without keywords has a line per
                    :key-handler (global-key-handler node location)
                    :focused (location= location (focus context)))))
 
-(defparameter *macro-call-key-handlers* (make-hash-table :test #'equal))
-
-(defmethod handle-key ((node parse:macro-call) view location buffer event)
-  (declare (ignore view))
-  (when-let ((handler (gethash event *macro-call-key-handlers*)))
-    (let ((i (position-if (lambda (l) (location= location l)) (stack buffer))))
-      (unless (zerop i)
-        (funcall handler (nthcdr (1- i) (stack buffer)) buffer)))))
-
-(defun wrap-in-list (loc buffer stack)
-  "Wraps the value at `loc' in a syntax list, adding a hole afterwards unless it is
-already and focuses the hole."
-  (let ((holep (typep (node-at loc) 'parse:hole)))
-    (edit-list loc (lambda (thing) (if holep (ref-list thing) (ref-list thing (hole))))
-               (append-id (location-id loc) (if holep 0 1)) buffer stack)))
-
-(defun macro-body-id-p (id)
-  (and (consp id) (eq (car id) 'parse:body)))
-
-(setf (gethash (tui-sys:make-event :kind #\() *macro-call-key-handlers*)
-      (lambda (stack buffer)
-        (let ((loc (car stack)))
-          (when (macro-body-id-p (location-id loc))
-            (save-history buffer)
-            (wrap-in-list loc buffer stack)
-            t))))
-
-(setf (gethash (tui-sys:make-event :kind #\space) *macro-call-key-handlers*)
-      (lambda (stack buffer)
-        (let* ((loc (car stack))
-               (node (location-node loc))
-               (id (location-id loc)))
-          (multiple-value-bind (list-id index)
-              (cond ((eq id 'parse:op) (values 'parse:body 0))
-                    ((handle-focus-p buffer loc) (values id 0))
-                    (t (values (parent-id id) (1+ (lastcar id)))))
-            (insert-or-jump (make-location :node node :id list-id) index buffer stack))
-          t)))
-
-(setf (gethash (tui-sys:make-event :kind #\rubout) *macro-call-key-handlers*)
-      (lambda (stack buffer)
-        (let* ((loc (car stack))
-               (id (location-id loc)))
-          (when (macro-body-id-p id)
-            (let ((parent (make-location :node (location-node loc) :id (parent-id id))))
-              (save-history buffer)
-              (if (= 1 (length (elements (node-at parent))))
-                  (edit-list parent (constantly nil)
-                             (if (eq (location-id parent) 'parse:body)
-                                 'parse:op
-                                 ;; focus a nested list
-                                 (location-id parent))
-                             buffer stack)
-                  (ast-delete parent (lastcar id) buffer stack))
-              t)))))
-
 ;;; quasiquote
 (defmethod render-node ((node parse:quasiquote-form) stack context rect &key)
   (let* ((location (car stack))
@@ -2159,116 +1398,6 @@ pairs building new elements of &rest and &body slots."))
                    :key-handler (global-key-handler node location)
                    :focused (location= location (focus context)))))
 
-(defparameter *layout-key-handlers* (make-hash-table :test #'equal)
-  "Map from event to callbacks (layout, child-stack, buffer) -> bool whether to propagate.")
-
-(defmethod handle-key ((node parse:irregular-form) view location buffer event)
-  (declare (ignore view))
-  (when-let ((layout (gethash (type-of node) *layouts*))
-             (handler (gethash event *layout-key-handlers*)))
-    (let ((i (position-if (lambda (l) (location= location l)) (stack buffer))))
-      (unless (zerop i)
-        (funcall handler layout (nthcdr (1- i) (stack buffer)) buffer)))))
-
-(defun rubout-tree-slot (loc stack buffer)
-  "Deletes at `loc', keeping focus valid when a declaration list becomes empty."
-  (save-history buffer)
-  (let* ((id (location-id loc))
-         (node (location-node loc)))
-    (if (consp id)
-        (let* ((parent-id (parent-id id))
-               (parent (make-location :node node :id parent-id)))
-          (if (= 1 (length (elements (node-at parent))))
-              (edit-list parent (constantly nil)
-                         (if (member parent-id '(parse:decls parse:declarations))
-                             (move-back node parent-id)
-                             parent-id)
-                         buffer stack)
-              (ast-delete parent (lastcar id) buffer stack)))
-        (swap-node loc (hole) buffer))))
-
-(defun layout-rubout (layout stack buffer)
-  "Deletes the focused element of a list slot, or restores the slot to its template."
-  (let* ((loc (car stack))
-         (node (location-node loc))
-         (id (location-id loc))
-         (slot (ensure-car id))
-         (template (layout-template layout slot)))
-    (cond
-      (template
-       (let ((rest-loc (make-location :node node :id slot)))
-         (flet ((reset ()
-                  (save-history buffer)
-                  (edit-list rest-loc (constantly (list (funcall template)))
-                             (append-id slot 0) buffer stack)
-                  (focus-hole-in-slot buffer)
-                  t))
-           (cond ((symbolp id)
-                  (reset))
-                 ((or (= 2 (length id)) (= 3 (length id)))
-                  (if (= 1 (length (elements (node-at rest-loc))))
-                      (reset)
-                      (progn (save-history buffer)
-                             (ast-delete rest-loc (second id) buffer stack))))))))
-      ((member (slot-kind layout slot) '(parse::&tree parse::&declarations))
-       (rubout-tree-slot loc stack buffer)))))
-
-(defun layout-space (layout stack buffer)
-  "Graphically inserts after, or jumps to the next adjacent hole."
-  (let* ((loc (car stack))
-         (node (location-node loc))
-         (id (location-id loc))
-         (slot (ensure-car id))
-         (next (when (symbolp id)
-                 (find-if (lambda (next)
-                            (or (not (eq (slot-kind layout next) 'parse::&declarations))
-                                (funcall next node)))
-                          (cdr (member id (layout-slots layout))))))
-         (template (layout-template layout slot)))
-    (cond
-      ((handle-focus-p buffer loc)
-       (let ((item (if template (funcall template) (hole))))
-         (insert-or-jump loc 0 buffer stack
-                         :item item :tail (when (typep item 'ref-list) '(0)))))
-      (next
-       (let ((next-loc (make-location :node node :id next))
-             (next-template (layout-template layout next)))
-         (if (and (member (cdr (assoc next (parse:form-slot-kinds (type-of node))))
-                          '(&rest &body parse::&tree parse::&declarations))
-                  (gen-list-p (node-at next-loc)))
-             (insert-or-jump next-loc 0 buffer stack
-                             :item (if next-template (funcall next-template) (hole)))
-             (refocus buffer next))))
-      ((and template (consp id))
-       (let ((rest-loc (make-location :node node :id slot))
-             (nested (typep (funcall template) 'ref-list)))
-         (case (length id)
-           (2 (if nested ; e.g. (body i), or (rest i) which needs traverse
-                  (insert-or-jump rest-loc (1+ (second id)) buffer stack
-                                  :item (funcall template) :tail '(0))
-                  (insert-or-jump rest-loc (1+ (second id)) buffer stack)))
-           (3 (when nested
-                (insert-or-jump (make-location :node node :id (list slot (second id)))
-                                (1+ (third id)) buffer stack)))
-           (t (slog* (format nil "no space action for ~a" (length id)))))))
-      ((and (member (slot-kind layout slot) '(parse::&tree parse::&declarations))
-            (consp id))
-       (insert-or-jump (make-location :node node :id (parent-id id))
-                       (1+ (lastcar id)) buffer stack)))))
-
-(defun layout-wrap (layout stack buffer)
-  "Wraps the focused part of an unevaluated slot in a syntax list."
-  (let ((loc (car stack)))
-    (when (member (slot-kind layout (ensure-car (location-id loc)))
-                  '(parse::&tree parse::&declarations))
-      (save-history buffer)
-      (wrap-in-list loc buffer stack)
-      t)))
-
-(setf (gethash (tui-sys:make-event :kind #\rubout) *layout-key-handlers*) #'layout-rubout
-      (gethash (tui-sys:make-event :kind #\space) *layout-key-handlers*) #'layout-space
-      (gethash (tui-sys:make-event :kind #\() *layout-key-handlers*) #'layout-wrap)
-
 (defun register-layout (layout)
   (assert (ends-with-subseq "-FORM" (string (layout-op layout))))
   (let ((len (length "-FORM")))
@@ -2436,94 +1565,6 @@ ASSUMES we never focus a plain list body."
                                                 :lambda-list (ref-list (hole))
                                                 :body (list (hole))))))
 
-;;; function-code
-(defparameter *fun-code-key-handlers* (make-hash-table :test #'equal))
-
-(defmethod handle-key ((node parse:function-code) view location buffer event)
-  (declare (ignore view))
-  (when-let ((handler (gethash event *fun-code-key-handlers*)))
-    (let ((i (position-if (lambda (l) (location= location l)) (stack buffer))))
-      (unless (zerop i)
-        (funcall handler (nthcdr (1- i) (stack buffer)) buffer)))))
-
-(setf
- (gethash (tui-sys:make-event :kind #\rubout) *fun-code-key-handlers*)
- (lambda (stack buffer)
-   (declare (ignore stack buffer))
-   t))
-
-(setf
- (gethash (tui-sys:make-event :kind #\space) *fun-code-key-handlers*)
- (lambda (stack buffer)
-   (let* ((loc (car stack))
-          (node (location-node loc)))
-     (flet ((insert-into (id index)
-              (insert-or-jump (make-location :node node :id id) index buffer stack))
-            (shorter-than (id limit)
-              (< (length (elements (node-at (make-location :node node :id id)))) limit)))
-       (trivia:cmatch (location-id loc)
-         ((list* (eql 'parse:declarations) path)
-          (insert-into (parent-id (location-id loc)) (1+ (lastcar path))))
-         ((list (eql 'parse:lambda-list) (and (type integer) i))
-          (insert-into 'parse:lambda-list (1+ i)))
-         ((eql 'parse:lambda-list) (insert-into 'parse:lambda-list 0))
-         ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j))
-          (when (shorter-than `(parse:lambda-list ,i) 3)
-            (insert-into `(parse:lambda-list ,i) (1+ j))))
-         ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j)
-                (and (type integer) k))
-          (when (shorter-than `(parse:lambda-list ,i ,j) 2)
-            (insert-into `(parse:lambda-list ,i ,j) (1+ k))))
-         ((eql 'parse:docstring)
-          (insert-into 'parse:body 0))
-         ((list (eql 'parse:body) (and (type integer) i))
-          (insert-into 'parse:body (1+ i))))))))
-
-(setf
- (gethash (tui-sys:make-event :kind #\() *fun-code-key-handlers*)
- (lambda (stack buffer)
-   (let ((loc (car stack)))
-     (trivia:match (location-id loc)
-       ((list* (eql 'parse:declarations) _)
-        (save-history buffer)
-        (wrap-in-list loc buffer stack)
-        t)
-       ((or (list (eql 'parse:lambda-list) (type integer))
-            (list (eql 'parse:lambda-list) (type integer) (type integer)))
-        (save-history buffer)
-        (edit-list loc (lambda (param) (ref-list param (hole)))
-                   (append-id (location-id loc) 1) buffer stack)
-        t)))))
-
-(setf
- (gethash (tui-sys:make-event :kind #\rubout) *fun-code-key-handlers*)
- (lambda (stack buffer)
-   (let* ((loc (car stack))
-          (node (location-node loc))
-          (ll-loc (make-location :node node :id 'parse:lambda-list)))
-     (trivia:match (location-id loc)
-       ((list* (eql 'parse:declarations) _)
-        (rubout-tree-slot loc stack buffer))
-       ((list (eql 'parse:lambda-list) (and (type integer) i))
-        (save-history buffer)
-        (if (= 1 (length (parse:elements (node-at ll-loc))))
-            (swap-node ll-loc (parse:ref-list) buffer)
-            (ast-delete ll-loc i buffer stack)))
-       ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j))
-        (unless (zerop j)
-          (save-history buffer)
-          (ast-delete (make-location :node node :id `(parse:lambda-list ,i)) j
-                      buffer stack)))
-       ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j)
-              (and (type integer) k))
-        (unless (zerop k)
-          (save-history buffer)
-          (ast-delete (make-location :node node :id `(parse:lambda-list ,i ,j))
-                      k buffer stack)))
-       ((eql 'parse:lambda-list)
-        (save-history buffer)
-        (swap-node ll-loc (parse:ref-list) buffer))))))
-
 ;;; function-code (lambda-list, documentation and body, shared by defun/defmacro/
 ;;; defmethod/lambda/flet/labels), including declarations.
 (defmethod render-node ((node parse:function-code) stack context rect &key)
@@ -2578,409 +1619,6 @@ ASSUMES we never focus a plain list body."
             rect)
      :key-handler (global-key-handler node location)
      :focused (location= location (focus context)))))
-
-;;; global key handlers
-(defun build-arglist (fname &optional old-body)
-  (let* ((arglist (when (fboundp fname) (slynk-backend:arglist fname)))
-         (argcount (if (proper-list-p arglist)
-                       (loop for a in arglist
-                             until (member a lambda-list-keywords)
-                             count t)
-                       0)))
-    (append old-body
-            (loop for i below (max 1 (- argcount (length old-body)))
-                  collect (hole)))))
-
-(defun build-call (ref &optional old-body)
-  "ref must be a symbol-ref"
-  (check-type ref parse:symbol-ref)
-  (let ((fname (parse:resolve ref)))
-    (if-let (expansion (gethash fname *default-expansions*))
-      (funcall expansion)
-      (let ((syntax
-              (apply #'ref-list (parse:copy-node ref)
-                     (build-arglist fname
-                                    (mapcar (lambda (form)
-                                              (parse:copy-syntax (parse:to-syntax form)))
-                                            old-body)))))
-        (handler-case (slog (parse:parse-syntax syntax))
-          (parse:ast-parse-error () nil))))))
-
-(defun hole-path (node id)
-  "The path from `node' to the first hole at `id' or below it, entering only lists
-addressed by indices."
-  (let ((value (node-at (make-location :node node :id id))))
-    (cond ((typep value 'hole) (list id))
-          ((typep value 'parse:function-code)
-           (when-let (path (or (list-hole-path value 'parse:lambda-list)
-                               (list-hole-path value 'parse:body)))
-             (cons id path)))
-          ((and (consp id) (gen-list-p value)) (list-hole-path node id)))))
-
-(defun list-hole-path (node id)
-  (let ((value (node-at (make-location :node node :id id))))
-    (assert (gen-list-p value))
-    (loop for i below (length (elements value))
-          thereis (hole-path node (append-id id i)))))
-
-(defun focus-hole-in-slot (buffer)
-  "Focuses the first hole at or below the focused location."
-  (let* ((loc (focus buffer))
-         (node (location-node loc))
-         (id (location-id loc)))
-    (when-let (path (if (symbolp id)
-                        (list-hole-path node id)
-                        (hole-path node id)))
-      (refocus buffer (first path))
-      (dolist (id (rest path))
-        (descend buffer id)))))
-
-(defun focus-first-hole (buffer)
-  (let ((node (node-at (focus buffer))))
-    (loop for (slot . kind) in (parse:form-slot-kinds (type-of node))
-          do (when-let (path
-                        (if (and (member kind
-                                         '(&rest &body parse::&tree parse::&declarations))
-                                 (gen-list-p (node-at (make-location :node node :id slot))))
-                            (list-hole-path node slot)
-                            (hole-path node slot)))
-               (dolist (id path)
-                 (descend buffer id))
-               (return)))))
-
-(setf (gethash (tui-sys:make-event :kind #\space) *global-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (let ((stack (stack buffer)))
-          (when (= (length stack) 1)
-            (let* ((toplevel (car stack))
-                   (i (location-id toplevel)))
-              (assert (integerp i))
-              (save-history buffer)
-              (let ((newroot (list-insert (location-node toplevel) (hole) (1+ i))))
-                (commit-edit buffer
-                             (cons (make-location :node newroot :id (1+ i))
-                                   (rest stack))
-                             newroot)))))))
-
-(setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (when-let* ((state (completion-state buffer))
-                    (selection (nth (selection state) (candidates state))))
-          (let ((s selection))
-            (cond
-              ((fboundp s)
-               (let ((name-node (make-instance 'parse:symbol-ref
-                                               :name (symbol-name s)
-                                               :home-package (symbol-package s)))
-                     (sort (locsort (focus buffer))))
-                 (case sort
-                   (parse:eval-form
-                    (when-let (call (build-call name-node))
-                      (swap-node (focus buffer) call buffer)
-                      (focus-first-hole buffer)))
-                   (parse:unevaluated
-                    (when-let (call (build-call name-node))
-                      (swap-node (focus buffer) (parse:to-syntax call) buffer)
-                      (focus-first-hole buffer)))
-                   ;; operator call
-                   (parse:fun-designator
-                    (when (eq (locsort (second (stack buffer))) 'parse:eval-form)
-                      (when-let (call (build-call name-node
-                                                  (parse:body
-                                                   (location-node (focus buffer)))))
-                        (swap-node (second (stack buffer)) call buffer)
-                        (focus-first-hole buffer))))
-                   (t t))))
-              ((gethash s *default-expansions*)
-               (let ((focus (focus buffer)))
-                 ;; replace the whole parent function node if editing the name
-                 (swap-node (if (and (typep (location-node focus) 'parse:function-call)
-                                     (eq (location-id focus) 'parse:name))
-                                (second (stack buffer))
-                                focus)
-                            (funcall (gethash s *default-expansions*))
-                            buffer))
-               (focus-first-hole buffer))
-              (t
-               (swap-node (focus buffer)
-                          (make-instance 'parse:symbol-ref
-                                         :name (symbol-name s)
-                                         :home-package (symbol-package s))
-                          buffer))))
-          (setf (completion-state buffer) nil)
-          t)))
-
-(setf (gethash (tui-sys:make-event :kind #\newline) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (let ((ref (node-at (focus buffer))))
-          (when (and (typep ref 'parse:symbol-ref)
-                     (eq 'parse:eval-form (locsort (focus buffer))))
-            (when-let (call (build-call ref))
-              (swap-node (focus buffer) call buffer)
-              (focus-first-hole buffer)
-              t)))))
-
-(defun reify (object)
-  (typecase object
-    (number (make-instance 'parse:literal :str (princ-to-string object)))
-    (string (make-instance 'parse:literal :str (princ-to-string object)))
-    (character (make-instance 'parse:literal :str (princ-to-string object)))
-    (list (make-instance 'parse:quote-form
-                         :op 'parse:read-quote
-                         :thing (apply #'ref-list (mapcar #'reify object))))
-    (t (ref-list))))
-
-;; TODO capture i/o using gray streams
-(setf (gethash (tui-sys:make-event :kind #\e :altp t) *global-key-handlers*)
-      (lambda (view buffer)
-        (let ((stack (stack buffer))
-              (rect (staging-to-absolute-coordinates ; screen-absolute coordinates
-                     (tui:rect view) (scroll-state-viewport (scroll-state buffer))
-                     (buffer-rect buffer))))
-          (handler-bind ((warning #'muffle-warning))
-            (parse::with-temporary-interning (interned)
-              (let* ((raw (parse::strip-wrappers
-                           (parse:to-syntax (node-at (car stack)))
-                           interned))
-                     (*standard-output* (make-broadcast-stream))
-                     (res (eval raw)))
-                (slog* (format nil "eval produced ~a" res))
-                (add-buffer
-                 (buffer-ui buffer)
-                 :ast (list (reify res)) :floating t
-                 :package (buffer-package buffer)
-                 :x (tui:rect-x2 rect) :y (tui:rect-y rect))))))))
-
-;; convert back to hole
-(setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (rubout-eval-form buffer)))
-
-(setf (gethash (tui-sys:make-event :kind :right-arrow :controlp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (let* ((stack (stack buffer))
-               (loc (car stack))
-               (up (location-node loc))
-               (ploc (cadr stack))
-               (upup (location-node ploc)))
-          (when (and (is-binop-call up) (is-binop-call upup)
-                     (trivia:match (location-id ploc)
-                       ((list (eql 'parse:body) (eql 0)) t))
-                     (trivia:match (location-id loc)
-                       ((list (eql 'parse:body) (eql 1)) t)))
-            (swap-node (caddr stack)
-                       (make-instance
-                        'parse:function-call
-                        :name (parse:name up)
-                        :body (list (first (parse:body up))
-                                    (make-instance
-                                     'parse:function-call
-                                     :name (parse:name upup)
-                                     :body (list (second (parse:body up))
-                                                 (second (parse:body upup))))))
-                       buffer)
-            (descend buffer '(parse:body 1))
-            (descend buffer '(parse:body 0))))))
-
-(setf (gethash (tui-sys:make-event :kind :left-arrow :controlp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (let* ((stack (stack buffer))
-               (loc (car stack))
-               (up (location-node loc))
-               (ploc (cadr (stack buffer)))
-               (upup (location-node ploc)))
-          (when (and (is-binop-call up) (is-binop-call upup)
-                     (trivia:match (location-id ploc)
-                       ((list (eql 'parse:body) (eql 1)) t))
-                     (trivia:match (location-id loc)
-                       ((list (eql 'parse:body) (eql 0)) t)))
-            (swap-node (caddr stack)
-                       (make-instance
-                        'parse:function-call
-                        :name (parse:name up)
-                        :body (list (make-instance
-                                     'parse:function-call
-                                     :name (parse:name upup)
-                                     :body (list (first (parse:body upup))
-                                                 (first (parse:body up))))
-                                    (second (parse:body up))))
-                       buffer)
-            (descend buffer '(parse:body 0))
-            (descend buffer '(parse:body 1))))))
-
-(defun take-selection (buffer selection)
-  "Reifies selection state into the cutbuffer without editing."
-  (if (typep selection 'zipper)
-      (setf (zipper buffer) selection
-            (cutbuffer buffer) nil)
-      (setf (cutbuffer buffer) (copy-locations (selection-locations selection))
-            (zipper buffer) nil))
-  t)
-
-(defun empty-list-placeholder (loc)
-  (let* ((node (location-node loc))
-         (id (location-id loc))
-         (value (node-at loc))
-         (layout (gethash (type-of node) *layouts*))
-         (template (when (and layout (symbolp id)) (layout-template layout id))))
-    (cond (template (if (listp value)
-                        (list (funcall template))
-                        (ref-list (funcall template))))
-          ((listp value) (list (hole)))
-          (t (check-type value ref-list)))))
-
-(defun cut-selection (buffer selection)
-  "Cuts the current selection or zipper, modifying the ast."
-  (let ((forms (selection-forms selection)))
-    (take-selection buffer selection)
-    (if (typep selection 'zipper)
-        (let* ((stack (nthcdr (zipper-depth selection) (stack buffer)))
-               (hole (car stack))
-               (id (location-id hole)))
-          (if (> (length forms) 1)
-              ;; a zipper may top out at any eval-form, which is not always a place
-              ;; several forms can be left in e.g. dotimes counter
-              (when (eval-list-position-p hole)
-                (save-history buffer)
-                (let ((slot (parent-id id))
-                      (index (id-index id)))
-                  (edit-list (make-location :node (location-node hole) :id slot)
-                             (lambda (body)
-                               (let ((elts (elements body)))
-                                 `(,@(subseq elts 0 index)
-                                   ,@forms
-                                   ,@(subseq elts (1+ index)))))
-                             (append-id slot index) buffer stack)))
-              (progn
-                (save-history buffer)
-                (ast-replace hole (constantly (first forms)) buffer stack))))
-        (multiple-value-bind (low high) (selection-range selection)
-          (save-history buffer)
-          (let* ((list-loc (selection-list-location selection))
-                 (slot (selection-parent-id selection))
-                 (elts (elements (node-at list-loc)))
-                 (new (or `(,@(subseq elts 0 low) ,@(subseq elts (1+ high)))
-                          (empty-list-placeholder list-loc))))
-            (edit-list list-loc (constantly new)
-                       (if (elements new) (append-id slot (max 0 (1- low))) slot)
-                       buffer (stack buffer)))))
-    t))
-
-(setf (gethash (tui-sys:make-event :kind #\c :controlp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (if-let (selection (selection-at-focus buffer))
-          (take-selection buffer selection)
-          (let ((loc (focus buffer)))
-            (when (locsort loc)
-              (setf (cutbuffer buffer) (copy-locations (list loc))
-                    (zipper buffer) nil))))
-        t))
-
-(setf (gethash (tui-sys:make-event :kind #\x :controlp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (if-let (selection (selection-at-focus buffer))
-          (cut-selection buffer selection)
-          (let ((loc (focus buffer)))
-            (when (locsort loc)
-              (setf (cutbuffer buffer) (copy-locations (list loc))
-                    (zipper buffer) nil)
-              (swap-node loc (hole) buffer))))
-        t))
-
-(defun paste-conversion (from to)
-  "Controls copying between location sorts."
-  (cond ((and from (equal from to)) #'parse:copy-node)
-        ((and (eq from 'parse:eval-form) (eq to 'parse:unevaluated))
-         (lambda (form) (parse:to-syntax (parse:copy-node form))))))
-
-(defun paste-forms (buffer clipboard)
-  "Pastes the forms of `clipboard' after the focused list element, over the selection at
-the focus, or over a focused hole.
-Each form is checked for convertibility against the sort of the position it's pasted into,
-forms past the end of a selection taking the sort of its last position."
-  (let* ((focus (focus buffer))
-         (id (location-id focus))
-         (selection (when-let (selection (selection-at-focus buffer))
-                      (when (= (id-index id) (selection-range selection))
-                        selection)))
-         (targets (if selection
-                      (mapcar #'locsort (selection-locations selection))
-                      (list (locsort focus))))
-         (converts (loop for sort in (slog (cutbuffer-sorts clipboard))
-                         for i from 0
-                         collect (paste-conversion
-                                  sort (nth (min i (1- (length targets))) targets)))))
-    (when (every #'identity converts)
-      (let ((forms (mapcar #'funcall converts (cutbuffer-forms clipboard))))
-        (cond ((bodylike-id id)
-               (multiple-value-bind (start end)
-                   (cond (selection
-                          (multiple-value-bind (low high) (selection-range selection)
-                            (values low (1+ high))))
-                         ((typep (node-at focus) 'parse:hole)
-                          (values (id-index id) (1+ (id-index id))))
-                         (t
-                          (values (1+ (id-index id)) (1+ (id-index id)))))
-                 (let ((slot (parent-id id)))
-                   (save-history buffer)
-                   (setf (selection buffer) nil)
-                   (edit-list (make-location :node (location-node focus) :id slot)
-                              (lambda (body)
-                                (let ((elts (elements body)))
-                                  `(,@(subseq elts 0 start) ,@forms ,@(subseq elts end))))
-                              (append-id slot (+ start (length forms) -1))
-                              buffer (stack buffer)))))
-              ((= 1 (length forms))
-               (swap-node focus (first forms) buffer)))))))
-
-(defun fill-zipper (zipper forms)
-  "Fills the zipper hole with forms and returns a complete node."
-  (multiple-value-bind (low high) (selection-range zipper)
-    (parse:copy-node
-     (nth-value 1 (rebuild-spine (selection-list-location zipper)
-                                 (lambda (body)
-                                   (let ((elts (elements body)))
-                                     `(,@(subseq elts 0 low)
-                                       ,@forms
-                                       ,@(subseq elts (1+ high)))))
-                                 (zipper-stack zipper))))))
-
-(defun paste-zipper (buffer zipper)
-  "Pastes from (zipper buffer) around the current selection using fill-zipper,
-modifying the ast."
-  (let ((focus (focus buffer))
-        (selection (selection-at-focus buffer)))
-    (if selection
-        (multiple-value-bind (low high) (selection-range selection)
-          (let ((forms (selection-forms selection))
-                (slot (selection-parent-id selection)))
-            (save-history buffer)
-            (edit-list (selection-list-location selection)
-                       (lambda (body)
-                         (let ((elts (elements body)))
-                           `(,@(subseq elts 0 low)
-                             ,(fill-zipper zipper forms)
-                             ,@(subseq elts (1+ high)))))
-                       (append-id slot low) buffer (stack buffer))))
-        (when (eq 'parse:eval-form (locsort focus))
-          (swap-node focus (fill-zipper zipper (list (node-at focus))) buffer)))
-    t))
-
-(setf (gethash (tui-sys:make-event :kind #\v :controlp t) *default-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        ;; these are mutually exclusive as cutting a zipper nulls the cutbuffer
-        (cond ((zipper buffer) (paste-zipper buffer (zipper buffer)))
-              ((cutbuffer buffer) (paste-forms buffer (cutbuffer buffer))))
-        t))
 
 ;;; completions
 (defun render-completion (sym index state rect)
@@ -3329,24 +1967,25 @@ as `viewport'."
                                         (funcall printer out))))
     (error () "<error printing debugger entry>")))
 
+(defun restart-depth (restart state)
+  "Returns the oldest debugger depth containing `restart' in `state'."
+  (loop for captured in (debug-restarts state)
+        for level downfrom (length (debug-conditions state))
+        when (member restart captured :test #'eq)
+          minimize level))
+
 (defmethod draw-buffer (buffer (state debug-state))
   (let* ((ui (buffer-ui buffer))
          (condition (first (debug-conditions state)))
          (restarts (first (debug-restarts state)))
-         (depth (length (debug-conditions state)))
          (frames (slynk-backend:compute-backtrace 0 *debugger-entries*))
          (lines (append
                  (list (slynk::safe-condition-message condition) "Restarts:")
                  (loop for restart in restarts for i from 0
-                       for restart-depth
-                         = (loop for captured in (debug-restarts state)
-                                 for level downfrom depth
-                                 when (member restart captured :test #'eq)
-                                   minimize level)
                        collect (debugger-text
                                 (lambda (out)
                                   (format out "~d [depth ~d]: ~a"
-                                          i restart-depth restart))))
+                                          i (restart-depth restart state) restart))))
                  (list "Backtrace:")
                  (loop for frame in frames for i from 0
                        collect (format nil "~d: ~a" i (slynk::frame-to-string frame)))))
@@ -3525,7 +2164,8 @@ as `viewport'."
    (zipper :type (or null zipper))
    (cutbuffer :type (or null cutbuffer))
    (focused-buffer)
-   (new-buffers :init nil :type list))
+   (new-buffers :init nil :type list)
+   (closed-buffers :init nil :type list))
   (:representation :class))
 
 (defun handle-pane-drag (ui event target)
@@ -3563,6 +2203,9 @@ as `viewport'."
          t)))))
 
 (defun dispatch-ui-event (ui event)
+  (when-let (handler (gethash event *ui-key-handlers*))
+    (funcall handler ui)
+    (return-from dispatch-ui-event))
   (let* ((mouse (when (tui:mouse-event-p event) (tui:event-kind event)))
          ;; currently only completion
          (overlay (when (and mouse (tui:root-view ui))
@@ -3621,20 +2264,25 @@ as `viewport'."
                                         :render-state (render-state buffer)))
                          originals)))
     (setf (buffers working) copies
-          (slot-value working 'focused-buffer) (nth (position (focused-buffer ui) originals)
-                                                    copies))
+          (slot-value working 'focused-buffer) (when-let (focused (focused-buffer ui))
+                                                (find (buffer-id focused) copies
+                                                      :key #'buffer-id)))
     (dispatch-ui-event working event)
     (let ((new (mapcar (lambda (buffer)
                          (make-buffer :buffer-ui ui :buffer-id (buffer-id buffer)
                                       :buffer-state (buffer-state buffer)))
-                       (nthcdr (length copies) (buffers working)))))
+                       (remove-if (lambda (buffer) (member buffer copies)) (buffers working)))))
       (values copies
               (make-ui-effects
                :selection (selection working) :zipper (zipper working)
                :cutbuffer (cutbuffer working)
                :pane-drag (pane-drag working) :new-buffers new
-               :focused-buffer (find (buffer-id (focused-buffer working))
-                                     (append originals new) :key #'buffer-id))))))
+               :closed-buffers (loop for copy in copies
+                                     unless (member copy (buffers working))
+                                       collect (buffer-id copy))
+               :focused-buffer (when-let (focused (focused-buffer working))
+                                 (find (buffer-id focused) (append originals new)
+                                       :key #'buffer-id)))))))
 
 (defmethod tui:dispatch-event ((ui ui) event)
   (let ((revision (revision ui)))
@@ -3645,7 +2293,11 @@ as `viewport'."
       (when (= revision (revision ui))
         (loop for buffer in (buffers ui) for copy in copies
               do (setf (buffer-state buffer) (buffer-state copy)))
-        (setf (buffers ui) (append (buffers ui) (new-buffers effects)))
+        (setf (buffers ui) (append (remove-if (lambda (buffer)
+                                           (member (buffer-id buffer)
+                                                   (closed-buffers effects)))
+                                         (buffers ui))
+                                  (new-buffers effects)))
         (setf (pane-drag ui) (pane-drag effects)
               (selection ui) (selection effects)
               (zipper ui) (zipper effects)
@@ -3654,7 +2306,7 @@ as `viewport'."
         (incf (revision ui))))))
 
 (defmethod tui:dispatch-event :around ((ui ui) event)
-  (with-simple-restart (ignore-event "ignore event-handling error")
+  (with-simple-restart (abort "ignore event-handling error")
     (if (and (not (tui:mouse-event-p event))
              (equal (tui:event-kind event) #\q)
              (tui:event-controlp event))
