@@ -6,6 +6,7 @@
 ;; same space as the supplied bounds unless specified.
 ;; Importantly, the render-* functions produce rendered views with rects relative to
 ;; their parent buffer's top left corner.
+;; note: debugger code must NOT error, catch any printing errors
 
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
@@ -254,6 +255,15 @@ If this returns NIL, propagate up the cursor stack.")
    (render-state :init (make-render-state) :mutable t :type render-state))
   (:representation :class))
 
+(defrecord debug-state ()
+  ((debug-conditions :init () :mutable t :type list)
+   (debug-restarts :init () :mutable t :type list)
+   (buffer-x :init 0 :mutable t :type (integer 0))
+   (buffer-y :init 0 :mutable t :type (integer 0)))
+  (:representation :class))
+
+(defmethod floating ((state debug-state)) t)
+
 (macrolet ((buffer-state-accessors (state readers &rest accessors)
              `(progn
                 ,@(loop for name in (append readers accessors)
@@ -266,7 +276,7 @@ If this returns NIL, propagate up the cursor stack.")
   (buffer-state-accessors
    buffer-state ()
    floating buffer-package buffer-source buffer-x buffer-y ast edit-loc goal-col
-   completion-state
+   completion-state debug-conditions debug-restarts
    history future stack goal-stacks)
   (buffer-state-accessors
    render-state (stage-cache redisplay-cache node-views)
@@ -769,6 +779,11 @@ column. Returns NIL if not found."
       #'move-up)
 (setf (gethash (tui-sys:make-event :kind :up-arrow) *default-key-handlers*)
       #'move-up)
+
+(setf (gethash (tui-sys:make-event :kind #\e :controlp t) *default-key-handlers*)
+      (lambda (&rest args)
+        (declare (ignore args))
+        (break)))
 
 (defun move-left (view buffer)
   (atom-move
@@ -3232,7 +3247,7 @@ as `viewport'."
                    :rows (max 0 (- (tui:rows ui) (buffer-y buffer)))
                    :cols (max 0 (- (tui:cols ui) (buffer-x buffer))))))
 
-(defun buffer-rect (buffer)
+(defun buffer-rect (buffer &optional (col-bound most-positive-fixnum))
   "Returns an absolute coordinate rect bounding the content viewport of `buffer'."
   (let* ((rect (buffer-outer-rect buffer))
          (inset (if (floating buffer) 1 0)))
@@ -3240,7 +3255,8 @@ as `viewport'."
                    :x (+ (tui:rect-x rect) (min inset (tui:rect-cols rect)))
                    :y (+ (tui:rect-y rect) (min inset (tui:rect-rows rect)))
                    :rows (max 0 (- (tui:rect-rows rect) (* 2 inset)))
-                   :cols (max 0 (- (tui:rect-cols rect) (* 2 inset))))))
+                   :cols (max 0 (min (- (tui:rect-cols rect) (* 2 inset))
+                                     col-bound)))))
 
 (defun fit-floating-buffer (buffer)
   "Fits `buffer' to its contents, keeping its border inside the screen."
@@ -3286,21 +3302,94 @@ as `viewport'."
       (tui:put #\└ rows 1 rect style)
       (tui:put #\┘ rows cols rect style))))
 
-(defun draw-buffer (buffer)
+(defmethod draw-buffer (buffer (state buffer-state))
   (when (floating buffer)
     (fit-floating-buffer buffer)
     (draw-buffer-border buffer))
   (let ((buffer-rect (buffer-rect buffer)))
     (when (and (plusp (tui:rect-rows buffer-rect))
                (plusp (tui:rect-cols buffer-rect)))
-      (tui:fill-rect (tui:make-style :bg #x0)
-                     buffer-rect
+      (tui:fill-rect (tui:make-style :bg #x0) buffer-rect
                      :char #\space)
       (let* ((content (render-toplevel-window buffer buffer-rect))
              (offset (scroll-state-viewport (scroll-state buffer))))
         (draw-semantic-backgrounds buffer content offset buffer-rect)
         (draw-highlights buffer content offset buffer-rect)
         (setf (buffer-view buffer) content)))))
+
+(defparameter *debugger-entries* 10)
+(defparameter *max-debugger-width* 60)
+(defun debugger-text (printer)
+  "Captures `printer' output without recursively debugging printing failures."
+  (handler-case
+      (let ((*print-circle* t)
+            (*print-level* 5)
+            (*print-length* 20))
+        (substitute #\space #\newline (with-output-to-string (out)
+                                        (funcall printer out))))
+    (error () "<error printing debugger entry>")))
+
+(defmethod draw-buffer (buffer (state debug-state))
+  (let* ((ui (buffer-ui buffer))
+         (condition (first (debug-conditions state)))
+         (restarts (first (debug-restarts state)))
+         (depth (length (debug-conditions state)))
+         (frames (slynk-backend:compute-backtrace 0 *debugger-entries*))
+         (lines (append
+                 (list (slynk::safe-condition-message condition) "Restarts:")
+                 (loop for restart in restarts for i from 0
+                       for restart-depth
+                         = (loop for captured in (debug-restarts state)
+                                 for level downfrom depth
+                                 when (member restart captured :test #'eq)
+                                   minimize level)
+                       collect (debugger-text
+                                (lambda (out)
+                                  (format out "~d [depth ~d]: ~a"
+                                          i restart-depth restart))))
+                 (list "Backtrace:")
+                 (loop for frame in frames for i from 0
+                       collect (format nil "~d: ~a" i (slynk::frame-to-string frame)))))
+         (width (min *max-debugger-width* (tui:cols ui)))
+         (height (min (+ 2 (length lines)) (tui:rows ui))))
+    (setf (floating-rect buffer)
+          (tui:make-rect :x (min (buffer-x buffer) (- (tui:cols ui) width))
+                         :y (min (buffer-y buffer) (- (tui:rows ui) height))
+                         :rows height :cols width))
+    (let* ((rect (buffer-rect buffer))
+           (children nil))
+      (tui:fill-rect (tui:make-style :fg #xeeeeee :bg 0)
+                     (floating-rect buffer) :char #\space)
+      (draw-buffer-border buffer)
+      (loop for text in lines for row from 0 below (tui:rect-rows rect)
+            do (tui:puts* text (1+ row) 1 rect)
+               (when (<= 2 row (1+ (length restarts)))
+                 (let* ((restart (nth (- row 2) restarts))
+                        (bounds (tui:make-rect :x 0 :y row :rows 1
+                                               :cols (tui:rect-cols rect))))
+                   (push (make-instance
+                          'tui:view :rect bounds
+                          :mouse-handler
+                          (lambda (view event)
+                            (let ((mouse (tui:event-kind event)))
+                              (when (and (eq (tui:mouse-data-state mouse) :click)
+                                         (eq (tui:mouse-data-button mouse) :left)
+                                         (tui:mouse-within mouse (tui:rect view)))
+                                (invoke-restart-interactively restart)))))
+                         children))))
+      (setf (buffer-view buffer)
+            (make-instance
+             'tui:view
+             :rect (tui:make-rect :x 0 :y 0 :rows (tui:rect-rows rect)
+                                  :cols (tui:rect-cols rect))
+             :children (nreverse children) :focused t
+             :key-handler
+             (lambda (view event working)
+               (declare (ignore view working))
+               (when (is-regular-char-event event)
+                 (when-let* ((index (digit-char-p (tui:event-kind event)))
+                             (restart (nth index restarts)))
+                   (invoke-restart-interactively restart)))))))))
 
 (defun render-buffer (buffer)
   (let* ((old (render-state buffer))
@@ -3311,7 +3400,7 @@ as `viewport'."
                    :render-state (make-render-state
                                   :stage-cache (copy-hash-table (stage-cache old))
                                   :scroll-state (scroll-state old)))))
-    (draw-buffer working)
+    (draw-buffer working (buffer-state working))
     ;; commit only after success, old version can be used recursively by debugging
     (setf (render-state buffer) (render-state working))))
 
@@ -3327,14 +3416,16 @@ as `viewport'."
     (render-buffer buffer))
   ;; completion is global
   (let ((completion (when-let (buffer (focused-buffer ui))
-                      (when (buffer-view buffer)
+                      (when (and (buffer-view buffer)
+                                 (typep (buffer-state buffer) 'buffer-state))
                         (render-completion-window buffer)))))
     (make-instance 'tui:view :rect (tui::screen-rect)
                              :children (when completion (list completion)))))
 
 ;; note: must go below definitions, next to tui:redisplay
-(let ((render-node-methods (closer-mop:generic-function-methods #'render-node))
-      (old-render-method (find-method #'tui:render nil '(ui)))
+(let ((render-node-methods nil)
+      (old-render-method nil)
+      (old-redisplay-method nil)
       (fnames '(render-toplevel-window render-buffer draw-buffer draw-buffer-border
                 measure-node
                 function-call-indentation
@@ -3345,11 +3436,19 @@ as `viewport'."
                 draw-semantic-backgrounds draw-highlights
                 render-completion-window render-completion))
       (funs (make-hash-table :test 'eq)))
-  (loop for name in fnames
-        do (setf (gethash name funs) (fdefinition name)))
+
+  (defun save-ui ()
+    (setf render-node-methods (closer-mop:generic-function-methods #'render-node))
+    (setf old-redisplay-method (find-method #'tui:redisplay '(:around) '(ui)))
+    (setf old-render-method (find-method #'tui:render nil '(ui)))
+    (loop for name in fnames
+          do (setf (gethash name funs) (fdefinition name))))
+
   (defun reset-ui ()
     (remove-method #'tui:render (find-method #'tui:render nil '(ui)))
     (add-method #'tui:render old-render-method)
+    (remove-method #'tui:redisplay (find-method #'tui:redisplay '(:around) '(ui)))
+    (add-method #'tui:redisplay old-redisplay-method)
     (loop for method in (closer-mop:generic-function-methods #'render-node)
           do (remove-method #'render-node method))
     (loop for method in render-node-methods
@@ -3357,24 +3456,54 @@ as `viewport'."
     (loop for name in fnames
           do (setf (fdefinition name) (gethash name funs)))))
 
-(let ((redisplay-failing nil))
-  (defmethod tui:redisplay-internal :around ((ui ui))
-    (restart-case
-        (unless (redisplayed-since-input ui)
-          (with-timing (lambda (time)
-                         (slog* (format nil "~aRedisplay done in ~Ams"
-                                        (make-string 70 :initial-element #\-)
-                                        (truncate time 1000))))
-            (call-next-method))
-          (setf redisplay-failing nil))
-      (restore-ui-fallback ()
-        :report "restore broken redisplay methods, exit if still failing"
-        (reset-ui)
-        (if redisplay-failing
-            (progn (slog 'failed)
-                   (tui:stop ui))
-            (progn (setf redisplay-failing t)
-                   (tui:redisplay ui)))))))
+(defun enter-debugger-loop (ui condition)
+  (slog* (format nil "entering-recursive-loop on ~s" condition))
+  (incf (revision ui))
+  (let ((debugger (find-if #'debug-state-p (buffers ui) :key #'buffer-state))
+        (previous-focus (focused-buffer ui)))
+    (unless debugger
+      (let ((buffer (make-buffer
+                     :buffer-ui ui
+                     :buffer-state (make-instance 'debug-state
+                                                  :buffer-x 10
+                                                  :buffer-y 10))))
+        (appendf (buffers ui) (list buffer))
+        (setf debugger buffer)))
+    (push condition (debug-conditions debugger))
+    (push (compute-restarts condition) (debug-restarts debugger))
+    (setf (focused-buffer ui) debugger
+          (redisplayed-since-input ui) nil)
+    (unwind-protect
+         (slynk-backend:call-with-debugging-environment
+          (lambda () (tui:run-loop ui)))
+      (pop (debug-conditions debugger))
+      (pop (debug-restarts debugger))
+      (when (eq (focused-buffer ui) debugger)
+        (setf (focused-buffer ui) previous-focus))
+      (setf (redisplayed-since-input ui) nil)
+      (when (null (debug-conditions debugger))
+        (removef (buffers ui) debugger)))))
+
+;; TODO consider continue restarts
+(let ((redisplay-failed nil))
+  (defmethod tui:redisplay :around ((ui ui))
+    (slynk-backend:call-with-debugger-hook
+     (lambda (condition previous-hook)
+       (declare (ignore previous-hook))
+       (reset-ui)
+       (if redisplay-failed
+           (progn (slog 'fallback-redisplay-failed) (tui:stop ui))
+           (progn
+             (setf redisplay-failed t)
+             (enter-debugger-loop ui condition))))
+     (lambda ()
+       (unless (redisplayed-since-input ui)
+         (with-timing (lambda (time)
+                        (slog* (format nil "~aRedisplay done in ~Ams"
+                                       (make-string 70 :initial-element #\-)
+                                       (truncate time 1000))))
+           (call-next-method))
+         (setf redisplay-failed nil))))))
 
 (defun buffer-at-point (ui row col)
   "Finds the *last drawn* buffer containing the absolute point `row', `col' (1-based)."
@@ -3502,8 +3631,8 @@ as `viewport'."
       (values copies
               (make-ui-effects
                :selection (selection working) :zipper (zipper working)
-               :cutbuffer (cutbuffer working) :new-buffers new
-               :pane-drag (pane-drag working)
+               :cutbuffer (cutbuffer working)
+               :pane-drag (pane-drag working) :new-buffers new
                :focused-buffer (find (buffer-id (focused-buffer working))
                                      (append originals new) :key #'buffer-id))))))
 
@@ -3525,12 +3654,16 @@ as `viewport'."
         (incf (revision ui))))))
 
 (defmethod tui:dispatch-event :around ((ui ui) event)
-  (with-simple-restart (nil "ignore event-handling error")
+  (with-simple-restart (ignore-event "ignore event-handling error")
     (if (and (not (tui:mouse-event-p event))
              (equal (tui:event-kind event) #\q)
              (tui:event-controlp event))
-        (tui:stop ui)
-        (call-next-method))
+        (progn (tui:stop ui)) ; XXX currently doesn't exit recursively
+        (slynk-backend:call-with-debugger-hook
+         (lambda (condition previous-hook)
+           (declare (ignore previous-hook))
+           (enter-debugger-loop ui condition))
+         (lambda () (call-next-method))))
     (unless (and (tui:mouse-event-p event)
                  (eq :hover (tui:mouse-data-button (tui:event-kind event))))
       (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled)))))
@@ -3538,7 +3671,8 @@ as `viewport'."
 (defmethod tui:dispatch-event :after ((ui ui) event)
   (declare (ignore event))
   (setf (redisplayed-since-input ui) nil)
-  (setf (redisplayed-since-input ui) (tui:redisplay ui)))
+  (tui:redisplay ui)
+  (setf (redisplayed-since-input ui) t))
 
 (defmethod tui:handle-resize :after ((ui ui))
   (setf (redisplayed-since-input ui) nil))

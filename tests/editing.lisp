@@ -1098,10 +1098,10 @@ second\"" (parse:str (parse::docstring code)))
   ((depth :initform 0 :accessor escape-depth)
    (trace :initform nil :accessor escape-trace)))
 
-(defmethod tui:redisplay-internal ((ui redisplay-escape-ui))
+(defmethod tui:redisplay ((ui redisplay-escape-ui))
   (error "The escape test must not reach the primary method."))
 
-(defmethod tui:redisplay-internal :around ((ui redisplay-escape-ui))
+(defmethod tui:redisplay :around ((ui redisplay-escape-ui))
   (if (zerop (escape-depth ui))
       (progn
         (incf (escape-depth ui))
@@ -1109,14 +1109,14 @@ second\"" (parse:str (parse::docstring code)))
         (push :outer-resumed (escape-trace ui)))
       (progn
         (push :inner (escape-trace ui))
-        (throw 'tui::quit-redisplay nil)
+        (throw 'tui:next-redisplay nil)
         (push :unreachable (escape-trace ui)))))
 
-(define-test redisplay-wrapper-bounds-subclass-methods :parent editing
+(define-test redisplay-escape-unwinds-subclass-methods :parent editing
   (let ((ui (make-instance 'redisplay-escape-ui)))
-    (is eq t (tui:redisplay ui))
-    (is equal '(:outer-resumed nil :inner) (escape-trace ui))
-    (is eq nil (tui:redisplay ui))))
+    (is eq nil (catch 'tui:next-redisplay (tui:redisplay ui)))
+    (is equal '(:inner) (escape-trace ui))
+    (is eq nil (catch 'tui:next-redisplay (tui:redisplay ui)))))
 
 (define-test evaluation-creates-floating-buffer :parent editing
   (let* ((buffer (goto (ui-for "42")))
@@ -1256,3 +1256,23 @@ second\"")))))
     (is eq t (not (null (parse:unary-reader-marker-p (parse::wrap-marker symbol))))))
   (is eq nil (parse:unary-reader-marker-p (sym "QUOTE")))
   (is eq nil (parse:unary-reader-marker-p (parse::wrap-marker 'cl:progn))))
+
+(define-test debugger-restarts-survive-event-redraw :parent editing
+  (let* ((ui (make-instance 'w::ui))
+         (condition (make-condition 'simple-error :format-control "Debugger test"))
+         (state (w::make-debug-state :debug-conditions (list condition)))
+         (buffer (w::make-buffer :buffer-ui ui :buffer-state state)))
+    (setf (w::buffers ui) (list buffer)
+          (w::focused-buffer ui) buffer)
+    (is eq :recovered
+        (restart-case
+            (progn
+              (setf (w::debug-restarts state) (list (compute-restarts condition)))
+              (slynk-backend:call-with-debugging-environment
+               (lambda ()
+                 ;; A redraw during another event must not capture its restart.
+                 (restart-case (render-buffer buffer :rows 24 :cols 80)
+                   (transient () :report "Temporary event restart" :wrong))
+                 ;; The temporary restart is now inactive; entry zero still works.
+                 (w::handle-ui-event ui (event #\0)))))
+          (recover () :report "Recover original error" :recovered)))))

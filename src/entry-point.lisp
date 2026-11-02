@@ -88,6 +88,7 @@
   (let ((ast-list (if astp ast (demo-ast))))
     (check-type ast-list cons)
     (let ((tui (make-instance 'ui)))
+      (save-ui)
       (setf *state* tui)
       (add-buffer tui :ast ast-list :source source :package package)
       ;; set default background to black and foreground to pure white (xterm extension)
