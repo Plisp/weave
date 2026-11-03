@@ -1965,7 +1965,8 @@ as `viewport'."
             (*print-length* 20))
         (substitute #\space #\newline (with-output-to-string (out)
                                         (funcall printer out))))
-    (error () "<error printing debugger entry>")))
+    (error () "<error printing debugger entry>")
+    (slynk-backend:sly-db-condition () "<unavailable debugger entry>")))
 
 (defun restart-depth (restart state)
   "Returns the oldest debugger depth containing `restart' in `state'."
@@ -1978,17 +1979,21 @@ as `viewport'."
   (let* ((ui (buffer-ui buffer))
          (condition (first (debug-conditions state)))
          (restarts (first (debug-restarts state)))
-         (frames (slynk-backend:compute-backtrace 0 *debugger-entries*))
          (lines (append
-                 (list (slynk::safe-condition-message condition) "Restarts:")
+                 (list (debugger-text
+                        (lambda (out) (slynk-backend:print-condition condition out)))
+                       "Restarts:")
                  (loop for restart in restarts for i from 0
                        collect (debugger-text
                                 (lambda (out)
                                   (format out "~d [depth ~d]: ~a"
                                           i (restart-depth restart state) restart))))
                  (list "Backtrace:")
-                 (loop for frame in frames for i from 0
-                       collect (format nil "~d: ~a" i (slynk::frame-to-string frame)))))
+                 (loop for frame in (slynk-backend:compute-backtrace 0 *debugger-entries*)
+                       for i from 0
+                       collect (debugger-text
+                                (lambda (out)
+                                  (format out "~d: ~a" i (slynk::frame-to-string frame)))))))
          (width (min *max-debugger-width* (tui:cols ui)))
          (height (min (+ 2 (length lines)) (tui:rows ui))))
     (setf (floating-rect buffer)
@@ -2063,9 +2068,12 @@ as `viewport'."
 
 ;; note: must go below definitions, next to tui:redisplay
 (let ((render-node-methods nil)
+      (draw-buffer-methods nil)
+      (old-render-around-method nil)
       (old-render-method nil)
       (old-redisplay-method nil)
-      (fnames '(render-toplevel-window render-buffer draw-buffer draw-buffer-border
+      (fnames '(render-toplevel-window render-buffer draw-buffer-border
+                debugger-text restart-depth enter-debugger-loop
                 measure-node
                 function-call-indentation
                 ref-list-indentation symbol-ref-text render-literal-text render-literal-line
@@ -2077,6 +2085,8 @@ as `viewport'."
       (funs (make-hash-table :test 'eq)))
 
   (defun save-ui ()
+    (setf draw-buffer-methods (copy-list (closer-mop:generic-function-methods #'draw-buffer)))
+    (setf old-render-around-method (find-method #'tui:render '(:around) '(ui)))
     (setf render-node-methods (closer-mop:generic-function-methods #'render-node))
     (setf old-redisplay-method (find-method #'tui:redisplay '(:around) '(ui)))
     (setf old-render-method (find-method #'tui:render nil '(ui)))
@@ -2084,6 +2094,13 @@ as `viewport'."
           do (setf (gethash name funs) (fdefinition name))))
 
   (defun reset-ui ()
+    (dolist (method (copy-list (closer-mop:generic-function-methods #'draw-buffer)))
+      (remove-method #'draw-buffer method))
+    (dolist (method draw-buffer-methods)
+      (add-method #'draw-buffer method))
+    (when-let (method (find-method #'tui:render '(:around) '(ui) nil))
+      (remove-method #'tui:render method))
+    (add-method #'tui:render old-render-around-method)
     (remove-method #'tui:render (find-method #'tui:render nil '(ui)))
     (add-method #'tui:render old-render-method)
     (remove-method #'tui:redisplay (find-method #'tui:redisplay '(:around) '(ui)))
@@ -2096,7 +2113,8 @@ as `viewport'."
           do (setf (fdefinition name) (gethash name funs)))))
 
 (defun enter-debugger-loop (ui condition)
-  (slog* (format nil "entering-recursive-loop on ~s" condition))
+  (slog* (debugger-text
+          (lambda (out) (format out "entering-recursive-loop on ~s" condition))))
   (incf (revision ui))
   (let ((debugger (find-if #'debug-state-p (buffers ui) :key #'buffer-state))
         (previous-focus (focused-buffer ui)))
@@ -2109,7 +2127,8 @@ as `viewport'."
         (appendf (buffers ui) (list buffer))
         (setf debugger buffer)))
     (push condition (debug-conditions debugger))
-    (push (compute-restarts condition) (debug-restarts debugger))
+    ;; note: restart tests may error
+    (push (ignore-errors (compute-restarts condition)) (debug-restarts debugger))
     (setf (focused-buffer ui) debugger
           (redisplayed-since-input ui) nil)
     (unwind-protect
@@ -2118,7 +2137,10 @@ as `viewport'."
       (pop (debug-conditions debugger))
       (pop (debug-restarts debugger))
       (when (eq (focused-buffer ui) debugger)
-        (setf (focused-buffer ui) previous-focus))
+        (setf (focused-buffer ui)
+              (if (member previous-focus (buffers ui))
+                  previous-focus
+                  (find-if (lambda (buffer) (not (eq buffer debugger))) (buffers ui)))))
       (setf (redisplayed-since-input ui) nil)
       (when (null (debug-conditions debugger))
         (removef (buffers ui) debugger)))))
