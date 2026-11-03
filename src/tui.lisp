@@ -1388,6 +1388,17 @@ pairs building new elements of &rest and &body slots."))
     (&rest (list :indent *vertical* :delimited :shallow))
     (t (list :indent *vertical*))))
 
+(defun render-setf-function-name (node stack context rect)
+  (tui:with-horizontal (rect)
+    (tui:place (rect) (render-literal-line "(" stack context rect))
+    (dolist (slot '(parse:setf-op parse:name))
+      (unless (eq slot 'parse:setf-op) (tui:pad 1))
+      (tui:place (rect)
+                 (render-node (funcall slot node)
+                              (cons (make-location :node node :id slot) stack)
+                              context rect)))
+    (tui:place (rect) (render-literal-line ")" stack context rect))))
+
 (defun render-layout-slot (node item stack context rect)
   (cond
     ((consp item)
@@ -1401,6 +1412,10 @@ pairs building new elements of &rest and &body slots."))
      (render-symbol-space (parse:op node)
                           (make-location :node node :id 'parse:op)
                           stack context rect))
+    ((and (eq item 'parse:name)
+          (typep node '(or parse:defun-form parse:defmethod-form))
+          (slot-boundp node 'parse:setf-op))
+     (render-setf-function-name node stack context rect))
     ((symbolp item)
      (apply #'render-node (funcall item node)
             (cons (make-location :node node :id item) stack)
@@ -1584,7 +1599,6 @@ ASSUMES we never focus a plain list body."
   ((parse:op parse:name)
    (1 parse:macro-code)))
 
-;; TODO (setf f) printing
 (deflayout parse:defun-form ()
   ((parse:op parse:name)
    (1 parse:fun-code)))
@@ -1995,7 +2009,7 @@ as `viewport'."
         (setf (buffer-view buffer) content)))))
 
 (defparameter *debugger-entries* 10)
-(defparameter *max-debugger-width* 60)
+(defparameter *max-debugger-width* 80)
 (defun debugger-text (printer)
   "Captures `printer' output without recursively debugging printing failures."
   (handler-case
@@ -2120,7 +2134,7 @@ as `viewport'."
                 function-call-indentation
                 ref-list-indentation symbol-ref-text render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements
-                render-layout-slot slot-render-keys
+                render-layout-slot slot-render-keys render-setf-function-name
                 macro-call-indentation setf-indentation loop-indentation
                 draw-semantic-backgrounds draw-highlights
                 render-completion-window render-completion))

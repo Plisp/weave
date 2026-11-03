@@ -528,14 +528,21 @@ addressed by indices."
                     (when-let (call (build-call name-node))
                       (swap-node (focus buffer) (parse:to-syntax call) buffer)
                       (focus-first-hole buffer)))
-                   ;; operator call
                    (parse:fun-designator
-                    (when (eq (locsort (second (stack buffer))) 'parse:eval-form)
-                      (when-let (call (build-call name-node
-                                                  (parse:body
-                                                   (location-node (focus buffer)))))
-                        (swap-node (second (stack buffer)) call buffer)
-                        (focus-first-hole buffer))))
+                    (typecase (location-node (focus buffer))
+                      (parse:function-form
+                       (if (eq s 'lambda)
+                           (progn
+                             (swap-node (focus buffer) (build-call name-node) buffer)
+                             (focus-first-hole buffer))
+                           (swap-node (focus buffer) name-node buffer)))
+                      (parse:function-call
+                       (when (eq (locsort (second (stack buffer))) 'parse:eval-form)
+                         (when-let (call (build-call name-node
+                                                     (parse:body
+                                                      (location-node (focus buffer)))))
+                           (swap-node (second (stack buffer)) call buffer)
+                           (focus-first-hole buffer))))))
                    (t t))))
               ((gethash s *default-expansions*)
                (let ((focus (focus buffer)))
@@ -616,6 +623,8 @@ addressed by indices."
               (case (char-downcase c)
                 (#\\ (make-instance 'parse:character-literal :str "#\\"))
                 (#\* (make-instance 'parse:bitvector-literal :str "#*"))
+                (#\' (make-instance 'parse:function-form :op 'parse:read-function
+                                                         :fun-designator (hole)))
                 ((#\b #\o #\x)
                  (make-instance 'parse:integer-literal
                                 :radix (ecase (char-downcase c) (#\b 2) (#\o 8) (#\x 16))
@@ -631,7 +640,17 @@ addressed by indices."
               (make-instance 'parse:symbol-ref
                              :name (string-upcase (concatenate 'string prefix (string c)))
                              :home-package (buffer-package buffer))))))
-    (when new (swap-node location new buffer) t)))
+    (when new
+      (let ((funquotep (typep new 'parse:function-form)))
+        (swap-node location
+                   (if (and funquotep (eq (locsort location) 'parse:unevaluated))
+                       (parse:to-syntax new) new)
+                   buffer)
+        (when funquotep
+          (if (typep (node-at (focus buffer)) 'parse:function-form)
+              (descend buffer 'parse:fun-designator)
+              (refocus buffer (append-id (location-id (focus buffer)) 1)))))
+      t)))
 
 (defmethod handle-key :around ((node hole) view location buffer event)
   (let ((c (tui:event-kind event)))

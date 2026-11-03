@@ -2495,13 +2495,41 @@ other atom."
       outer-env))
 
 (defform (function &tree fun-designator))
+(defmethod get-location ((node function-form) id)
+  (trivia:ematch id
+    ((eql 'op) (op node))
+    ((eql 'fun-designator) (fun-designator node))
+    ((list* (eql 'fun-designator) path)
+     (gen-tree-ref (fun-designator node) path))))
+
+(defmethod update ((node function-form) id value)
+  (make-instance 'function-form
+                 :op (if (eq id 'op) value (op node))
+                 :fun-designator
+                 (trivia:ematch id
+                   ((eql 'op) (fun-designator node))
+                   ((eql 'fun-designator) value)
+                   ((list* (eql 'fun-designator) path)
+                    (gen-tree-update (fun-designator node) path value)))))
+
 (defmethod location-sort ((node function-form) id)
-  (case (id-slot id)
-    (op 'symbol-ref)
-    (fun-designator (if (and (eq id 'fun-designator)
-                             (symbol-ref-p (fun-designator node)))
-                        'fun-designator
-                        'unevaluated))))
+  (trivia:match id
+    ((eql 'op) 'symbol-ref)
+    ((eql 'fun-designator)
+     (typecase (fun-designator node)
+       ((or lambda-form #+sbcl named-lambda-form) 'eval-form)
+       ((or symbol-ref hole) 'fun-designator)
+       (t 'unevaluated)))
+    ((list* (eql 'fun-designator) path)
+     (when (gen-list-p (fun-designator node)) 'unevaluated))))
+
+(defmethod suffix-path ((node function-form) suffix)
+  (when suffix
+    (case (first suffix)
+      (0 (list 'op))
+      (1 (if (gen-list-p (fun-designator node))
+             (list (if (rest suffix) (cons 'fun-designator (rest suffix)) 'fun-designator))
+             (suffix-step node 'fun-designator (rest suffix)))))))
 
 (defun walk-function-form (form env walker on-binder)
   "Macroexpansions tend to bind this, e.g. sbcl's destructuring-bind."

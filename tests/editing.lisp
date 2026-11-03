@@ -1405,3 +1405,51 @@ second\"")))))
   (let ((ui (ui-for "12.")))
     (press ui #\/ #\5)
     (is equal "12/5" (code ui))))
+
+(define-test edit-function-lambda :parent editing
+  (let ((ui (goto (ui-for "#'(lambda (x) x)")
+                  'parse:fun-designator 'parse:fun-code '(parse:body 0))))
+    (press ui #\y)
+    (is equal "(FUNCTION (LAMBDA (X) XY))" (code ui))
+    (is equal '("#'λ (x)" "    xy") (lines ui))))
+
+(define-test render-setf-defun-name :parent editing
+  (let ((ui (ui-for "(defun (setf foo) (v x) v)")))
+    (is equal "defun (setf foo)" (first (lines ui)))
+    (goto ui 'parse:name)
+    (press ui #\x)
+    (is equal "defun (setf foox)" (first (lines ui)))
+    (is equal "(DEFUN (SETF FOOX) (V X) V)" (code ui))))
+
+(define-test render-setf-defmethod-name :parent editing
+  (let ((ui (ui-for "(defmethod (setf foo) :around (v (x t)) v)")))
+    (is equal "defmethod (setf foo) :around" (first (lines ui)))
+    (goto ui 'parse:name)
+    (press ui #\x)
+    (is equal "defmethod (setf foox) :around" (first (lines ui)))
+    (is equal "(DEFMETHOD (SETF FOOX) AROUND (V (X T)) V)" (code ui))))
+
+(define-test complete-function-designator :parent editing
+  (let ((ui (goto (ui-for "(defvar *state* (function foo))")
+                  '(parse:body 1) 'parse:fun-designator)))
+    (press ui :rubout :rubout :rubout #\l #\a #\m #\b #\d #\a :enter)
+    (is equal "(DEFVAR *STATE* (FUNCTION (LAMBDA (_) _)))" (code ui))
+    (is eq 'parse:hole (type-of (focused ui)))
+    (is eq t (not (null (lines ui)))))
+  (let ((ui (goto (ui-for "(function foo)") 'parse:fun-designator)))
+    (press ui :rubout :rubout :rubout #\c #\d #\r :enter)
+    (is equal "(FUNCTION CDR)" (code ui))))
+
+(define-test insert-funquote :parent editing
+  (let ((ui (ui-for (parse:hole))))
+    (press ui #\# #\')
+    (is equal '(parse:fun-designator) (focus-path ui))
+    (is eq 'parse:read-function (parse:op (first (w::ast ui))))
+    (press ui #\l #\a #\m #\b #\d #\a :enter)
+    (is equal "(FUNCTION (LAMBDA (_) _))" (code ui))
+    (is equal "#'λ (hole)" (first (lines ui))))
+  (let ((ui (goto (ui-for "'foo") 'parse:thing)))
+    (press ui :rubout :rubout :rubout #\# #\' #\c #\a #\r)
+    (is equal "(QUOTE (FUNCTION CAR))" (code ui))
+    (is eq 'parse:ref-list (type-of (parse:thing (first (w::ast ui)))))
+    (is eq t (not (null (lines ui))))))

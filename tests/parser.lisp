@@ -1275,7 +1275,7 @@
 
 (define-test function-designators-sort :parent parser
   (is equal 'parse:fun-designator (parse:location-sort (parse "(function car)") 'parse:fun-designator))
-  (is equal 'parse:unevaluated
+  (is equal 'parse:eval-form
             (parse:location-sort (parse "(function (lambda (x) x))") 'parse:fun-designator)))
 
 ;;; suffix path reachability
@@ -1602,3 +1602,18 @@
   (let ((ratio (parse:copy-node (parse "#xA/B"))))
     (is = 16 (parse::radix (parse:numerator-node ratio)))
     (is = 16 (parse::radix (parse:denominator-node ratio)))))
+
+(define-test function-designator-lambda-locations :parent parser
+  (let* ((node (parse "#'(lambda (x) x)"))
+         (path (parse::suffix-path node '(1 2)))
+         (lambda (parse:get-location node 'parse:fun-designator)))
+    (is equal '(parse:fun-designator parse:fun-code (parse:body 0)) path)
+    (is eq lambda (parse:fun-designator
+                   (parse:update node 'parse:fun-designator lambda)))
+    (is eq 'parse:fun-designator
+        (parse:location-sort (parse:update node 'parse:fun-designator (parse:hole))
+                             'parse:fun-designator)))
+  (let* ((node (parse "(function (setf car))"))
+         (updated (parse:update node '(parse:fun-designator 1) (sym "CDR"))))
+    (is equal "(FUNCTION (SETF CDR))" (sx updated))
+    (is equal "CDR" (parse:name (parse:get-location updated '(parse:fun-designator 1))))))
