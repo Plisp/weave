@@ -85,9 +85,9 @@ construction, do not modify."))
   (:representation :struct))
 
 (defun copy-selection (selection &key (point (selection-point selection))
-                                   (activep (selection-activep selection))
-                                   (stack (when (typep selection 'zipper)
-                                            (zipper-stack selection))))
+                                      (activep (selection-activep selection))
+                                      (stack (when (typep selection 'zipper)
+                                               (zipper-stack selection))))
   "Returns a selection with updated fields. A nonempty `stack' makes it into a zipper."
   (apply (if stack #'make-zipper #'make-selection)
          :buffer-id (selection-buffer-id selection)
@@ -312,7 +312,11 @@ construction, do not modify."))
                  (cond
                    ((gen-list-p value)
                     (loop for i below (length (elements value))
-                          do (visit (make-location :node node :id (append-id id i)) env)))
+                          do (visit (if (and (listp node) (integerp id))
+                                        (make-location :node value :id (list 'parse:elements
+                                                                             i))
+                                        (make-location :node node :id (append-id id i)))
+                                    env)))
                    ((typep value 'parse:function-code)
                     (dolist (slot '(parse:lambda-list parse:body))
                       (visit (make-location :node value :id slot) env)))
@@ -738,28 +742,39 @@ Uses shared scratch cells and clears the touched scratch area on exit."
   "A `delimited' list is drawn with `*list-delimiters*' around it, recursively unless
 `delimited' is :shallow. It's opening parens is selectable."
   (let* ((location (car stack))
+         (rootp (and (listp (location-node location))
+                     (integerp (location-id location))))
+         (contents-location (if rootp (make-location :node l :id 'parse:elements) location))
+         (contents-stack (if rootp stack (cdr stack)))
          (focused (location= location (focus context)))
-         (head (first (elements l))))
+         (head (first (elements l)))
+         (kind (parse::kind l))
+         (open-text (case kind
+                      (:vector "#(")
+                      (:array (format nil "#~dA" (parse::rank l)))
+                      (otherwise (car *list-delimiters*))))
+         (close-text (if (eq kind :array) "" (cdr *list-delimiters*))))
+    (unless (eq kind :list) (setf delimited t))
     (flet ((contents (rect)
              (let* ((keys `(,@(when (eq delimited t) '(:delimited t))
                             :transform ,transform
                             ,@(when (functionp indent) `(:indent ,indent))))
                     (spec (if indent indent
                               (ref-list-indentation
-                               (elements l) (list-locator location) (cdr stack)
+                               (elements l) (list-locator contents-location) contents-stack
                                context rect keys))))
-               (render-elements (elements l) spec (list-locator location)
-                                (cdr stack) context rect keys))))
+               (render-elements (elements l) spec (list-locator contents-location)
+                                contents-stack context rect keys))))
       (if (and delimited (not (parse:unary-reader-marker-p head)))
           (let* ((handle (make-location :node l :id :open))
-                 (open (render-delimiter (car *list-delimiters*) handle
+                 (open (render-delimiter open-text handle
                                          (cons handle stack) rect
                                          :hoverable t))
                  (inner (contents (tui:clamp-rect
                                    (tui:copy-rect rect :x (tui:rect-x2 (tui:rect open)))
                                    rect)))
                  (close (multiple-value-bind (end-x end-y) (view-end inner)
-                          (render-delimiter (cdr *list-delimiters*) location stack
+                          (render-delimiter close-text location stack
                                             (tui:clamp-rect
                                              (tui:copy-rect rect :x end-x :y end-y)
                                              rect)))))
@@ -839,6 +854,29 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                    :key-handler (when focused
                                   (global-key-handler node location))
                    :focused focused)))
+
+(defmethod render-node ((node parse:ratio-literal) stack context rect &key)
+  (let* ((location (car stack))
+         (focused (location= location (focus context)))
+         (contents
+           (tui:with-horizontal (rect)
+             (tui:place (rect)
+               (render-node (parse:numerator-node node)
+                            (cons (make-location :node node
+                                                 :id 'parse:numerator-node)
+                                  stack)
+                            context rect))
+             (tui:place (rect) (render-literal-line "/" stack context rect))
+             (tui:place (rect)
+               (render-node (parse:denominator-node node)
+                            (cons (make-location :node node
+                                                 :id 'parse:denominator-node)
+                                  stack)
+                            context rect)))))
+    (make-instance 'ast-view :rect (tui:rect contents) :location location
+                             :children (list contents) :focused focused
+                             :key-handler (when focused
+                                            (global-key-handler node location)))))
 
 (defmethod render-node ((node parse:literal) stack context rect &key)
   (render-literal-text node (format nil "~a" (parse:str node)) stack context rect))
@@ -1290,6 +1328,7 @@ pairs building new elements of &rest and &body slots."))
   (:method (node)
     (when-let (layout (gethash (type-of node) *layouts*))
       (layout-slots layout)))
+  (:method ((node parse:ratio-literal)) '(parse:numerator-node parse:denominator-node))
   (:method ((node parse:function-call)) '(parse:name parse:body))
   (:method ((node parse:macro-call)) '(parse:op parse:body))
   (:method ((node parse:function-code))
@@ -1996,10 +2035,12 @@ as `viewport'."
                                   (format out "~d: ~a" i (slynk::frame-to-string frame)))))))
          (width (min *max-debugger-width* (tui:cols ui)))
          (height (min (+ 2 (length lines)) (tui:rows ui))))
+    ;;
     (setf (floating-rect buffer)
           (tui:make-rect :x (min (buffer-x buffer) (- (tui:cols ui) width))
                          :y (min (buffer-y buffer) (- (tui:rows ui) height))
                          :rows height :cols width))
+    ;;
     (let* ((rect (buffer-rect buffer))
            (children nil))
       (tui:fill-rect (tui:make-style :fg #xeeeeee :bg 0)
@@ -2021,6 +2062,7 @@ as `viewport'."
                                          (tui:mouse-within mouse (tui:rect view)))
                                 (invoke-restart-interactively restart)))))
                          children))))
+      ;;
       (setf (buffer-view buffer)
             (make-instance
              'tui:view
@@ -2114,7 +2156,7 @@ as `viewport'."
 
 (defun enter-debugger-loop (ui condition)
   (slog* (debugger-text
-          (lambda (out) (format out "entering-recursive-loop on ~s" condition))))
+          (lambda (out) (format out "entering recursive loop on ~s" condition))))
   (incf (revision ui))
   (let ((debugger (find-if #'debug-state-p (buffers ui) :key #'buffer-state))
         (previous-focus (focused-buffer ui)))
@@ -2145,7 +2187,7 @@ as `viewport'."
       (when (null (debug-conditions debugger))
         (removef (buffers ui) debugger)))))
 
-;; TODO consider continue restarts
+;; TODO capture use-value/store-value using gray streams
 (let ((redisplay-failed nil))
   (defmethod tui:redisplay :around ((ui ui))
     (slynk-backend:call-with-debugger-hook
@@ -2333,11 +2375,16 @@ as `viewport'."
              (equal (tui:event-kind event) #\q)
              (tui:event-controlp event))
         (progn (tui:stop ui)) ; XXX currently doesn't exit recursively
-        (slynk-backend:call-with-debugger-hook
-         (lambda (condition previous-hook)
-           (declare (ignore previous-hook))
-           (enter-debugger-loop ui condition))
-         (lambda () (call-next-method))))
+        ;; XXX every global rebound by events must be saved here as needed
+        ;; e.g. the problem with eval was that standard-output was rebound around the error,
+        ;; suppressing redraw
+        (let ((out *standard-output*))
+          (slynk-backend:call-with-debugger-hook
+           (lambda (condition previous-hook)
+             (declare (ignore previous-hook))
+             (let ((*standard-output* out))
+               (enter-debugger-loop ui condition)))
+           (lambda () (call-next-method)))))
     (unless (and (tui:mouse-event-p event)
                  (eq :hover (tui:mouse-data-button (tui:event-kind event))))
       (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled)))))

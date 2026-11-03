@@ -1582,3 +1582,23 @@
       (is eq nil (slot-boundp copy 'parse:setf-op))
       (is eq nil (slot-boundp updated 'parse:setf-op))
       (is eq t (typep (parse:to-syntax updated) 'parse:ref-list)))))
+
+(define-test typed-reader-literals :parent parser
+  (dolist (entry '(("12" parse:integer-literal)
+                   ("12." parse:integer-literal)
+                   ("#16rAF" parse:integer-literal)
+                   ("2/2" parse:ratio-literal)
+                   ("#xA/B" parse:ratio-literal)
+                   ("1.2d3" parse:float-literal)
+                   ("\"hi\"" parse:string-literal)
+                   ("#\\Space" parse:character-literal)
+                   ("#*010" parse:bitvector-literal)))
+    (destructuring-bind (source type) entry
+      (let* ((node (parse source))
+             (copy (parse:copy-node node)))
+        (is eq type (type-of node))
+        (is eq type (type-of copy))
+        (is equal source (parse:str copy)))))
+  (let ((ratio (parse:copy-node (parse "#xA/B"))))
+    (is = 16 (parse::radix (parse:numerator-node ratio)))
+    (is = 16 (parse::radix (parse:denominator-node ratio)))))

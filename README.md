@@ -30,6 +30,7 @@ In emacs, sly-connect to 4005 and
 * `Enter` selects a completion/expands the symbol at point into a call
 * `Ctrl-n/p/b/f` move by atom and goal column
 * `Alt-n/p` move by parent stack
+* `Alt-P` move by parent until reaching a non-evaluated position
 
 * `Shift+left/right` starts a selection
 * `Shift+up/down` adjusts a zipper selection

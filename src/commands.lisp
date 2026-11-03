@@ -219,7 +219,14 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
   (assert (eq (location-node loc) (location-node (car stack))))
   (labels ((rebuild (stack newnode newstack)
              (if (null stack)
-                 (values (nreverse newstack) newnode)
+                 ;; Macro reanalysis may have copied descendants. Resolve the saved
+                 ;; path ids through the new tree
+                 (values (loop for loc in newstack
+                               for parent = newnode then (node-at fresh)
+                               for fresh = (make-location :node parent :id (location-id loc))
+                               collect fresh into path
+                               finally (return (nreverse path)))
+                         newnode)
                  (let* ((this (car stack))
                         (id (location-id this))
                         (new-parent (update (location-node this) id newnode)))
@@ -380,7 +387,7 @@ If this returns NIL, propagate up the cursor stack.")
                                           :home-package (buffer-package buffer))))
               (swap-node location newnode buffer)))
            ((digit-char-p c)
-            (let ((newnode (make-instance 'parse:literal :str (string c))))
+            (let ((newnode (make-instance 'parse:integer-literal :str (string c))))
               (swap-node location newnode buffer)))
            ;; needs to deal with comma depth and insertion
            ;; ((char= c #\`)
@@ -412,7 +419,8 @@ If this returns NIL, propagate up the cursor stack.")
                                       :home-package (buffer-package buffer))
                        buffer))
            ((digit-char-p c)
-            (swap-node location (make-instance 'parse:literal :str (string c)) buffer))))))))
+            (swap-node location (make-instance 'parse:integer-literal :str (string c))
+                       buffer))))))))
 
 (defun build-arglist (fname &optional old-body)
   (let* ((arglist (when (fboundp fname) (slynk-backend:arglist fname)))
@@ -486,7 +494,9 @@ addressed by indices."
       (lambda (view buffer)
         (declare (ignore view))
         (let ((stack (stack buffer)))
-          (when (= (length stack) 1)
+          (when (and (= (length stack) 1)
+                     (not (typep (node-at (focus buffer))
+                                 '(or parse:string-literal parse:character-literal))))
             (let* ((toplevel (car stack))
                    (i (location-id toplevel)))
               (assert (integerp i))
@@ -550,8 +560,16 @@ addressed by indices."
       (lambda (view buffer)
         (declare (ignore view))
         (let ((ref (node-at (focus buffer))))
-          (when (and (typep ref 'parse:symbol-ref)
-                     (eq 'parse:eval-form (locsort (focus buffer))))
+          (when (and (eq 'parse:eval-form (locsort (focus buffer)))
+                     (or (typep ref 'parse:symbol-ref)
+                         (and (typep ref 'parse:hole)
+                              (or (string= (parse:text ref) "+")
+                                  (string= (parse:text ref) "-")))))
+            (when (typep ref 'parse:hole)
+              (setf ref (make-instance 'parse:symbol-ref
+                                       :name (parse:text ref)
+                                       :home-package (buffer-package buffer))))
+            ;;
             (when-let (call (build-call ref))
               (swap-node (focus buffer) call buffer)
               (focus-first-hole buffer)
@@ -587,26 +605,169 @@ addressed by indices."
         (declare (ignore view))
         (rubout-eval-form buffer)))
 
-;;;
+;;; holes
+
+(defun start-literal (node location buffer c)
+  "Convert generic holes to the appropriate literal type"
+  (let* ((prefix (text node))
+         (new
+           (cond
+             ((string= prefix "#")
+              (case (char-downcase c)
+                (#\\ (make-instance 'parse:character-literal :str "#\\"))
+                (#\* (make-instance 'parse:bitvector-literal :str "#*"))
+                ((#\b #\o #\x)
+                 (make-instance 'parse:integer-literal
+                                :radix (ecase (char-downcase c) (#\b 2) (#\o 8) (#\x 16))
+                                :str (concatenate 'string "#" (string c))))
+                (#\( (make-instance 'parse:ref-list :kind :vector))
+                (otherwise nil)))
+             ((find c "#+-") (hole (string c)))
+             ((char= c #\") (make-instance 'parse:string-literal :str "\"\""))
+             ((digit-char-p c)
+              (make-instance 'parse:integer-literal
+                             :str (concatenate 'string prefix (string c))))
+             ((and (member prefix '("-" "+") :test #'string=) (symbol-char-p c))
+              (make-instance 'parse:symbol-ref
+                             :name (string-upcase (concatenate 'string prefix (string c)))
+                             :home-package (buffer-package buffer))))))
+    (when new (swap-node location new buffer) t)))
+
+(defmethod handle-key :around ((node hole) view location buffer event)
+  (let ((c (tui:event-kind event)))
+    (if (and (is-regular-char-event event)
+             (member (locsort location) '(parse:eval-form parse:unevaluated string))
+             (start-literal node location buffer c))
+        t
+        (call-next-method))))
+
+(defmethod handle-key ((node parse:integer-hole) view location buffer event)
+  (declare (ignore view))
+  (when (is-regular-char-event event)
+    (let ((c (tui:event-kind event)))
+      (cond ((digit-char-p c (parse::radix node))
+             (swap-node location (make-instance 'parse:integer-literal
+                                                :radix (parse::radix node)
+                                                :str (concatenate 'string (text node)
+                                                                  (string c)))
+                        buffer))
+            ((find c "+-")
+             (swap-node location (make-instance 'parse:integer-hole
+                                                :radix (parse::radix node)
+                                                :text (string c))
+                        buffer))
+            ((char= c #\Rubout)
+             (unless (zerop (length (text node)))
+               (swap-node location (make-instance 'parse:integer-hole
+                                                  :radix (parse::radix node))
+                          buffer))
+             t)
+            ;; eat invalid input before it propagates up
+            (t t)))))
+
+(defgeneric literal-input (node character)
+  (:method ((node parse:literal) character) nil))
+
+(defmethod literal-input ((node parse:string-literal) c)
+  (let* ((*read-eval* nil)
+         (value (read-from-string (parse:str node)))
+         (new (if (char= c #\Rubout)
+                  (subseq value 0 (max 0 (1- (length value))))
+                  (concatenate 'string value (string c)))))
+    (make-instance 'parse:string-literal :str (write-to-string new :escape t))))
+
+(defmethod literal-input ((node parse:character-literal) c)
+  (let ((s (parse:str node)))
+    (make-instance 'parse:character-literal
+                   :str (if (char= c #\Rubout)
+                            (subseq s 0 (max 2 (1- (length s))))
+                            (concatenate 'string s (string c))))))
+
+(defmethod literal-input ((node parse:bitvector-literal) c)
+  (when (or (find c "01") (char= c #\Rubout))
+    (let ((s (parse:str node)))
+      (make-instance 'parse:bitvector-literal
+                     :str (if (char= c #\Rubout)
+                              (subseq s 0 (max 2 (1- (length s))))
+                              (concatenate 'string s (string c)))))))
+
+(defmethod literal-input ((node parse:integer-literal) c)
+  (let* ((s (parse:str node))
+         (base (parse::radix node))
+         (prefix-end (if (char= (char s 0) #\#)
+                         (if-let (r (position #\r s :test #'char-equal))
+                           (1+ r) 2)
+                         0)))
+    (cond ((and (find c "+-") (= (length s) prefix-end))
+           (make-instance 'parse:integer-literal :radix base
+                                                 :str (concatenate 'string s (string c))))
+          ((digit-char-p c base)
+           (if (and (zerop prefix-end) (find #\. s))
+               (make-instance 'parse:float-literal
+                              :str (concatenate 'string s (string c)))
+               (make-instance 'parse:integer-literal
+                              :radix base
+                              :str (concatenate 'string s (string c)))))
+          ((char= c #\Rubout)
+           (let ((new (subseq s 0 (max prefix-end (1- (length s))))))
+             (if (member new '("" "+" "-") :test #'string=)
+                 (make-instance 'parse:integer-hole :radix base :text new)
+                 (make-instance 'parse:integer-literal :radix base :str new))))
+          ((and (zerop prefix-end) (find c ".eEsSfFdDlL")
+                (not (and (char= c #\.) (find #\. s))))
+           (make-instance 'parse:float-literal :str (concatenate 'string s (string c)))))))
+
+(defmethod literal-input ((node parse:float-literal) c)
+  (let ((s (parse:str node)))
+    (cond ((or (digit-char-p c)
+               (and (find c "+-") (find (char s (1- (length s))) "eEsSfFdDlL"))
+               (and (find c "eEsSfFdDlL")
+                    (not (find-if (lambda (c) (find c "eEsSfFdDlL")) s)))
+               (and (char= c #\.) (not (find #\. s))
+                    (not (find-if (lambda (c) (find c "eEsSfFdDlL")) s))))
+           (make-instance 'parse:float-literal :str (concatenate 'string s (string c))))
+          ((char= c #\Rubout)
+           (let ((new (subseq s 0 (max 0 (1- (length s))))))
+             (if (zerop (length new)) (make-instance 'parse:integer-hole)
+                 (make-instance (if (find-if (lambda (c) (find c ".eEsSfFdDlL")) new)
+                                    'parse:float-literal 'parse:integer-literal)
+                                :str new)))))))
 
 (defmethod handle-key ((node parse:literal) view location buffer event)
+  (declare (ignore view))
   (when (is-regular-char-event event)
-    (let ((s (parse:str node))
-          (c (tui:event-kind event)))
-      (cond ((digit-char-p c)
-             (swap-node location
-                        (make-instance 'parse:literal :str (format nil "~a~a" s c))
-                        buffer)
-             t)
-            ((char= c #\Rubout)
-             (let ((s (string s)))
-               (if (< 1 (length s))
-                   (swap-node location
-                              (make-instance 'parse:literal
-                                             :str (string-drop s 1))
-                              buffer)
-                   (swap-node location (hole) buffer)))
-             t)))))
+    (let ((c (tui:event-kind event)))
+      (cond
+        ((and (typep node 'parse:integer-literal) (char= c #\/)
+              (member (locsort location) '(parse:eval-form parse:unevaluated)))
+         (swap-node location
+                    (make-instance
+                     'parse:ratio-literal :str ""
+                                          :numerator-node
+                                          (if (ends-with #\. (parse:str node))
+                                              (make-instance 'parse:integer-literal
+                                                             :radix (parse::radix node)
+                                                             :str (string-right-trim
+                                                                   "." (parse:str node)))
+                                              node)
+                                          :denominator-node
+                                          (make-instance 'parse:integer-hole
+                                                         :radix (parse::radix node)))
+                    buffer)
+         (descend buffer 'parse:denominator-node)
+         t)
+        (t
+         (when-let (new (literal-input node c))
+           (when (and (eq (locsort location) 'parse:integer-literal)
+                      (not (typep new '(or parse:integer-literal parse:integer-hole))))
+             (return-from handle-key t))
+           ;;
+           (swap-node location
+                      (if (and (typep new 'parse:integer-hole)
+                               (not (eq (locsort location) 'parse:integer-literal)))
+                          (hole (text new)) (parse::copy-anchors node new))
+                      buffer)
+           t))))))
 
 (defmethod handle-key ((node parse:symbol-ref) view location buffer event)
   (when (is-regular-char-event event)
@@ -707,14 +868,15 @@ if none, surround current atom"
                   (return t))))
 
 (loop for sym across *arb-arity-binops*
-      for s = (string s)
+      for s = (string sym)
       do (when (= 1 (length (string s)))
            (setf (gethash (tui-sys:make-event :kind (schar s 0) :altp t)
                           *global-key-handlers*)
-                 ;; oops old bug if we don't compute from s prior to its mutation by loop
-                 (lambda (view buffer)
-                   (declare (ignore view))
-                   (wrap-arith sym buffer)))))
+                 ;; oops bug if we don't compute from s prior to its mutation by loop
+                 (let ((sym* sym))
+                   (lambda (view buffer)
+                     (declare (ignore view))
+                     (wrap-arith sym* buffer))))))
 
 (setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
       (lambda (view buffer)
@@ -992,14 +1154,17 @@ already and focuses the hole."
 
 ;;; misc
 
+;; TODO inspector
 (defun reify (object)
   (typecase object
-    (number (make-instance 'parse:literal :str (princ-to-string object)))
-    (string (make-instance 'parse:literal :str (princ-to-string object)))
-    (character (make-instance 'parse:literal :str (princ-to-string object)))
+    ((or number string character bit-vector)
+     (parse:reader-literal object (write-to-string object :escape t)))
     (list (make-instance 'parse:quote-form
                          :op 'parse:read-quote
                          :thing (apply #'ref-list (mapcar #'reify object))))
+    (boolean (make-instance 'parse:symbol-ref
+                            :home-package #.(find-package "CL")
+                            :name (princ-to-string object)))
     (t (ref-list))))
 
 ;; TODO capture i/o using gray streams
@@ -1014,8 +1179,8 @@ already and focuses the hole."
               (let* ((raw (parse::strip-wrappers
                            (parse:to-syntax (node-at (car stack)))
                            interned))
-                     (*standard-output* (make-broadcast-stream))
-                     (res (eval raw)))
+                     (res (let ((*standard-output* (make-broadcast-stream)))
+                            (eval raw))))
                 (slog* (format nil "eval produced ~a" res))
                 (add-buffer
                  (buffer-ui buffer)

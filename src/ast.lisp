@@ -17,6 +17,9 @@
            #:form-slot-kinds #:form-optional-slots
 
            #:eval-form #:symbol-ref #:binder #:literal
+           #:string-literal #:character-literal #:integer-literal #:float-literal
+           #:bitvector-literal #:ratio-literal #:integer-hole #:reader-literal
+           #:numerator-node #:denominator-node
            #:reader-marker #:read-quasiquote #:read-quote #:read-function #:read-eval
            #:string-and-package= #:unary-reader-marker-p
            #:resolve
@@ -81,6 +84,14 @@
   ((str :type string))
   (:documentation "Atomic literal"))
 
+(defrecord string-literal (literal) ())
+(defrecord character-literal (literal) ())
+(defrecord integer-literal (literal) ((radix :init 10 :type (integer 2 36))))
+(defrecord float-literal (literal) ())
+(defrecord bitvector-literal (literal) ())
+(defrecord ratio-literal (literal)
+  ((numerator-node) (denominator-node)))
+
 (defrecord symbol-ref (eval-form atom-form)
   ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
@@ -100,6 +111,8 @@
   ((text :init "" :mutable t :type simple-string))
   (:documentation "Stands in for a reader atom, or evaluated form."))
 (defun hole (&optional (text "")) (make-instance 'hole :text text))
+(defrecord integer-hole (hole) ((radix :init 10 :type (integer 2 36))))
+
 (defmethod name ((o hole)) "hole")
 
 (defmethod initialize-instance :after ((node symbol-ref) &key)
@@ -233,7 +246,15 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defgeneric copy-node (node)
   (:method ((o null)) o) ; optional slots
   (:method ((o comment)) (make-instance 'comment :kind (kind o) :str (str o)))
-  (:method ((o literal)) (make-instance 'literal :str (str o)))
+  (:method ((o literal)) (make-instance (class-of o) :str (str o)))
+  (:method ((o integer-literal))
+    (make-instance 'integer-literal :str (str o) :radix (radix o)))
+  (:method ((o ratio-literal))
+    (make-instance 'ratio-literal :str (str o)
+                                  :numerator-node (copy-node (numerator-node o))
+                                  :denominator-node (copy-node (denominator-node o))))
+  (:method ((o integer-hole))
+    (make-instance 'integer-hole :text (text o) :radix (radix o)))
   (:method ((o hole)) (hole (text o)))
   ;; note: class-of, so binders/reader markers don't decay
   (:method ((o symbol-ref))
@@ -848,6 +869,21 @@ Otherwise in the walker just returns elements."
                         (car path))))
         (t (tree-update tree path new-value))))
 
+(defmethod get-location ((node ref-list) id)
+  (trivia:ematch id
+    ((eql 'elements) (elements node))
+    ((list* (eql 'elements) path) (gen-tree-ref node path))))
+
+(defmethod update ((node ref-list) id value)
+  (trivia:ematch id
+    ((eql 'elements) (with-elements node value))
+    ((list* (eql 'elements) path) (gen-tree-update node path value))))
+
+(defmethod location-sort ((node ref-list) id)
+  (when (or (eq id 'elements)
+            (and (consp id) (eq (car id) 'elements)))
+    'unevaluated))
+
 (defun resolve (wrapper)
   "Resolves `wrapper' to an actual symbol in its home package or NIL when it is absent
 (indicated by second return value) perhaps as a result of editing, or a fresh uninterned
@@ -1031,6 +1067,25 @@ The specializer-list-p argument is always NIL so we can classify specializers."
           (map-macro-lambda list #'note #'identity #'identity #'identity)
           (map-lambda-list list #'note #'identity #'identity #'identity nil)))
     (nreverse binders)))
+
+(defmethod str ((node ratio-literal))
+  (flet ((spelling (part) (if (typep part 'hole) (text part) (str part))))
+    (format nil "~a/~a" (spelling (numerator-node node))
+            (spelling (denominator-node node)))))
+
+(defmethod get-location ((node ratio-literal) id)
+  (ecase id
+    (numerator-node (numerator-node node))
+    (denominator-node (denominator-node node))))
+
+(defmethod location-sort ((node ratio-literal) id)
+  (when (member id '(numerator-node denominator-node)) 'integer-literal))
+
+(defmethod update ((node ratio-literal) id value)
+  (make-instance 'ratio-literal :str ""
+                 :numerator-node (if (eq id 'numerator-node) value (numerator-node node))
+                 :denominator-node (if (eq id 'denominator-node)
+                                       value (denominator-node node))))
 
 (defmethod location-env ((node function-code) id outer-env)
   (check-evaluated node id)
@@ -2642,7 +2697,7 @@ XXX performs unguarded read-evaluation."
                   (if (or status (null (home-package form)))
                       sym
                       (let ((new (#+sbcl sb-ext:without-package-locks #-sbcl progn
-                                   (intern (name form) (home-package form)))))
+                                  (intern (name form) (home-package form)))))
                         (vector-push-extend new interned)
                         new))))
                ((typep form 'hole) (make-symbol "HOLE"))
@@ -3469,6 +3524,38 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
         hash
         (car source))))
 
+(defun literal-radix (spelling)
+  (if (and (> (length spelling) 1) (char= (char spelling 0) #\#))
+      (case (char-downcase (char spelling 1))
+        (#\b 2) (#\o 8) (#\x 16)
+        (otherwise
+         (let ((end (position #\r spelling :test #'char-equal)))
+           (if end (parse-integer spelling :start 1 :end end) 10))))
+      10))
+
+(defun reader-literal (value spelling)
+  "Classifies a reader constant while retaining its written `spelling'."
+  (cond
+    ((and (rationalp value) (find #\/ spelling))
+     (let ((slash (position #\/ spelling))
+           (radix (literal-radix spelling)))
+       (make-instance 'ratio-literal
+                      :str spelling
+                      :numerator-node (make-instance 'integer-literal
+                                                     :radix radix
+                                                     :str (subseq spelling 0 slash))
+                      :denominator-node (make-instance 'integer-literal
+                                                       :radix radix
+                                                       :str (subseq spelling (1+ slash))))))
+    ((integerp value)
+     (make-instance 'integer-literal :str spelling :radix (literal-radix spelling)))
+    (t
+     (make-instance (typecase value
+                      (string 'string-literal) (character 'character-literal)
+                      (float 'float-literal) (bit-vector 'bitvector-literal)
+                      (t 'literal))
+                    :str spelling))))
+
 (defmethod eclector.reader:make-structure-instance
     ((client my-client) (name t) (initargs t))
   nil)
@@ -3502,8 +3589,8 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
                          (char= #\( (schar (source client) (1+ (car source)))))
                     (make-instance 'ref-list :kind :vector))
                    (t
-                    (make-instance 'literal :str (subseq (source client)
-                                                         (car source) (cdr source))))))
+                    (reader-literal result (subseq (source client)
+                                                  (car source) (cdr source))))))
             (t (error "weird constant ~a" result)))
       ;; compound form, or some wrapper
       (labels ((frobber ()

@@ -66,12 +66,12 @@ second\"" (parse:str (parse::docstring code)))
                              :body nil)))
     (is equal "() / \"raw documentation\"" (draw (ui-for code)))))
 
-(define-test function-code-space-after-docstring :parent editing
+(define-test function-code-edit-docstring :parent editing
   (let ((ui (goto (ui-for "(defun f () \"doc\" (print 1))")
                   'parse:fun-code 'parse::docstring)))
     (press ui :space)
-    (is equal "(DEFUN F () \"doc\" _ (PRINT 1))" (code ui))
-    (is equal '(parse:fun-code (parse:body 0)) (focus-path ui))))
+    (is equal "(DEFUN F () \"doc \" (PRINT 1))" (code ui))
+    (is equal '(parse:fun-code parse::docstring) (focus-path ui))))
 
 (define-test entry-point-top-level-is-a-list :parent editing
   (is equal t (listp (w::demo-ast)))
@@ -1330,3 +1330,78 @@ second\"")))))
     (is eq nil continued)
     (is equal (list buffer) (w::buffers ui))
     (is eq buffer (w::focused-buffer ui))))
+
+(define-test literal-prefix-editing :parent editing
+  (dolist (entry '(((#\- #\2) "-2" parse:integer-literal)
+                   ((#\- #\a) "-A" parse:symbol-ref)
+                   ((#\# #\x #\F) "#xF" parse:integer-literal)
+                   ((#\# #\b #\1 #\2 #\0) "#b10" parse:integer-literal)
+                   ((#\# #\* #\0 #\2 #\1) "#*01" parse:bitvector-literal)
+                   ((#\# #\\ #\S #\p #\a #\c #\e) "#\\Space" parse:character-literal)
+                   ((#\1 #\. #\2 #\d #\- #\3) "1.2d-3" parse:float-literal)))
+    (destructuring-bind (keys expected type) entry
+      (let ((ui (ui-for (parse:hole))))
+        (apply #'press ui keys)
+        (is equal expected (code ui))
+        (is eq type (type-of (focused ui)))))))
+
+(define-test editable-string-escapes :parent editing
+  (let ((ui (ui-for (parse:hole))))
+    (press ui #\" #\a :space #\" #\\ :enter)
+    (is equal (format nil "a ~c~c~%" #\" #\\)
+        (read-from-string (code ui)))
+    (press ui :rubout)
+    (is equal "a \"\\" (read-from-string (code ui)))))
+
+(define-test editable-ratio-components :parent editing
+  (let ((ui (ui-for "12")))
+    (press ui #\/)
+    (is eq 'parse:integer-hole (type-of (focused ui)))
+    (is equal '(parse:denominator-node) (focus-path ui))
+    (press ui #\3 #\. #\4)
+    (is equal "12/34" (code ui))
+    (press ui :rubout :rubout)
+    (is eq 'parse:integer-hole (type-of (focused ui)))
+    (press ui #\5)
+    (is equal "12/5" (code ui)))
+  (let ((ui (goto (ui-for "#xA/B") 'parse:denominator-node)))
+    (press ui #\F)
+    (is equal "#xA/BF" (code ui)))
+  (let ((ui (goto (ui-for "1/2") 'parse:numerator-node)))
+    (press ui :rubout)
+    (is eq 'parse:integer-hole (type-of (focused ui)))
+    (is equal "hole/2" (first (lines ui)))
+    (press ui #\3)
+    (is equal "3/2" (code ui))))
+
+(define-test ratio-edit-in-macro :parent editing
+  (let ((ui (goto (ui-for "(when t 12)") '(parse:body 1))))
+    (press ui #\/ #\2 #\3)
+    (is equal "(WHEN T 12/23)" (code ui))
+    (is equal '("when t" " 12/23") (lines ui))
+    (is eq (w::location-node (w::focus ui))
+        (w::node-at (second (w::stack ui))))))
+
+(define-test preserve-radix-prefix :parent editing
+  (let ((ui (ui-for "#16rFF")))
+    (press ui :rubout :rubout :rubout #\A)
+    (is equal "#16rA" (code ui))))
+
+(define-test array-reader-notation :parent editing
+  (dolist (source '("#()" "#(1 2)" "#2A((1 2) (3 4))" "#0A1"))
+    (is equal source (first (lines (ui-for source)))))
+  (let ((ui (ui-for "#(1 2)")))
+    (w::descend ui '(parse:elements 0))
+    (press ui #\3)
+    (is equal "#(13 2)" (first (lines ui)))))
+
+(define-test trailing-dot-integer-editing :parent editing
+  (let ((ui (ui-for "12.")))
+    (press ui #\3)
+    (is equal "12.3" (code ui))
+    (is eq 'parse:float-literal (type-of (focused ui)))))
+
+(define-test trailing-dot-integer-to-ratio :parent editing
+  (let ((ui (ui-for "12.")))
+    (press ui #\/ #\5)
+    (is equal "12/5" (code ui))))
