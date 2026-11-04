@@ -64,7 +64,7 @@ construction, do not modify."))
 
 (defrecord completion-state ()
   ((anchor)
-   (candidates :type list)
+   (candidates :type vector)
    (selection :init 0 :type (integer 0))))
 
 (defun copy-completion-state (state &key (anchor (anchor state))
@@ -402,10 +402,20 @@ since these aren't a proper location."
          (eq '&body (cdr (assoc id (parse:form-slot-kinds
                                     (type-of (location-node location)))))))))
 
+(defun completion-match-p (name candidate)
+  "Is (nonempty string) `name' an ordered subsequence of `candidate'?"
+  (let ((text (string candidate)))
+    (or (zerop (length name))
+        (and (char= (char name 0) (char text 0))
+             (loop with start = 0
+                   for c across name
+                   always (when-let (position (position c text :start start))
+                            (setf start (1+ position))))))))
+
 (defun global-key-handler (node location)
   "Handler receives its working buffer explicitly at dispatch time."
   (lambda (view event buffer)
-    (slog event)
+    (slog* (format nil "event: ~a" event))
     (assert (location= location (focus buffer)))
     ;; (slog (butlast (stack buffer))) ; suppress toplevel list
     (or (when-let (handler (gethash event *global-key-handlers*))
@@ -425,16 +435,20 @@ since these aren't a proper location."
       (setf (completion-state buffer)
             (when (eq (node-at (focus buffer)) (anchor completion))
               (let* ((name (parse:name (anchor completion)))
-                     (valid (delete-if-not (lambda (s) (starts-with-subseq name (string s)))
-                                           (copy-list (candidates completion)))))
+                     (valid (delete-if-not (lambda (s) (completion-match-p name s))
+                                           (copy-seq (candidates completion)))))
                 (copy-completion-state
                  completion
-                 :candidates (if (find name valid :test #'string=)
-                                 (sort valid #'<
-                                       :key (lambda (s)
-                                              (mk-string-metrics:damerau-levenshtein
-                                               name (string s))))
-                                 valid))))))
+                 :selection (min (selection completion) (max 0 (1- (length valid))))
+                 :candidates (stable-sort valid
+                                          (lambda (s1 s2)
+                                            (let ((e1 (string= name s1))
+                                                  (e2 (string= name s2)))
+                                              (cond ((and e1 e2) nil)
+                                                    (e1 t) (e2 nil)
+                                                    (t (string< s1 s2)))))
+                                          :key #'string))))))
+    ;;
     (assert (not (plain-body-location-p (focus buffer))) ()
             "focused the body ~a of ~a" (location-id (focus buffer))
             (type-of (location-node (focus buffer))))))
@@ -482,10 +496,6 @@ since these aren't a proper location."
        (not (or (tui:event-controlp event)
                 (tui:event-altp event) (tui:event-metap event)))))
 
-(defun completion-candidates (context)
-  (declare (ignore context))
-  (loop for s being the symbols of (find-package "CL") collect s))
-
 (defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (/= . #\≠) (lambda . "λ")))
 
 (defparameter *reader-punctuation* '((parse:read-quote . "'")
@@ -503,31 +513,37 @@ since these aren't a proper location."
     (eclector.reader:unquote-splicing 'unquote-splicing)
     (t name)))
 
-(defun symbol-ref-text (node package &optional use-mappings)
+(defun symbol-ref-prefix (node package)
+  "The package prefix displayed for `node' in `package' or NIL when unqualified."
   (let ((name (parse:name node))
         (home (parse:home-package node)))
     (cond
-      ((typep node 'parse:reader-marker)
-       (or (assoc-value *reader-punctuation* (to-read-syntax (parse:resolve node)))
-           (string name)))
-      ((eq home (find-package :keyword)) (format nil ":~(~a~)" name))
-      ((and use-mappings
-            (assoc-value *symbol-mappings* node :test #'parse:string-and-package=))
-       (string (assoc-value *symbol-mappings* node :test #'parse:string-and-package=)))
-      ((null home) (format nil "#:~(~a~)" name))
+      ((parse::input-prefix node) (parse::input-prefix node))
+      ((typep node 'parse:reader-marker) nil)
+      ((eq home (find-package :keyword)) ":")
+      ((null home) "#:")
       ((or (eq home package)
            (multiple-value-bind (symbol found) (find-symbol name package)
              (and found
                   (multiple-value-bind (original present) (find-symbol name home)
                     (and present (eq symbol original))))))
-       (string-downcase name))
+       nil)
       (t
        (let ((prefix (or (car (rassoc home (slynk-backend:package-local-nicknames package)))
                          (first (sort (cons (package-name home)
                                             (copy-list (package-nicknames home)))
                                       #'< :key #'length)))))
-         (format nil "~(~a~a~a~)" prefix
-                 (if (external-symbol-p name home) ":" "::") name))))))
+         (strcat prefix (if (external-symbol-p name home) ":" "::")))))))
+
+(defun symbol-ref-text (node package &optional use-mappings)
+  (cond
+    ((typep node 'parse:reader-marker)
+     (or (assoc-value *reader-punctuation* (to-read-syntax (parse:resolve node)))
+         (string (parse:name node))))
+    ((and use-mappings (null (parse::input-prefix node))
+          (assoc-value *symbol-mappings* node :test #'parse:string-and-package=))
+     (string (assoc-value *symbol-mappings* node :test #'parse:string-and-package=)))
+    (t (string-downcase (concatenate 'string (symbol-ref-prefix node package) (parse:name node))))))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect &key)
   (let* ((location (car stack))
@@ -1674,23 +1690,24 @@ ASSUMES we never focus a plain list body."
      :focused (location= location (focus context)))))
 
 ;;; completions
-(defun render-completion (sym index state rect)
+(defun render-completion (cand index state rect &optional (package-prefix ""))
   (when (plusp (tui:rect-rows rect))
-    (let ((prefix (parse:name (anchor state)))
+    (let ((text (parse:name (anchor state)))
           (selectedp (= index (selection state))))
       (flet ((style (bold)
                (tui:make-style :fg #xeeeeee
-                               :bg (if selectedp #x2aa198 #x0)
+                               :bg (if selectedp #x2aa198 #x073642)
                                :boldp bold
                                :italicp nil
                                :reversep nil
                                :underlinep nil)))
-        (tui:fill-rect (style nil) (tui:copy-rect rect :rows 1)
-                       :char #\space)
-        (tui:puts* (string-downcase prefix) 1 1 rect (style t))
-        (tui:puts* (string-downcase
-                    (nth-value 1 (starts-with-subseq prefix (string sym) :return-suffix t)))
-                   1 (+ 1 (length prefix)) rect (style nil)))
+        (tui:fill-rect (style nil) (tui:copy-rect rect :rows 1) :char #\space)
+        (tui:puts* (string-downcase package-prefix) 1 1 rect (style t))
+        (loop with offset = (1+ (tui:display-width package-prefix))
+              for c across (string-downcase (string cand))
+              do (tui:put* c 1 offset rect
+                           (style (if (find c text :test #'char-equal) t nil)))
+                 (incf offset (tui:character-width c))))
       (make-instance 'tui:view :rect (tui:copy-rect rect :rows 1)))))
 
 (defun render-completion-window (buffer)
@@ -1698,19 +1715,21 @@ ASSUMES we never focus a plain list body."
     (let* ((bounds (tui::screen-rect))
            (anchor (anchor state))
            (anchor-rect (node-screen-rect buffer anchor))
-           (maxlen (loop for candidate in (candidates state)
+           (package-prefix (or (symbol-ref-prefix anchor (buffer-package buffer)) ""))
+           (maxlen (loop for candidate across (candidates state)
                          maximize (tui:display-width (string candidate))))
            (rect (tui:clamp-rect
                   (tui:make-rect :x (tui:rect-x anchor-rect)
                                  :y (tui:rect-y2 anchor-rect)
                                  :rows (tui:rect-rows bounds)
-                                 :cols maxlen)
+                                 :cols (+ (tui:display-width package-prefix) maxlen))
                   bounds)))
       (tui:with-vertical (rect)
-        (loop for candidate in (candidates state)
+        (loop for candidate across (candidates state)
               for index from 0
               until (tui:full)
-              do (tui:place (rect) (render-completion candidate index state rect)))))))
+              do (tui:place (rect) (render-completion candidate index state rect
+                                                      package-prefix)))))))
 
 (defun make-cell-buffer (rows cols)
   (let ((buffer (make-array (list rows cols))))
@@ -2132,7 +2151,8 @@ as `viewport'."
                 debugger-text restart-depth enter-debugger-loop
                 measure-node
                 function-call-indentation
-                ref-list-indentation symbol-ref-text render-literal-text render-literal-line
+                ref-list-indentation symbol-ref-prefix symbol-ref-text
+                render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements
                 render-layout-slot slot-render-keys render-setf-function-name
                 macro-call-indentation setf-indentation loop-indentation
@@ -2170,7 +2190,7 @@ as `viewport'."
 
 (defun enter-debugger-loop (ui condition)
   (slog* (debugger-text
-          (lambda (out) (format out "entering recursive loop on ~s" condition))))
+          (lambda (out) (format out "recursively debugging error: ~a" condition))))
   (incf (revision ui))
   (let ((debugger (find-if #'debug-state-p (buffers ui) :key #'buffer-state))
         (previous-focus (focused-buffer ui)))

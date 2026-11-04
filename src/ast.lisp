@@ -95,7 +95,8 @@
 (defrecord symbol-ref (eval-form atom-form)
   ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
-   (home-package :type (or null package)))
+   (home-package :type (or null package))
+   (input-prefix :init nil :type (or null string)))
   (:documentation "Represents a symbol, possibly referring to a symbol macro."))
 
 (defun string-and-package= (node sym)
@@ -258,7 +259,8 @@ so a name test alone can't distinguish #:|.| from a dot."))
   (:method ((o hole)) (hole (text o)))
   ;; note: class-of, so binders/reader markers don't decay
   (:method ((o symbol-ref))
-    (make-instance (class-of o) :name (name o) :home-package (home-package o)))
+    (make-instance (class-of o) :name (name o) :home-package (home-package o)
+                                :input-prefix (input-prefix o)))
   (:method ((o label-def)) (make-instance 'label-def :name (name o)
                                                      :labeled (copy-node (labeled o))))
   (:method ((o function-call)) (make-instance 'function-call
@@ -804,7 +806,7 @@ without expanding hardwired operators."
 
 (defun form-parse-error (control &rest args)
   (error 'form-parse-error
-         :format-control (concatenate 'string "parse failed: " control)
+         :format-control (strcat "parse failed: " control)
          :format-arguments args))
 
 (define-condition analysis-invariant-error (simple-error)
@@ -1420,7 +1422,6 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                     (&rest-qualifiers
                      (push `((list (eql ',part) (type integer)) 'unevaluated) sort-clauses))
                     ;; note: nothing inside quoted data is ever a binder or eval-form
-                    ;; TODO refine sorts by value type (symbol/string/number/...)
                     ((&tree &declarations)
                      (push `((eql ',part) 'unevaluated) sort-clauses)
                      (push `((list* (eql ',part) (type list)) 'unevaluated) sort-clauses))
@@ -2988,7 +2989,7 @@ At inert source references, binding captures require the same namespace and sour
 Return binding captures, reference captures, and whether analysis completed.
 - Variable reference captures are symbols.
 - Function/block captures are (:FUNCTION name)/(:BLOCK name).
-TODO: maybe walk tag references
+note: doesn't walk tag references
 note: CL function names are exempt; portable code may not lexically rebind them.
 CALL-NEXT-METHOD and NEXT-METHOD-P are exceptions implicitly rebound by DEFMETHOD.
 note: function references from packages named SB-* are exempt implementation-internals.

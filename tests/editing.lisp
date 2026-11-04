@@ -117,7 +117,7 @@ second\"" (parse:str (parse::docstring code)))
          (anchor (progn (goto ui 5 'parse:name) (focused ui))))
     (setf (w::completion-state ui)
           (make-instance 'w::completion-state :anchor anchor
-                         :candidates '("FOO" "FOOBAR" "FOOBAZ")))
+                         :candidates #("FOO" "FOOBAR" "FOOBAZ")))
     (is equal '("f 5" "foo" "foobar") (lines ui :rows 3 :cols 20))
     (setf (w::completion-state ui) nil)
     (goto ui 5 '(parse:body 0))
@@ -303,7 +303,9 @@ second\"" (parse:str (parse::docstring code)))
 
 (define-test typing-a-call-into-a-macro-argument :parent editing
   (let ((ui (goto (ui-for "(loop for x in xs)") '(parse:body 3))))
-    (press ui :rubout :rubout #\( #\q #\u #\o #\t #\e :enter #\a)
+    (press ui :rubout :rubout #\( #\q #\u #\o #\t #\e)
+
+    (press ui :enter #\a)
     (is equal "(LOOP FOR X IN (QUOTE A))" (code ui))))
 
 (define-test completion-survives-macro-arguments :parent editing
@@ -335,6 +337,7 @@ second\"" (parse:str (parse::docstring code)))
   (flet ((complete (word)
            (let ((ui (goto (ui-for "(list xs)") '(parse:body 0))))
              (apply #'press ui :rubout :rubout (coerce word 'list))
+
              (press ui :enter)
              ui)))
     (is equal "(LIST (CONS _ _))" (code (complete "CONS")))
@@ -744,7 +747,13 @@ second\"" (parse:str (parse::docstring code)))
 
 (define-test completing-a-macro-name-reparses-arguments :parent editing
   (let ((ui (goto (ui-for "(dolist (x xs) (print x))") 'parse:op)))
-    (press ui :rubout :rubout #\s :enter)
+    (press ui :rubout :rubout #\s)
+    ;; visible symbols also include names interned during intermediate macro edits
+    (let ((state (w::completion-state ui)))
+      (setf (w::completion-state ui)
+            (w::copy-completion-state
+             state :selection (position 'dolist (w::candidates state)))))
+    (press ui :enter)
     (let ((form (first (w::ast ui))))
       (is equal 'parse:macro-call (type-of form))
       (is equal t (parse::expanded form))
@@ -840,7 +849,7 @@ second\"" (parse:str (parse::docstring code)))
     (setf (w::buffer-x buffer) 3
           (w::buffer-y buffer) 2
           (w::completion-state buffer)
-          (w::make-completion-state :anchor (focused buffer) :candidates '(car caar)))
+          (w::make-completion-state :anchor (focused buffer) :candidates #(car caar)))
     (let* ((cells (render-buffer buffer :rows 7 :cols 20))
            (overlay (first (tui:children (tui:root-view ui))))
            (rect (tui:rect overlay)))
@@ -877,7 +886,7 @@ second\"" (parse:str (parse::docstring code)))
     (is equal "AREF" (parse:name (focused buffer)))
     (press buffer #\x)
     (is equal "(FUNCTION (SETF AREFX))" (code buffer))
-    (is equal "#'(setf cl::arefx)" (draw buffer))
+    (is equal "#'(setf arefx)" (draw buffer))
     (press buffer '(:ctrl #\u))
     (is equal "#'(setf aref)" (draw buffer))))
 
@@ -895,7 +904,9 @@ second\"" (parse:str (parse::docstring code)))
 
 (define-test complete-let-with-enter :parent editing
   (let ((buffer (ui-for nil)))
-    (press buffer #\l #\e #\t :enter)
+    (press buffer #\l #\e #\t)
+
+    (press buffer :enter)
     (is eq 'parse:let-form (type-of (first (w::ast buffer))))
     (is equal "(LET ((_ _)) _)" (code buffer))
     (is equal "let (hole hole) /  hole" (draw buffer))))
@@ -1063,14 +1074,14 @@ second\"" (parse:str (parse::docstring code)))
   (let* ((buffer (ui-for "ca"))
          (ui (w::buffer-ui buffer))
          (completion (w::make-completion-state :anchor (focused buffer)
-                                               :candidates '(car caar))))
+                                               :candidates #(car caar))))
     (setf (w::completion-state buffer) completion)
     (render-buffer buffer)
     (let ((copies (w::handle-ui-event ui (event #\r))))
       (is eq completion (w::completion-state buffer))
       (is equal "CA" (parse:name (w::anchor completion)))
-      (is equal '(car caar) (w::candidates completion))
-      (is equal '(car) (w::candidates (w::completion-state (first copies)))))))
+      (is equalp #(car caar) (w::candidates completion))
+      (is equalp #(car caar) (w::candidates (w::completion-state (first copies)))))))
 
 (define-test failed-event-discards-state-and-effects :parent editing
   (let* ((buffer (goto (ui-for "(f a b)") '(parse:body 0)))
@@ -1282,7 +1293,7 @@ second\"")))))
          (ui (w::buffer-ui first))
          (second (w::add-buffer ui :ast (list (parse "b")) :package *package*)))
     (setf (w::completion-state second)
-          (w::make-completion-state :anchor (focused second) :candidates '(beta)))
+          (w::make-completion-state :anchor (focused second) :candidates #(beta)))
     (multiple-value-bind (copies effects) (w::handle-ui-event ui (event '(:ctrl #\w)))
       (is = 2 (length (w::buffers ui)))
       (is equal (list (w::buffer-id first)) (w::closed-buffers effects))
@@ -1437,7 +1448,9 @@ second\"")))))
     (is eq 'parse:hole (type-of (focused ui)))
     (is eq t (not (null (lines ui)))))
   (let ((ui (goto (ui-for "(function foo)") 'parse:fun-designator)))
-    (press ui :rubout :rubout :rubout #\c #\d #\r :enter)
+    (press ui :rubout :rubout :rubout #\c #\d #\r)
+
+    (press ui :enter)
     (is equal "(FUNCTION CDR)" (code ui))))
 
 (define-test insert-funquote :parent editing
@@ -1453,3 +1466,102 @@ second\"")))))
     (is equal "(QUOTE (FUNCTION CAR))" (code ui))
     (is eq 'parse:ref-list (type-of (parse:thing (first (w::ast ui)))))
     (is eq t (not (null (lines ui))))))
+
+(define-test qualified-symbol-input :parent editing
+  (let* ((package (make-package (symbol-name (gensym "QUALIFIED-")) :use nil))
+         (public (intern "PUBLIC" package))
+         (private (intern "PRIVATE" package)))
+    (unwind-protect
+         (progn
+           (export public package)
+           (let ((ui (ui-for (parse:hole))))
+             (loop for c across (package-name package) do (press ui c))
+             (press ui #\:)
+             (is eq package (parse:home-package (focused ui)))
+             (is equalp #() (w::candidates (w::completion-state ui)))
+             (press ui #\:)
+             (is eq nil (w::completion-state ui))
+             (press ui #\p #\r)
+             (is equal "PR" (parse:name (focused ui)))
+             (is equal (string-downcase (format nil "~a::pr" (package-name package)))
+                 (first (lines ui)))
+             (press ui :enter)
+             (is eq private (parse:resolve (focused ui)))))
+      (delete-package package))))
+
+(define-test completion-visible-symbols :parent editing
+  (let* ((ui (ui-for "foo"))
+         (symbols (w::completion-candidates ui)))
+    (is eq t (vectorp symbols))
+    (is eq t (not (null (find 'car symbols))))
+    (is eq t (not (null (find 'completion-visible-symbols symbols))))))
+
+(define-test completion-tab-preserves-order :parent editing
+  (let ((ui (ui-for (parse:hole))))
+    (setf (w::buffer-package ui) (find-package :weave-tui))
+    (loop for c across "tui:rect" do (press ui c))
+    (let* ((state (w::completion-state ui))
+           (before (copy-seq (w::candidates state))))
+      (loop repeat 6
+            do (press ui '(:ctrl #\i))
+               (is equalp before (w::candidates (w::completion-state ui)))))))
+
+(define-test completion-existing-package-prefix :parent editing
+  (let ((ui (ui-for "uncursed:rect")))
+    (setf (w::buffer-package ui) (find-package :weave-tui))
+    (is eq nil (parse::input-prefix (focused ui)))
+    (press ui :rubout)
+    (is equal "tui:rec" (first (lines ui)))
+    (let ((candidates (w::candidates (w::completion-state ui))))
+      (is eq t (not (null (find 'tui:rect candidates))))
+      (loop for symbol across candidates
+            do (is eq :external (nth-value 1 (find-symbol (symbol-name symbol) :uncursed)))))
+    (is eq t (some (lambda (line) (alexandria:starts-with-subseq "tui:rec" line))
+                   (rest (lines ui))))
+    (let* ((cells (render-buffer ui))
+           (style (tui::cell-style (aref cells 1 0))))
+      (is eq t (tui-sys:boldp style)))))
+
+(define-test completion-existing-internal-prefix :parent editing
+  (let ((ui (ui-for "weave-parser::input-prefix")))
+    (setf (w::buffer-package ui) (find-package :weave-tui))
+    (press ui :rubout)
+    (is equal "parse::input-prefi" (first (lines ui)))
+    (is eq t (not (null (find 'parse::input-prefix
+                              (w::candidates (w::completion-state ui))))))))
+
+(define-test completion-exact-match-first-and-selection :parent editing
+  (let* ((ui (ui-for "rec"))
+         (state (w::make-completion-state
+                 :anchor (focused ui) :selection 2
+                 :candidates (vector (make-symbol "") (make-symbol "RESPECT")
+                                     (make-symbol "RECT") (make-symbol "REACT")))))
+    (setf (w::completion-state ui) state)
+    (press ui #\t)
+    (let ((new (w::completion-state ui)))
+      (is equal '("RECT" "REACT" "RESPECT") (map 'list #'symbol-name (w::candidates new)))
+      (is = 0 (w::selection new))
+      (is = 2 (w::selection state)))))
+
+(define-test completion-wide-character-placement :parent editing
+  (let* ((cells (w::make-cell-buffer 1 5))
+         (tui::*put-buffer* cells)
+         (state (w::make-completion-state :anchor (sym "界A") :candidates #("界A"))))
+    (w::render-completion "界A" 0 state (tui:make-rect :x 0 :y 0 :rows 1 :cols 5))
+    (is equal "a" (tui::cell-string (aref cells 0 2)))))
+
+(define-test unqualified-symbol-text-has-no-nil-prefix :parent editing
+  (is equal "car" (w::symbol-ref-text (sym "CAR") (find-package :cl-user))))
+
+(define-test completion-ordered-subsequences :parent editing
+  (is eq t (w::completion-match-p "D-BIND" 'destructuring-bind))
+  (is eq nil (w::completion-match-p "D-BIND" 'w::debug-conditions))
+  (is eq nil (w::completion-match-p "D-BIND" 'alexandria-2:dim-in-bounds-p))
+  (is eq nil (w::completion-match-p "ABB" "AB"))
+  (is eq t (w::completion-match-p "ABB" "ABCB"))
+  (is eq nil (w::completion-match-p "" "ABC"))
+  (is eq nil (w::completion-match-p "A" ""))
+  (let ((ui (ui-for (parse:hole))))
+    (setf (w::buffer-package ui) (find-package :weave-tui))
+    (loop for c across "d-bind" do (press ui c))
+    (is eq 'destructuring-bind (aref (w::candidates (w::completion-state ui)) 0))))

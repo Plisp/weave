@@ -13,6 +13,7 @@
            #:external-symbol-p
            #:defrecord #:shallow-copy-record
            #:with-timing
+           #:strcat
            ))
 (in-package #:weave-utils)
 
@@ -209,3 +210,15 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
     `(let ((,begin (get-internal-real-time)))
        ,@body
        (funcall ,printer (- (get-internal-real-time) ,begin)))))
+
+(defun strcat (&rest designators)
+  "Returns a fresh string formed by concatenating `designators'."
+  (declare (optimize speed))
+  (let* ((total-length (reduce #'+ designators :key (lambda (d) (length (string d)))))
+         (out (make-string total-length)))
+    (loop with i = 0
+          for d in designators
+          for str = (string d)
+          do (replace out str :start1 i)
+             (incf i (length str)))
+    out))
