@@ -124,3 +124,10 @@
 (defmacro shadowing-vars (a b &body body)
   `(let* ((,a 1) (,b 2)) ,@body))
 
+(defun select-completion (buffer name)
+  (let* ((state (w::completion-state buffer))
+         (index (position (string name) (w::candidates state)
+                          :key #'symbol-name :test #'string=)))
+    (assert index)
+    (setf (w::completion-state buffer)
+          (w::copy-completion-state state :selection index))))

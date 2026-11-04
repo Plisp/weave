@@ -369,65 +369,58 @@ If this returns NIL, propagate up the cursor stack.")
 
 (defmethod handle-key ((node hole) view location buffer event)
   (let ((c (tui:event-kind event)))
-    (flet ((start-completion (newnode)
-             (setf (completion-state buffer)
-                   (make-completion-state
-                    :anchor newnode
-                    :candidates (completion-candidates buffer newnode)))))
-      (when (is-regular-char-event event)
-        (trivia:match (slog (locsort location))
-          ((eql 'parse:binder)
-           (when (and (symbol-char-p c) (not (digit-char-p c)))
-             (swap-node location (make-instance 'parse:binder
-                                                :name (string-upcase c)
-                                                :home-package (buffer-package buffer))
-                        buffer)))
-          ((eql 'parse:eval-form)
-           (cond
-             ((and (char= c #\() (not (typep (location-node location) 'parse:macro-call)))
-              (swap-node location (ref-list) buffer))
-             ((and (symbol-char-p c) (not (digit-char-p c)))
-              (let ((newnode (make-instance 'parse:symbol-ref
-                                            :name (string-upcase c)
-                                            :home-package (buffer-package buffer))))
-                (start-completion newnode)
-                (swap-node location newnode buffer)))
-             ((digit-char-p c)
-              (let ((newnode (make-instance 'parse:integer-literal :str (string c))))
-                (swap-node location newnode buffer)))
-             ;; TODO needs to deal with comma depth and insertion
-             ;; ((char= c #\`)
-             ;;  (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
-             ;;    (swap-node location newnode buffer)
-             ;;    (focus-first-hole buffer)
-             ;;    t))
-             ((char= c #\')
-              (let ((newnode (make-instance 'parse:quote-form :op 'parse:read-quote
-                                                              :thing (hole))))
-                (swap-node location newnode buffer)
-                (focus-first-hole buffer)
-                t))))
-          ((or (eql 'parse:fun-designator) (eql 'parse:symbol-ref))
-           (when (and (symbol-char-p c) (not (digit-char-p c)))
-             (let ((newnode (make-instance 'parse:symbol-ref
-                                           :name (string-upcase c)
-                                           :home-package (buffer-package buffer))))
-               (start-completion newnode)
-               (swap-node location newnode buffer))))
-          ((eql 'parse:unevaluated)
-           (cond
-             ((char= c #\()
-              (swap-node location (ref-list (hole)) buffer)
-              (refocus buffer (append-id (location-id (focus buffer)) 0)))
-             ((and (symbol-char-p c) (not (digit-char-p c)))
-              (swap-node location
-                         (make-instance 'parse:symbol-ref
-                                        :name (string-upcase c)
-                                        :home-package (buffer-package buffer))
-                         buffer))
-             ((digit-char-p c)
-              (swap-node location (make-instance 'parse:integer-literal :str (string c))
-                         buffer)))))))))
+    (when (is-regular-char-event event)
+      (trivia:match (slog (locsort location))
+        ((eql 'parse:binder)
+         (when (and (symbol-char-p c) (not (digit-char-p c)))
+           (swap-node location (make-instance 'parse:binder
+                                              :name (string-upcase c)
+                                              :home-package (buffer-package buffer))
+                      buffer)))
+        ((eql 'parse:eval-form)
+         (cond
+           ((and (char= c #\() (not (typep (location-node location) 'parse:macro-call)))
+            (swap-node location (ref-list) buffer))
+           ((and (symbol-char-p c) (not (digit-char-p c)))
+            (let ((newnode (make-instance 'parse:symbol-ref
+                                          :name (string-upcase c)
+                                          :home-package (buffer-package buffer))))
+              (swap-node location newnode buffer)))
+           ((digit-char-p c)
+            (let ((newnode (make-instance 'parse:integer-literal :str (string c))))
+              (swap-node location newnode buffer)))
+           ;; TODO needs to deal with comma depth and insertion
+           ;; ((char= c #\`)
+           ;;  (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
+           ;;    (swap-node location newnode buffer)
+           ;;    (focus-first-hole buffer)
+           ;;    t))
+           ((char= c #\')
+            (let ((newnode (make-instance 'parse:quote-form :op 'parse:read-quote
+                                                            :thing (hole))))
+              (swap-node location newnode buffer)
+              (focus-first-hole buffer)
+              t))))
+        ((or (eql 'parse:fun-designator) (eql 'parse:symbol-ref))
+         (when (and (symbol-char-p c) (not (digit-char-p c)))
+           (let ((newnode (make-instance 'parse:symbol-ref
+                                         :name (string-upcase c)
+                                         :home-package (buffer-package buffer))))
+             (swap-node location newnode buffer))))
+        ((eql 'parse:unevaluated)
+         (cond
+           ((char= c #\()
+            (swap-node location (ref-list (hole)) buffer)
+            (refocus buffer (append-id (location-id (focus buffer)) 0)))
+           ((and (symbol-char-p c) (not (digit-char-p c)))
+            (swap-node location
+                       (make-instance 'parse:symbol-ref
+                                      :name (string-upcase c)
+                                      :home-package (buffer-package buffer))
+                       buffer))
+           ((digit-char-p c)
+            (swap-node location (make-instance 'parse:integer-literal :str (string c))
+                       buffer))))))))
 
 (defun build-arglist (fname &optional old-body)
   (let* ((arglist (when (fboundp fname) (slynk-backend:arglist fname)))
@@ -437,8 +430,7 @@ If this returns NIL, propagate up the cursor stack.")
                              count t)
                        0)))
     (append old-body
-            (loop for i below (max 1 (- argcount (length old-body)))
-                  collect (hole)))))
+            (loop repeat (max 0 (- argcount (length old-body))) collect (hole)))))
 
 (defun build-call (ref &optional old-body)
   "ref must be a symbol-ref"
@@ -599,21 +591,25 @@ addressed by indices."
                     (null (elements focused))
                     (eq 'parse:eval-form (locsort location))))
            (swap-node location (hole) buffer))
-          ((and (eq 'parse:eval-form (locsort location))
-                (typep focused 'hole))
+          ((and (typep focused 'hole)
+                (eq 'parse:eval-form (locsort location)))
            (let ((id (location-id location))
                  (parent (location-node location)))
              ;; By default only delete children in a body
-             (when (bodylike-id id)
-               (let ((body-loc (make-location :node parent :id (parent-id id))))
-                 (save-history buffer)
-                 (if (< 1 (length (elements (node-at body-loc))))
-                     (ast-delete body-loc (id-index id) buffer)
-                     (edit-list body-loc
-                                (lambda (body)
-                                  (list-remove (elements body) (id-index id)))
-                                (move-back parent id) buffer (stack buffer)))
-                 t)))))))
+             (cond ((bodylike-id id)
+                    (let ((body-loc (make-location :node parent :id (parent-id id))))
+                      (save-history buffer)
+                      (if (< 1 (length (elements (node-at body-loc))))
+                          (ast-delete body-loc (id-index id) buffer)
+                          (edit-list body-loc
+                                     (lambda (body)
+                                       (list-remove (elements body) (id-index id)))
+                                     (move-back parent id) buffer (stack buffer)))
+                      t))
+                   ((and (integerp id) (< 1 (length (ast buffer))))
+                    (setf (ast buffer) (list-remove (ast buffer) id))
+                    (setf (stack buffer) (list (make-location :node (ast buffer)
+                                                              :id (max 0 (1- id))))))))))))
 
 (setf (gethash (tui-sys:make-event :kind #\rubout) *default-key-handlers*)
       (lambda (view buffer)
@@ -824,12 +820,12 @@ addressed by indices."
            (prefix (symbol-ref-prefix node (buffer-package buffer)))
            (home (if prefix (parse:home-package node) (buffer-package buffer)))
            (c (tui:event-kind event)))
-      (labels ((replace-ref (name home prefix &optional (refilter t) (complete t))
+      (labels ((replace-ref (name home prefix &optional (refilter t))
                  (let ((new (make-instance 'parse:symbol-ref :name name :home-package home
                                                              :input-prefix prefix)))
                    (swap-node location new buffer)
                    (setf (completion-state buffer)
-                         (when complete
+                         (when (completion-state buffer)
                            (if (and (not refilter) (completion-state buffer))
                                (copy-completion-state (completion-state buffer)
                                                       :anchor new :selection 0)
@@ -847,36 +843,30 @@ addressed by indices."
                                               :test #'string-equal))
                                   (find-package name))))
                 (when package
-                  (replace-ref "" package (strcat name ":") t t))))
+                  (replace-ref "" package (strcat name ":")))))
              ((and (zerop (length name))
                    (not (ends-with-subseq "::" prefix)))
-              ;; there can be many internal symbols, don't consider them all
-              (replace-ref "" home (strcat prefix ":") t nil)))
+              (replace-ref "" home (strcat prefix ":"))))
            t)
           ((symbol-char-p c)
            (if (string= ":" name) ; keyword
-               (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":" t t)
+               (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":")
                (replace-ref (strcat name (string (char-upcase c))) home prefix nil)))
           ((char= c #\Rubout)
            (cond
              ((plusp (length name))
               (if (and (= 1 (length name)) (null prefix))
                   (swap-node location (hole) buffer)
-                  (replace-ref
-                   (subseq name 0 (1- (length name))) home prefix t
-                   ;; do not complete without at least one filtered letter,
-                   ;; unless external non-keyword, in which case matches should be few
-                   (or (< 1 (length name))
-                       (let ((plen (length prefix)))
-                         (and prefix (char= #\: (char prefix (- plen 1)))
-                              (> plen 1) (char/= #\: (char prefix (- plen 2)))))))))
+                  (replace-ref (subseq name 0 (1- (length name))) home prefix)))
              ((and prefix (ends-with-subseq "::" prefix))
               (replace-ref "" home (subseq prefix 0 (1- (length prefix)))))
              (prefix
               (if (= 1 (length prefix))
                   (swap-node location (hole) buffer)
-                  (replace-ref (subseq prefix 0 (1- (length prefix)))
-                               (buffer-package buffer) nil nil nil))))
+                  (progn
+                    (setf (completion-state buffer) nil)
+                    (replace-ref (subseq prefix 0 (1- (length prefix)))
+                                 (buffer-package buffer) nil)))))
            t))))))
 
 (defmethod handle-key ((node parse:binder) view location buffer event)
@@ -954,25 +944,35 @@ if none, surround current atom"
                      (declare (ignore view))
                      (wrap-arith sym* buffer))))))
 
-(setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (when-let* ((state (completion-state buffer))
-                    (count (plusp (length (candidates state)))))
-          (setf (completion-state buffer)
-                (copy-completion-state
-                 state :selection (mod (1+ (selection state))
-                                       (length (candidates state))))))))
+(defun start-completion (view buffer)
+  (declare (ignore view))
+  (let ((node (node-at (focus buffer))))
+    (when (typep node 'parse:symbol-ref)
+      (setf (completion-state buffer)
+            (make-completion-state :anchor node
+                                   :candidates (completion-candidates buffer node)))
+      t)))
 
-(setf (gethash (tui-sys:make-event :kind #\tab :shiftp t) *global-key-handlers*)
-      (lambda (view buffer)
-        (declare (ignore view))
-        (when-let* ((state (completion-state buffer))
-                    (count (plusp (length (candidates state)))))
+(setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
+      #'start-completion
+      (gethash (tui-sys:make-event :kind #\tab) *global-key-handlers*)
+      #'start-completion)
+(remhash (tui-sys:make-event :kind #\tab :shiftp t) *global-key-handlers*)
+
+(defun handle-completion-key (view event buffer)
+  (declare (ignore view))
+  (when (and buffer (tui:event-controlp event)
+             (not (or (tui:event-altp event) (tui:event-metap event)))
+             (member (tui:event-kind event) '(#\n #\p)))
+    (when-let (state (completion-state buffer))
+      (let ((count (length (candidates state))))
+        (when (plusp count)
           (setf (completion-state buffer)
                 (copy-completion-state
-                 state :selection (mod (1- (selection state))
-                                       (length (candidates state))))))))
+                 state :selection (mod (+ (selection state)
+                                          (if (char= (tui:event-kind event) #\n) 1 -1))
+                                       count)))))
+      t)))
 
 ;;; macros
 
@@ -1246,6 +1246,7 @@ already and focuses the hole."
     (t (ref-list))))
 
 ;; TODO capture i/o using gray streams
+;; TODO intern permanently symbols used in toplevel definitions
 (setf (gethash (tui-sys:make-event :kind #\e :altp t) *global-key-handlers*)
       (lambda (view buffer)
         (let ((stack (stack buffer))
@@ -1253,12 +1254,12 @@ already and focuses the hole."
                      (tui:rect view) (scroll-state-viewport (scroll-state buffer))
                      (buffer-rect buffer))))
           (handler-bind ((warning #'muffle-warning))
-            (parse::with-temporary-interning (interned)
+            (let ((interned (make-array 0 :fill-pointer t :adjustable t)))
               (let* ((raw (parse::strip-wrappers
                            (parse:to-syntax (node-at (car stack)))
                            interned))
                      (res (let ((*standard-output* (make-broadcast-stream)))
-                            (eval raw))))
+                            (eval (slog raw)))))
                 (slog* (format nil "eval produced ~a" res))
                 (add-buffer
                  (buffer-ui buffer)

@@ -1477,7 +1477,7 @@ pairs building new elements of &rest and &body slots."))
                    *default-expansions*)
           (lambda () (default-node layout)))))
 
-(defmacro deflayout (type templates rows)
+(defmacro deflayout (type () templates &rest rows)
   "Lays out forms of class `type' in `rows' of slots, where `templates' are forms building
 new elements for its &rest and &body slots.
 ASSUMES that &rest slots accept (slot i j) even if the list is optional like let.
@@ -1488,143 +1488,159 @@ ASSUMES we never focus a plain list body."
                  :templates (list ,@(loop for (slot . template) in templates
                                           collect `(cons ',slot (lambda () ,template)))))))
 
-(deflayout parse:let*-form ((parse:vars . (ref-list (hole) (hole)))
-                            (parse:body . (hole)))
-  ((parse:op parse:vars)
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:let*-form ()
+  ((parse:vars . (ref-list (hole) (hole)))
+   (parse:body . (hole)))
+  (parse:op parse:vars)
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:let-form ((parse:vars . (ref-list (hole) (hole)))
-                           (parse:body . (hole)))
-  ((parse:op parse:vars)
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:let-form ()
+  ((parse:vars . (ref-list (hole) (hole)))
+   (parse:body . (hole)))
+  (parse:op parse:vars)
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:flet-form
-    ((parse:funs
-      . (ref-list (hole)
-                  (make-instance 'parse:function-code
-                                 :lambda-list-kind :lambda
-                                 :lambda-list (ref-list)
-                                 :body (list (hole)))))
-     (parse:body . (hole)))
-  ((parse:op parse:funs)
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:flet-form ()
+  ((parse:funs
+    . (ref-list (hole)
+                (make-instance 'parse:function-code
+                               :lambda-list-kind :lambda
+                               :lambda-list (ref-list)
+                               :body (list (hole)))))
+   (parse:body . (hole)))
+  (parse:op parse:funs)
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:labels-form
-    ((parse:funs
-      . (ref-list (hole)
-                  (make-instance 'parse:function-code
-                                 :lambda-list-kind :lambda
-                                 :lambda-list (ref-list)
-                                 :body (list (hole)))))
-     (parse:body . (hole)))
-  ((parse:op parse:funs)
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:labels-form ()
+  ((parse:funs
+    . (ref-list (hole)
+                (make-instance 'parse:function-code
+                               :lambda-list-kind :lambda
+                               :lambda-list (ref-list)
+                               :body (list (hole)))))
+   (parse:body . (hole)))
+  (parse:op parse:funs)
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:macrolet-form
-    ((parse:macro-defs
-      . (ref-list (hole)
-                  (make-instance 'parse:function-code
-                                 :lambda-list-kind :macro-lambda
-                                 :lambda-list (ref-list)
-                                 :body (list (hole)))))
-     (parse:body . (hole)))
-  ((parse:op parse:macro-defs)
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:macrolet-form ()
+  ((parse:macro-defs
+    . (ref-list (hole)
+                (make-instance 'parse:function-code
+                               :lambda-list-kind :macro-lambda
+                               :lambda-list (ref-list)
+                               :body (list (hole)))))
+   (parse:body . (hole)))
+  (parse:op parse:macro-defs)
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:symbol-macrolet-form ((parse:macro-code . (ref-list (hole) (hole)))
-                                       (parse:body . (hole)))
-  ((parse:op parse:macro-code)
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:symbol-macrolet-form ()
+  ((parse:macro-code . (ref-list (hole) (hole)))
+   (parse:body . (hole)))
+  (parse:op parse:macro-code)
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:block-form ((parse:body . (hole)))
-  ((parse:op parse:name)
-   (1 parse:body)))
+(deflayout parse:block-form ()
+  ((parse:body . (hole)))
+  (parse:op parse:name)
+  (1 parse:body))
 
-(deflayout parse:catch-form ((parse:body . (hole)))
-  ((parse:op parse:tag)
-   (1 parse:body)))
+(deflayout parse:catch-form ()
+  ((parse:body . (hole)))
+  (parse:op parse:tag)
+  (1 parse:body))
 
-(deflayout parse:throw-form ()
-  ((parse:op parse:tag 1 parse:result)))
+(deflayout parse:throw-form () ()
+  (parse:op parse:tag 1 parse:result))
 
-(deflayout parse:return-from-form ((parse:value . (hole)))
-  ((parse:op parse:name 1 parse:value)))
+(deflayout parse:return-from-form ()
+  ((parse:value . (hole)))
+  (parse:op parse:name 1 parse:value))
 
-(deflayout parse:if-form ((parse:then-else . (hole)))
-  ((parse:op parse:test)
-   (3 parse:then-else)))
+(deflayout parse:if-form ()
+  ((parse:then-else . (hole)))
+  (parse:op parse:test)
+  (3 parse:then-else))
 
-(deflayout parse:setq-form ((parse:forms . (hole)))
-  ((parse:op (parse:forms ((0 . 2))))))
+(deflayout parse:setq-form ()
+  ((parse:forms . (hole)))
+  (parse:op (parse:forms ((0 . 2)))))
 
-(deflayout parse:progn-form ((parse:forms . (hole)))
-  (parse:op
-   (1 parse:forms)))
+(deflayout parse:progn-form ()
+  ((parse:forms . (hole)))
+  parse:op
+  (1 parse:forms))
 
-(deflayout parse:tagbody-form ((parse:body . (hole)))
-  (parse:op
-   (1 parse:body)))
+(deflayout parse:tagbody-form ()
+  ((parse:body . (hole)))
+  parse:op
+  (1 parse:body))
 
-(deflayout parse:go-form ()
-  ((parse:op parse:tag)))
+(deflayout parse:go-form () ()
+  (parse:op parse:tag))
 
-(deflayout parse:the-form ()
-  ((parse:op parse:type-specifier 1 parse:form)))
+(deflayout parse:the-form () ()
+  (parse:op parse:type-specifier 1 parse:form))
 
-(deflayout parse:unwind-protect-form ((parse:cleanup . (hole)))
-  ((parse:op)
-   (3 parse:protected)
-   (1 parse:cleanup)))
+(deflayout parse:unwind-protect-form ()
+  ((parse:cleanup . (hole)))
+  (parse:op)
+  (3 parse:protected)
+  (1 parse:cleanup))
 
-(deflayout parse:multiple-value-prog1-form ((parse:body . (hole)))
-  ((parse:op parse:values-form)
-   (1 parse:body)))
+(deflayout parse:multiple-value-prog1-form ()
+  ((parse:body . (hole)))
+  (parse:op parse:values-form)
+  (1 parse:body))
 
-(deflayout parse:multiple-value-call-form ((parse:body . (hole)))
-  ((parse:op parse:fun 1 parse:arg 1 parse:body)))
+(deflayout parse:multiple-value-call-form ()
+  ((parse:body . (hole)))
+  (parse:op parse:fun 1 parse:arg 1 parse:body))
 
-(deflayout parse:progv-form ((parse:body . (hole)))
-  ((parse:op parse:var-list 1 parse:val-list)
-   (1 parse:body)))
+(deflayout parse:progv-form ()
+  ((parse:body . (hole)))
+  (parse:op parse:var-list 1 parse:val-list)
+  (1 parse:body))
 
-(deflayout parse:locally-form ((parse:body . (hole)))
-  (parse:op
-   (1 parse:decls)
-   (1 parse:body)))
+(deflayout parse:locally-form ()
+  ((parse:body . (hole)))
+  parse:op
+  (1 parse:decls)
+  (1 parse:body))
 
-(deflayout parse:eval-when-form ((parse:body . (hole)))
-  ((parse:op parse:situations)
-   (1 parse:body)))
+(deflayout parse:eval-when-form ()
+  ((parse:body . (hole)))
+  (parse:op parse:situations)
+  (1 parse:body))
 
-(deflayout parse:load-time-value-form ()
-  ((parse:op parse:form 1 parse:read-only-p)))
+(deflayout parse:load-time-value-form () ()
+  (parse:op parse:form 1 parse:read-only-p))
 
-(deflayout parse:function-form ()
-  ((parse:op parse:fun-designator)))
+(deflayout parse:function-form () ()
+  (parse:op parse:fun-designator))
 
-(deflayout parse:quote-form ()
-  ((parse:op parse:thing)))
+(deflayout parse:quote-form () ()
+  (parse:op parse:thing))
 
-(deflayout parse:defmacro-form ()
-  ((parse:op parse:name)
-   (1 parse:macro-code)))
+(deflayout parse:defmacro-form () ()
+  (parse:op parse:name)
+  (1 parse:macro-code))
 
-(deflayout parse:defun-form ()
-  ((parse:op parse:name)
-   (1 parse:fun-code)))
+(deflayout parse:defun-form () ()
+  (parse:op parse:name)
+  (1 parse:fun-code))
 
-(deflayout parse:defmethod-form ()
-  ((parse:op parse:name 1 parse:qualifiers)
-   (1 parse:fun-code)))
+(deflayout parse:defmethod-form () ()
+  (parse:op parse:name 1 parse:qualifiers)
+  (1 parse:fun-code))
 
-(deflayout parse:lambda-form ()
-  ((parse:op parse:fun-code)))
+(deflayout parse:lambda-form () ()
+  (parse:op parse:fun-code))
 ;; override for nonempty lambda list
 (setf (gethash 'lambda *default-expansions*)
       (lambda ()
@@ -1724,12 +1740,15 @@ ASSUMES we never focus a plain list body."
                                  :rows (tui:rect-rows bounds)
                                  :cols (+ (tui:display-width package-prefix) maxlen))
                   bounds)))
-      (tui:with-vertical (rect)
-        (loop for candidate across (candidates state)
-              for index from 0
-              until (tui:full)
-              do (tui:place (rect) (render-completion candidate index state rect
-                                                      package-prefix)))))))
+      (let ((view
+              (tui:with-vertical (rect)
+                (loop for candidate across (candidates state)
+                      for index from 0
+                      until (tui:full)
+                      do (tui:place (rect)
+                           (render-completion candidate index state rect package-prefix))))))
+        (setf (tui:key-handler view) #'handle-completion-key)
+        view))))
 
 (defun make-cell-buffer (rows cols)
   (let ((buffer (make-array (list rows cols))))
@@ -2301,6 +2320,10 @@ as `viewport'."
          t)))))
 
 (defun dispatch-ui-event (ui event)
+  (when (and (not (tui:mouse-event-p event)) (tui:root-view ui))
+    (dolist (overlay (tui:children (tui:root-view ui)))
+      (when (funcall (tui:key-handler overlay) overlay event (focused-buffer ui))
+        (return-from dispatch-ui-event))))
   (when-let (handler (gethash event *ui-key-handlers*))
     (funcall handler ui)
     (return-from dispatch-ui-event))

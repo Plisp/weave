@@ -2588,7 +2588,7 @@ other atom."
   :binds ((tag) (result)))
 
 (defform (load-time-value form &body read-only-p)
-  :binds ((form) (read-only-p))) ; XXX not evaluated, refine to boolean
+  :binds ((form) (read-only-p))) ; note: not evaluated
 
 (defform (eval-when (&rest-qualifiers situations) &body body)
   :binds ((body)))
