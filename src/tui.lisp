@@ -25,7 +25,7 @@
 
 ;; dynamic vars for debugging, should not be used
 (defvar *state* #.nil)
-(defvar *log* (sb-concurrency:make-mailbox :name "log"))
+(defvar *log* (sb-concurrency:make-mailbox :name "log")) ; XXX conditionalize
 (defvar *log-stop* (gensym))
 (defmacro slog (form)
   (once-only ((res form))
@@ -272,6 +272,7 @@ construction, do not modify."))
   (car (stack buffer)))
 
 ;;; rendering helpers
+
 (defgeneric render-node (node stack context rect &key &allow-other-keys)
   (:documentation "Drawn contents MUST fit within the provided `rect'."))
 
@@ -379,19 +380,70 @@ construction, do not modify."))
                       (fboundp symbol)
                       (boundp symbol)))))))
 
-(defmethod render-node :around (node stack context rect &key)
-  (let* ((vals (multiple-value-list (call-next-method)))
-         (view (first vals)))
-    (setf (gethash node (node-views context)) view)
-    ;; occasionally draws body lists
-    (when (typep view 'ast-view)
-      (setf (view-stack view) stack))
-    (when (location= (car stack) (focus context))
-      (setf (gethash :focus-view (redisplay-cache context)) view))
-    (values-list vals)))
+(defun anchored-comment-locations (node &optional (slots '(parse::leading)))
+  (when (typep node 'parse::anchor)
+    (loop for slot in slots
+          append (loop for comment in (slot-value node slot)
+                       for index from 0
+                       when (typep comment 'parse::comment)
+                         collect (make-location :node node
+                                                :id (list :comment slot index))))))
+
+(defun render-trailing-comments (view comments stack context rect)
+  (if (null comments)
+      view
+      (multiple-value-bind (x y)
+          (view-end view)
+        (let* ((bounds (tui:clamp-rect (tui:copy-rect rect :x (1+ x) :y y) rect))
+               (trailing
+                 (tui:with-horizontal (bounds)
+                   (loop for location in comments
+                         for firstp = t then nil
+                         do (unless firstp (tui:pad 1))
+                            (tui:place (bounds)
+                              (render-node (node-at location) (cons location stack)
+                                           context bounds)))))
+               (end (tui:rect trailing)))
+          (make-instance 'tui:view :children (list view trailing)
+                                   :rect (tui:clamp-rect
+                                          (tui:copy-rect
+                                           rect :cols (- (max (tui:rect-x2 (tui:rect view))
+                                                              (tui:rect-x2 end))
+                                                         (tui:rect-x rect))
+                                           :rows (- (max (tui:rect-y2 (tui:rect view))
+                                                         (tui:rect-y2 end))
+                                                    (tui:rect-y rect)))
+                                          rect))))))
+
+(defmethod render-node :around (node stack context rect &rest keys &key)
+  (let ((comments (anchored-comment-locations node))
+        (trailing (anchored-comment-locations node '(parse::trailing)))
+        (vals nil))
+    (flet ((render-form (bounds)
+             (setf vals (multiple-value-list
+                         (apply #'call-next-method node stack context bounds keys)))
+             (render-trailing-comments (first vals) trailing stack context bounds)))
+      (let* ((combined
+               (if comments
+                   (tui:with-vertical (rect)
+                     (dolist (location comments)
+                       (tui:place (rect)
+                         (render-node (node-at location) (cons location stack)
+                                      context rect)))
+                     (tui:place (rect) (render-form rect)))
+                   (render-form rect)))
+             (view (first vals)))
+        ;; for future comment completion
+        (setf (gethash node (node-views context)) view)
+        (when (typep view 'ast-view)
+          (setf (view-stack view) stack))
+        (when (location= (car stack) (focus context))
+          (setf (gethash :focus-view (redisplay-cache context)) view))
+        (values-list (cons combined (rest vals)))))))
+
+;;; event handling
 
 (defparameter *default-key-handlers* (make-hash-table :test #'equal))
-(defparameter *ui-key-handlers* (make-hash-table :test #'equal))
 
 (defparameter *global-key-handlers* (make-hash-table :test #'equal))
 (defun plain-body-location-p (location)
@@ -770,7 +822,8 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                       (:array (format nil "#~dA" (parse::rank l)))
                       (otherwise (car *list-delimiters*))))
          (close-text (if (eq kind :array) "" (cdr *list-delimiters*))))
-    (unless (eq kind :list) (setf delimited t))
+    (when (or (not (eq kind :list)) (parse::inside l))
+      (setf delimited t))
     (flet ((contents (rect)
              (let* ((keys `(,@(when (eq delimited t) '(:delimited t))
                             :transform ,transform
@@ -779,8 +832,13 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                               (ref-list-indentation
                                (elements l) (list-locator contents-location) contents-stack
                                context rect keys))))
-               (render-elements (elements l) spec (list-locator contents-location)
-                                contents-stack context rect keys))))
+               (if (parse::inside l)
+                   (let ((comments (anchored-comment-locations l '(parse::inside))))
+                     (render-elements (mapcar #'node-at comments) *horizontal*
+                                      (lambda (index) (nth index comments))
+                                      stack context rect nil))
+                   (render-elements (elements l) spec (list-locator contents-location)
+                                    contents-stack context rect keys)))))
       (if (and delimited (not (parse:unary-reader-marker-p head)))
           (let* ((handle (make-location :node l :id :open))
                  (open (render-delimiter open-text handle
@@ -891,6 +949,19 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                             context rect)))))
     (make-instance 'ast-view :rect (tui:rect contents) :location location
                              :children (list contents) :focused focused
+                             :key-handler (when focused
+                                            (global-key-handler node location)))))
+
+(defmethod render-node ((node parse::comment) stack context rect &key)
+  (let* ((location (car stack))
+         (focused (location= location (focus context)))
+         (contents (render-literal-line
+                    (parse:str node) stack context rect
+                    :style (tui:make-style :fg (if (and focused (buffer-focused-p context))
+                                                   #x0 #x839496)))))
+    (make-instance 'ast-view :rect (tui:rect contents) :location location
+                             :children (list contents)
+                             :hoverable t :focused focused
                              :key-handler (when focused
                                             (global-key-handler node location)))))
 
@@ -2170,6 +2241,7 @@ as `viewport'."
                 debugger-text restart-depth enter-debugger-loop
                 measure-node
                 function-call-indentation
+                anchored-comment-locations render-trailing-comments
                 ref-list-indentation symbol-ref-prefix symbol-ref-text
                 render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements
@@ -2318,6 +2390,8 @@ as `viewport'."
                   :offset-x (- (tui:mouse-data-col mouse) (tui:rect-x rect))
                   :offset-y (- (tui:mouse-data-row mouse) (tui:rect-y rect)))))
          t)))))
+
+(defparameter *ui-key-handlers* (make-hash-table :test #'equal))
 
 (defun dispatch-ui-event (ui event)
   (when (and (not (tui:mouse-event-p event)) (tui:root-view ui))

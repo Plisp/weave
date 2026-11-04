@@ -60,7 +60,7 @@
         (*package* *package*))
     (loop
       (multiple-value-bind (ast end)
-          (parse:parse-from-string client :start start)
+          (parse:parse-from-string client :start start :previous (car forms))
         (unless ast
           (return (values (or (nreverse forms) (list (hole))) end *package*)))
         (push ast forms)

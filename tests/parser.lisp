@@ -2,6 +2,32 @@
 
 (define-test parser)
 
+(define-test single-semicolon-comment-anchors :parent parser
+  (flet ((read-syntax (text)
+           (eclector.parse-result:read-from-string (parse:make-client text) text))
+         (texts (comments) (mapcar #'parse:str comments)))
+    (let* ((form (read-syntax (format nil "(; first~%a~%; after a~%;; before b~%b ; after b~%)")))
+           (a (first (parse:elements form)))
+           (b (second (parse:elements form))))
+      (is equal '("; first") (texts (parse::leading a)))
+      (is equal '("; after a") (texts (parse::trailing a)))
+      (is equal '(";; before b") (texts (parse::leading b)))
+      (is equal '("; after b") (texts (parse::trailing b))))
+    (let ((empty (read-syntax (format nil "(; inside~%)"))))
+      (is equal '("; inside") (texts (parse::inside empty))))
+    (let* ((form (read-syntax (format nil "(a ;; first~%; second~%)")))
+           (a (first (parse:elements form))))
+      (is equal '(";; first" "; second") (texts (parse::trailing a))))
+    (let* ((source (format nil "; first~%a~%; after a~%;;; before b~%b~%; eof~%"))
+           (client (parse:make-client source)))
+      (multiple-value-bind (a next) (parse:parse-from-string client)
+        (multiple-value-bind (b end) (parse:parse-from-string client :start next :previous a)
+          (is equal '("; first") (texts (parse::leading a)))
+          (is equal '("; after a") (texts (parse::trailing a)))
+          (is equal '(";;; before b") (texts (parse::leading b)))
+          (is eq nil (parse:parse-from-string client :start end :previous b))
+          (is equal '("; eof") (texts (parse::trailing b))))))))
+
 #+sbcl
 (define-test native-macro-environment-control-scopes :parent parser
   (let* ((env (parse:make-env :%blocks '(inner nil outer inner)

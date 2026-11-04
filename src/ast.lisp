@@ -330,17 +330,31 @@ so a name test alone can't distinguish #:|.| from a dot."))
           (inside new) (inside old)))
   new)
 
+(defun comment-location-p (id)
+  (and (consp id) (eq (first id) :comment)))
+
+(defmethod update ((node anchor) id new-value)
+  (declare (ignore new-value))
+  (error "Invalid location ~s in ~s" id node))
+
 (defmethod update :around ((node anchor) id new-value)
-  (declare (ignore id new-value))
-  (let* ((results (multiple-value-list (call-next-method)))
-         (new (first results)))
-    (when (and (typep new 'anchor) (not (eq new node)))
-      (copy-anchors node new))
-    (values-list results)))
+  (if (comment-location-p id)
+      (destructuring-bind (marker slot index) id
+        (declare (ignore marker))
+        (let ((new (shallow-copy-record node)))
+          (setf (slot-value new slot)
+                (list-update (slot-value node slot) new-value index))
+          new))
+      (let* ((results (multiple-value-list (call-next-method)))
+             (new (first results)))
+        (when (and (typep new 'anchor) (not (eq new node)))
+          (copy-anchors node new))
+        (values-list results))))
 
 (defgeneric is-atom (node)
   (:method (node) nil))
 (defmethod is-atom ((node literal)) t)
+(defmethod is-atom ((node comment)) t)
 (defmethod is-atom ((node symbol-ref)) t)
 (defmethod is-atom ((node hole)) t)
 
@@ -407,6 +421,17 @@ A method may return the contents at `id' as a second value, NIL when absent.")
 
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'."))
+
+(defmethod get-location ((node anchor) id)
+  (error "Invalid location ~s in ~s" id node))
+
+(defmethod get-location :around ((node anchor) id)
+  (if (comment-location-p id)
+      (nth (third id) (slot-value node (second id)))
+      (call-next-method)))
+
+(defmethod location-sort :around ((node anchor) id)
+  (if (comment-location-p id) 'comment (call-next-method)))
 
 (defun node-at (loc)
   "The node at `loc', but parsed parts of a macro call are taken instead."
@@ -3524,6 +3549,15 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
   "For reader syntax, which must stay distinct from explicit references to that symbol."
   (make-instance 'reader-marker :name (string sym) :home-package (symbol-package sym)))
 
+(defun single-semicolon-comment-p (item)
+  (and (typep item 'comment)
+       (eq (kind item) :line)
+       (let ((text (str item)))
+         (and (plusp (length text))
+              (char= (char text 0) #\;)
+              (or (= (length text) 1)
+                  (char/= (char text 1) #\;))))))
+
 (defun push-leading (node item)
   "Anchors `item', a comment or reader conditional, as written before `node'."
   (check-type node anchor)
@@ -3627,12 +3661,18 @@ keyword or a list. Consumed by the conditional one level up, never part of the t
                  (loop with comments = nil
                        with noncomments = (list)
                        for c in children
-                       do (if (not (typep c '(or comment read-cond)))
-                              (progn
-                                (anchor-leading c (nreverse comments))
-                                (push c noncomments)
-                                (setf comments nil)) ; reset after reading form
-                              (push c comments))
+                       do (cond ((not (typep c '(or comment read-cond)))
+                                 (setf comments (nreverse comments))
+                                 (when noncomments
+                                   (anchor-trailing
+                                    (car noncomments)
+                                    (remove-if-not #'single-semicolon-comment-p comments))
+                                   (setf comments (remove-if #'single-semicolon-comment-p
+                                                             comments)))
+                                 (anchor-leading c comments)
+                                 (push c noncomments)
+                                 (setf comments nil)) ; reset after reading form
+                                (t (push c comments)))
                        finally (return
                                  (if noncomments
                                      (progn (anchor-trailing (car noncomments)
@@ -3790,11 +3830,16 @@ passed with dynamic extent."
   "Parses `syntax' as toplevel code, keeping anchors."
   (parse syntax (make-env :%function-bindings '(read-eval)) #'copy-anchors))
 
-(defun parse-from-string (client &key (start 0))
-  "Parses one top-level form and returns it with the index at which reading stopped."
+(defun parse-from-string (client &key (start 0) previous)
+  "Parses one top-level form and returns it with the index at which reading stopped.
+Anchor single-semicolon comments to `previous' when supplied."
   (setf (source-offset client) start)
   (multiple-value-bind (form end leading-comments)
       (eclector.parse-result:read-from-string client (source client) nil nil :start start)
+    (when previous
+      (anchor-trailing previous (remove-if-not #'single-semicolon-comment-p
+                                               leading-comments))
+      (setf leading-comments (remove-if #'single-semicolon-comment-p leading-comments)))
     (if (null form)
         (values nil end leading-comments)
         (let ((result (parse-syntax form)))
