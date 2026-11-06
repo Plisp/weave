@@ -1643,3 +1643,286 @@
          (updated (parse:update node '(parse:fun-designator 1) (sym "CDR"))))
     (is equal "(FUNCTION (SETF CDR))" (sx updated))
     (is equal "CDR" (parse:name (parse:get-location updated '(parse:fun-designator 1))))))
+
+(define-test serialization-roundtrip :parent parser
+  (dolist (source '("(defun foo (x) \"doc\" (declare (ignore x)) 42)"
+                    "(defmethod foo :around ((x t)) (call-next-method))"
+                    "(let ((x 1)) (list x 2))" "'(a . b)" "`(a ,b ,@c)"
+                    "#'(lambda (x) x)" "#(1 2)" "#2A((1 2) (3 4))"
+                    "#0A1" "#xAF" "3/4" "#*101" "#\\Space"))
+    (let ((output (with-output-to-string (stream)
+                    (weave-serialization:serialize (list (parse source)) stream :package *package*))))
+      (is equalp (read-from-string source) (read-from-string output))))
+  (is equal (format nil "(defun foo (x)~%  (declare (ignore x))~%  42)~%")
+      (with-output-to-string (stream)
+        (weave-serialization:serialize (list (parse "(defun foo (x) (declare (ignore x)) 42)"))
+                         stream :package *package*))))
+
+(define-test serialization-comments-and-holes :parent parser
+  (dolist (source (list (format nil ";; before~%(list 1 ; after~% 2)")
+                       (format nil "(;; inside~%)") "(#| inside |#)"))
+    (let ((output (with-output-to-string (stream)
+                    (weave-serialization:serialize (list (parse source)) stream :package *package*))))
+      (is equal (read-from-string source) (read-from-string output))))
+  (let* ((ratio (make-instance 'parse:ratio-literal :str "1/"
+                               :numerator-node (parse "1")
+                               :denominator-node (make-instance 'parse:integer-hole)))
+         (output (with-output-to-string (stream)
+                   (weave-serialization:serialize (list ratio) stream)))
+         (symbol (read-from-string output)))
+    (is equal "HOLE" (symbol-name symbol))
+    (is eq nil (symbol-package symbol))))
+
+(define-test serialization-nested-layout-rules :parent parser
+  (flet ((render (source)
+           (with-output-to-string (stream)
+             (weave-serialization:serialize (list (parse source)) stream
+                              :package *package* :column-limit 30))))
+    (is equal (format nil "(outer (inner argument-one~%              argument-two)~%       following-argument)~%")
+        (render "(outer (inner argument-one argument-two) following-argument)"))
+    (is equal (format nil "(flet ((f (x)~%         (print x)~%         x)~%       (g ()~%         1))~%  (f (g)))~%")
+        (render "(flet ((f (x) (print x) x) (g () 1)) (f (g)))"))
+    (dolist (source '("(destructuring-bind (a b) values (list a b))"
+                      "(handler-case (foo) (error (e) (print e)))"
+                      "(case x ((a b) (foo) (bar)) (t (baz)))"
+                      "(defmethod foo :around :custom ((x t)) x)"
+                      "'(let ((x 1)) (foo x))"))
+      (is equalp (read-from-string source) (read-from-string (render source))))))
+
+(define-test serialization-loop-layout :parent parser
+  (is equal (format nil "(loop for x in xs~%      do (print x)~%         (print x)~%      finally (return xs))~%")
+      (with-output-to-string (stream)
+        (weave-serialization:serialize
+         (list (parse "(loop for x in xs do (print x) (print x) finally (return xs))"))
+         stream :package *package*))))
+
+(define-test serialization-file-api :parent parser
+  (let ((path (merge-pathnames (format nil "weave-serialize-~a.lisp" (gensym))
+                               (uiop:temporary-directory))))
+    (unwind-protect
+         (progn
+           (weave-serialization:serialize-file (list (parse "(list 1 2)")) path :package *package*)
+           (is equal (format nil "(list 1 2)~%") (uiop:read-file-string path))
+           (fail (weave-serialization:serialize-file nil path) file-error))
+      (when (probe-file path) (delete-file path)))))
+
+(define-test serialization-review-corrections :parent parser
+  (flet ((render (source &optional (width 92))
+           (with-output-to-string (stream)
+             (weave-serialization:serialize (list (parse source)) stream
+                              :package *package* :column-limit width))))
+    (is equal (format nil "nil~%") (render "nil"))
+    (is equal (format nil "(a-very-long-function-name~%  argument)~%")
+        (render "(a-very-long-function-name argument)" 30))
+    (is equal (format nil "`(when ,test~%   (print ,value))~%")
+        (render "`(when ,test (print ,value))"))
+    (dolist (source '("(alexandria:if-let (x (foo)) (bar x) (baz))"
+                      "(alexandria:when-let (x (foo)) (bar x))"
+                      "(with-accessors ((x slot)) object (print x))"
+                      "(weave-utils:defrecord foo () ((x :init nil)))"))
+      (is equalp (read-from-string source) (read-from-string (render source))))))
+
+(define-test serialization-inferred-macro-layout :parent parser
+  (is equal (format nil "(once-only (x)~%  (print x)~%  x)~%")
+      (with-output-to-string (stream)
+        (weave-serialization:serialize (list (parse "(alexandria:once-only (x) (print x) x)"))
+                         stream :package *package*)))
+  (is = 1 (weave-indentation:lambda-list-section-start
+           '(&whole form x &environment env &body body) '(&body &rest))))
+
+(defun serialization-keyword-example (&key alpha beta)
+  (list alpha beta))
+
+(define-test serialization-keyword-pairs :parent parser
+  (let* ((source "(serialization-keyword-example :alpha 123 :beta 456)")
+         (output (with-output-to-string (stream)
+                   (weave-serialization:serialize (list (parse source)) stream
+                                    :package *package* :column-limit 36))))
+    (is eq t (not (null (search ":alpha 123" output))))
+    (is eq t (not (null (search ":beta 456" output))))
+    (is equal (read-from-string source) (read-from-string output))))
+
+(define-test serialization-header-and-field-layout :parent parser
+  (flet ((render (source)
+           (with-output-to-string (stream)
+             (weave-serialization:serialize (list (parse source)) stream
+                                             :package *package*))))
+    (is equal (format nil "(multiple-value-bind (a b)~%    (foo)~%  (list a b))~%")
+        (render "(multiple-value-bind (a b) (foo) (list a b))"))
+    (is equal (format nil "(weave-utils:defrecord foo ()~%  ((a :init nil)~%   (b :init t)))~%")
+        (render "(weave-utils:defrecord foo () ((a :init nil) (b :init t)))"))))
+
+(define-test serialization-comment-separators :parent parser
+  (flet ((render (source)
+           (with-output-to-string (stream)
+             (weave-serialization:serialize (list (parse source)) stream
+                                             :package *package*))))
+    (is equal (format nil "(eq a ; note~%    b)~%")
+        (render (format nil "(eq a ; note~% b)")))
+    (is equal (format nil "(when test~%  (foo) ; note~%  ;; next~%  (bar))~%")
+        (render (format nil "(when test (foo) ; note~% ;; next~% (bar))")))
+    (is equal (format nil "(case x~%  (2~%   (if test~%       `(a) ; note~%       `(b))))~%")
+        (render (format nil "(case x (2 (if test `(a) ; note~% `(b))))")))))
+
+(weave-utils:defrecord serialization-options ()
+  ((alpha :init nil) (beta :init nil)))
+
+(define-test serialization-record-keywords :parent parser
+  (let ((output (with-output-to-string (stream)
+                  (weave-serialization:serialize
+                   (list (parse "(make-serialization-options :alpha 123 :beta 456)"))
+                   stream :package *package* :column-limit 36))))
+    (is eq t (not (null (search ":alpha 123" output))))
+    (is eq t (not (null (search ":beta 456" output))))))
+
+(define-test serialization-binding-lines-and-long-calls :parent parser
+  (flet ((render (source)
+           (with-output-to-string (stream)
+             (weave-serialization:serialize (list (parse source)) stream
+                                             :package *package* :column-limit 40))))
+    (is equal (format nil "(let ((a 1)~%      (b 2))~%  (+ a b))~%")
+        (render "(let ((a 1) (b 2)) (+ a b))"))
+    (is equal (format nil "(make-instance 'example~% :alpha (some-function argument)~% :beta 42)~%")
+        (render "(make-instance 'example :alpha (some-function argument) :beta 42)"))))
+
+(define-test serialization-loop-keyword-operands :parent parser
+  (is equal '((0 . 1) (1 . 4) (1 . 6) (1 . 2))
+      (weave-indentation:loop-indentation
+       (parse:elements
+        (parse:to-syntax (parse "(loop with count = 3 for i from 0 below count do (print i))"))))))
+
+(define-test serialization-long-call-indent-option :parent parser
+  (let ((weave-serialization:*long-call-indent* 3))
+    (is equal (format nil "(make-instance 'example~%   :alpha (some-function argument)~%   :beta 42)~%")
+        (with-output-to-string (stream)
+          (weave-serialization:serialize
+           (list (parse "(make-instance 'example :alpha (some-function argument) :beta 42)"))
+           stream :package *package* :column-limit 40)))))
+
+(define-test serialization-match-clause :parent parser
+  (is equal (format nil "(trivia:match (and x y)~%  ((list a b) (list b a)))~%")
+      (with-output-to-string (stream)
+        (weave-serialization:serialize
+         (list (parse "(trivia:match (and x y) ((list a b) (list b a)))"))
+         stream :package *package*))))
+
+(define-test serialization-cond-body-layout :parent parser
+  (is equal (format nil "(cond~%  (a (foo))~%  (b~%   (foo)~%   (bar))~%  ((long-condition x) (baz)))~%")
+      (with-output-to-string (stream)
+        (weave-serialization:serialize
+         (list (parse "(cond (a (foo)) (b (foo) (bar)) ((long-condition x) (baz)))"))
+         stream :package *package*))))
+
+(define-test serialization-all-keyword-indent :parent parser
+  (let ((output (with-output-to-string (stream)
+                  (weave-serialization:serialize
+                   (list (parse "(serialization-keyword-example :alpha (foo) :beta (bar))"))
+                   stream :package *package* :column-limit 36))))
+    (is eq t (not (null (search (format nil "~% :alpha") output))))
+    (is eq t (not (null (search (format nil "~% :beta") output))))
+    (is eq nil (search (format nil "~%  :") output))))
+
+(define-test serialization-apply-keywords :parent parser
+  (let* ((source "(apply (if flag #'foo #'bar) :alpha (first values) :beta (second values) tail)")
+         (output (with-output-to-string (stream)
+                   (weave-serialization:serialize (list (parse source)) stream
+                                                   :package *package* :column-limit 40))))
+    (is eq t (not (null (search ":alpha (first values)" output))))
+    (is eq t (not (null (search ":beta (second values)" output))))
+    (is equal (read-from-string source) (read-from-string output))))
+
+(define-test serialization-reader-conditionals :parent parser
+  (dolist (source '("(list #+:sbcl (foo) #-:sbcl (bar) (baz))"
+                    "(list #+sbcl (foo) #-sbcl (bar) (baz))"
+                    "(list #+(and sbcl (not missing-feature)) (foo) (baz))"
+                    "(list #+sbcl #+sbcl (foo) (baz))"))
+    (let ((output (with-output-to-string (stream)
+                    (weave-serialization:serialize
+                     (list (parse source)) stream :package *package*))))
+      (with-input-from-string (stream output)
+        (is equal (read-from-string source) (read stream))
+        (is eq :eof (read stream nil :eof)))
+      (when (search "(bar)" source)
+        (is eq t (not (null (search "(bar)" output))))))))
+
+(define-test serialization-clause-body-indent :parent parser
+  (dolist (source '("(trivia:match x (_ (foo) (bar)))"
+                    "(case x (otherwise (foo) (bar)))"))
+    (let ((output (with-output-to-string (stream)
+                    (weave-serialization:serialize
+                     (list (parse source)) stream :package *package*))))
+      (is eq t (not (null (search (format nil "~%   (foo)~%   (bar)") output)))))))
+
+(define-test serialization-own-line-comments :parent parser
+  (dolist (source (list (format nil "(let ((x 1)) ;; note~% x)")
+                       (format nil "(let ((x 1) ;; note~%)) x)")
+                       (format nil "(weave-utils:defrecord example ()~% ;; note~% ((x)~% ;; next~% (y)))")))
+    (let ((output (with-output-to-string (stream)
+                    (weave-serialization:serialize
+                     (list (parse source)) stream :package *package*))))
+      (let* ((comment (search ";; note" output))
+             (line-start (1+ (or (position #\Newline output :end comment :from-end t) -1))))
+        (is eq t (every (lambda (c) (char= c #\Space))
+                       (subseq output line-start comment))))
+      (is eq nil (search (format nil "~%~%") output))
+      (is equal (read-from-string source) (read-from-string output)))))
+
+(define-test serialization-binding-value-indent :parent parser
+  (dolist (entry '(("(multiple-value-setq (a b) (values 1 2))"
+                    "(multiple-value-setq (a b)~%    (values 1 2))~%")
+                   ("(progv names values (foo))"
+                    "(progv names~%    values~%  (foo))~%")))
+    (is equal (format nil (second entry))
+        (with-output-to-string (stream)
+          (weave-serialization:serialize
+           (list (parse (first entry))) stream :package *package*)))))
+
+(define-test serialization-explicit-linear-alignment :parent parser
+  (let ((weave-indentation:*indent-rules*
+          (acons 'defpackage '(:header 1 :rest (:break :linear))
+                 weave-indentation:*indent-rules*)))
+    (is equal
+        (format nil "(defpackage #:example~%  (:local-nicknames (:nick :package)~%                    (:other :another-package)))~%")
+        (with-output-to-string (stream)
+          (weave-serialization:serialize
+           (list (parse "(defpackage #:example (:local-nicknames (:nick :package) (:other :another-package)))"))
+           stream :package *package* :column-limit 50)))))
+
+(define-test checked-file-saving :parent parser
+  (let* ((path (merge-pathnames (format nil "weave-save-~a.lisp" (gensym))
+                               (uiop:temporary-directory)))
+         (readtable *readtable*)
+         (original "(list 1)")
+         (forms (weave-tui::parse-source "(list 2)")))
+    (unwind-protect
+         (progn
+           (with-open-file (stream path :direction :output :if-exists :error)
+             (write-string original stream))
+           (fail (weave-serialization:save-file-checked
+                  forms path (lambda (text)
+                               (declare (ignore text))
+                               (weave-tui::parse-source "(list 3)"))))
+           (is equal original (uiop:read-file-string path))
+           (is eq readtable *readtable*)
+           (weave-serialization:save-file-checked forms path #'weave-tui::parse-source)
+           (is equal '(list 2) (read-from-string (uiop:read-file-string path)))
+           (is eq readtable *readtable*)
+           (fail (weave-serialization:save-file-checked
+                  forms path #'weave-tui::parse-source :original original)))
+      (when (probe-file path) (delete-file path)))))
+
+(define-test serialization-skipped-input-equivalence :parent parser
+  (let ((*features* (cons :weave-save-test *features*)))
+    (flet ((key (source)
+             (weave-serialization::syntax-key (weave-tui::parse-source source))))
+      (let* ((source (format nil ";; before~%#+weave-save-test (list 1)~%#-weave-save-test (hidden 2)~%(list #| inside |#)"))
+             (forms (weave-tui::parse-source source))
+             (output (with-output-to-string (stream)
+                       (weave-serialization:serialize forms stream :package *package*))))
+        (is equal (key source) (key output)))
+      (is eq nil (equal (key (format nil ";; before~%(list 1)"))
+                        (key "(list 1)")))
+      (is eq nil (equal (key "#-weave-save-test (hidden 1) (list 2)")
+                        (key "#-weave-save-test (hidden 3) (list 2)")))
+      (is eq nil (equal (key "#+weave-save-test (list 1)")
+                        (key "(list 1)"))))))

@@ -1,13 +1,18 @@
 # WIP lisp structural editor
 
-`ast.lisp` is an almost complete parser for common lisp.
-`tui.lisp` is a terminal UI using [uncursed](https://github.com/plisp/uncursed).
+* `ast.lisp` is an almost complete parser for common lisp.
+* `indentation.lisp` contains formatting rules for both frontend and serializer
+* `tui.lisp` is a terminal UI using [uncursed](https://github.com/plisp/uncursed)
+* `commands.lisp` implements basic editing commands
+* `selection.lisp` implements selection
+* `entry-point.lisp` invokes the tui, check build.sh
 
-Currently mainly testing on sbcl due to non-standard macroexpansions.
-The point of structural editing is proven ergonomics (e.g. paredit, vim) adapted to a fully tree-structured context and to have incremental accurate type analysis and tracking of image state.
+Currently only testing on sbcl due to non-standard macroexpansions.
+The point of structural editing is proven ergonomics (e.g. paredit, vim) adapted to a fully tree-structured context and to have incremental semantic analysis and tracking of image state.
 
 * An interesting technique is used to lexically analyse macro calls, I'm working on a writeup for ELS next year.
 * Currently implemented is a generalization of zipper selection as described in [pantograph](https://arxiv.org/pdf/2411.16571).
+* Recursive stack debugging is supported without threads, similar to emacs (value restart support and commuting resumed commands is WIP)
 
 Ask me on the lisp discord if you have any questions :D
 
@@ -39,3 +44,4 @@ In emacs, sly-connect to 4005 and
 
 * `Ctrl-w` close buffer
 * `Alt-e` evaluation
+* `Ctrl-Alt-s` save file

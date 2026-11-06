@@ -17,8 +17,10 @@
   :pathname "src"
   :components ((:file "util")
                (:file "ast" :depends-on ("util"))
-               (:file "tui" :depends-on ("util" "ast"))
-               (:file "commands" :depends-on ("util" "ast" "tui"))
+               (:file "indentation" :depends-on ("ast"))
+               (:file "serialization" :depends-on ("indentation"))
+               (:file "tui" :depends-on ("util" "ast" "indentation"))
+               (:file "commands" :depends-on ("util" "ast" "tui" "serialization"))
                (:file "selection" :depends-on ("tui" "commands"))
                (:file "entry-point" :depends-on ("selection"))
                )

@@ -1,59 +1,62 @@
 (in-package #:weave-tui)
 
 (defun ancestor-asd-files (file)
-  (loop for directory = (uiop:pathname-directory-pathname (truename file)) then parent
-        for parent = (uiop:pathname-parent-directory-pathname directory)
+  (loop for directory = (uiop/pathname:pathname-directory-pathname
+                          (truename file)) then parent
+        for parent = (uiop/pathname:pathname-parent-directory-pathname directory)
         append (directory (make-pathname :name :wild :type "asd" :defaults directory))
-        until (uiop:pathname-equal directory parent)))
+        until (uiop/pathname:pathname-equal directory parent)))
 
 (defun source-components (system)
   (let ((result nil))
     (labels ((walk (component)
-               (when (typep component 'asdf:cl-source-file)
+               (when (typep component 'asdf/lisp-action:cl-source-file)
                  (push component result))
-               (when (typep component 'asdf:parent-component)
-                 (map nil #'walk (asdf:component-children component)))))
+               (when (typep component 'asdf/component:parent-component)
+                 (map nil #'walk (asdf/component:component-children component)))))
       (walk system))
     result))
 
 (defun system-source-components (asd)
   (let ((result nil))
-    (asdf:map-systems
-     (lambda (system)
-       (when (and (asdf:system-source-file system)
-                  (uiop:pathname-equal asd (asdf:system-source-file system)))
-         (dolist (component (source-components system))
-           (push (cons system component) result)))))
+    (asdf/system-registry:map-systems
+      (lambda (system)
+        (when (and (asdf/system:system-source-file system)
+                   (uiop/pathname:pathname-equal asd
+                    (asdf/system:system-source-file system)))
+          (dolist (component (source-components system))
+            (push (cons system component) result)))))
     result))
 
 (defun system-for-file (file)
   "Returns the ASDF system and source component corresponding to `file'."
   (let ((target (truename file)))
     (dolist (asd (ancestor-asd-files target))
-      (unless (asdf:component-loaded-p (pathname-name asd))
-        (asdf:load-asd asd))
-      (let ((matches
-              (remove-if-not
-               (lambda (entry)
-                 (when-let (component-file
-                             (probe-file (asdf:component-pathname (cdr entry))))
-                   (uiop:pathname-equal target component-file)))
-               (system-source-components asd))))
+      (unless (asdf/operate:component-loaded-p (pathname-name asd))
+        (asdf/find-system:load-asd asd))
+      (let ((matches (remove-if-not
+                       (lambda (entry)
+                         (when-let (component-file
+                                    (probe-file
+                                      (asdf/component:component-pathname (cdr entry))))
+                           (uiop/pathname:pathname-equal target component-file)))
+                      (system-source-components asd))))
         (when matches
           (unless (= 1 (length matches))
-            (error "~a belongs to multiple ASDF systems: ~{~a~^, ~}"
-                   target
-                   (mapcar (lambda (entry) (asdf:component-name (car entry))) matches)))
+            (error "~a belongs to multiple ASDF systems: ~{~a~^, ~}" target
+                   (mapcar (lambda (entry)
+                             (asdf/component:component-name (car entry)))
+                           matches)))
           (return-from system-for-file
-            (values (car (first matches)) (cdr (first matches)))))))
+           (values (car (first matches)) (cdr (first matches)))))))
     (error "No ASDF source component owns ~a" target)))
 
 (defun in-package-form-p (ast)
-  (and (typep ast 'parse:macro-call)
-       (eq 'cl:in-package (parse:resolve (parse:op ast)))))
+  (and (typep ast 'parse:macro-call) (eq 'in-package (parse:resolve (parse:op ast)))))
 
-(defun parse-source (source)
-  "Parses all top-level forms in `source', applying package changes between reads."
+(defun parse-source (source &key define-packages)
+  "Parses all top-level forms in `source', applying package changes between reads.
+If `define-packages' is true, also evaluates top-level defpackage forms."
   (let ((client (parse:make-client source))
         (start 0)
         (forms nil)
@@ -64,7 +67,10 @@
         (unless ast
           (return (values (or (nreverse forms) (list (hole))) end *package*)))
         (push ast forms)
-        (when (in-package-form-p ast)
+        (when (or (in-package-form-p ast)
+                  (and define-packages
+                       (typep ast 'parse:macro-call)
+                       (eq (parse:resolve (parse:op ast)) 'defpackage)))
           (eval (read-from-string source t nil :start start)))
         (setf start end)))))
 
@@ -72,9 +78,9 @@
   "Loads `file's owning asdf system before parsing"
   (multiple-value-bind (system component)
       (system-for-file file)
-    (unless (asdf:component-loaded-p system)
-      (asdf:load-system system))
-    (let ((source (alexandria:read-file-into-string file)))
+    (unless (asdf/operate:component-loaded-p system)
+      (asdf/operate:load-system system))
+    (let ((source (read-file-into-string file)))
       (multiple-value-bind (forms end package)
           (parse-source source)
         (values forms system component end (length source) package)))))
@@ -94,24 +100,25 @@
       ;; set default background to black and foreground to pure white (xterm extension)
       (format *terminal-io* "~c]10;#ffffff~c" #\esc (code-char 7))
       (format *terminal-io* "~c]11;#000000~c" #\esc (code-char 7))
-      (unwind-protect
-           (tui:run tui :redisplay-on-input t ; :mouse :hover
-                    )
+      (unwind-protect (tui:run tui
+                               :redisplay-on-input t ; :mouse :hover
+                               )
         (slog *log-stop*)))))
 
-(defun main (&optional (file (first (uiop:command-line-arguments))))
+(defun main (&optional (file (first (uiop/image:command-line-arguments))))
   (multiple-value-bind (ast system component end length package)
-      (if file (parse-file-loading-system file)
+      (if file
+          (parse-file-loading-system file)
           (values (demo-ast) nil nil nil nil *package*))
     (declare (ignore system component end length))
     (if (interactive-stream-p *standard-output*)
         (tui-main ast file package)
         (progn
-          (bt:make-thread (lambda () (tui-main ast file package))
-                          :initial-bindings `((*package* . ,*package*)))
+          (bt:make-thread
+            (lambda ()
+              (tui-main ast file package))
+           :initial-bindings `((*package* . ,*package*)))
           (loop :for (form . value) = (sb-concurrency:receive-message *log*)
                 :until (eq value *log-stop*)
-                :do (if form
-                        (format t "~a~%|> ~s~%" form value)
-                        (format t "~a~%" value))
-                    (force-output))))))
+                :do (if form (format t "~a~%|> ~s~%" form value) (format t "~a~%" value))
+                   (force-output))))))

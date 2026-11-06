@@ -7,7 +7,7 @@
 (define-test layouts-render :parent editing
   (is equal "let (a 1 /      b 2) /  f a" (draw (ui-for "(let ((a 1) (b 2)) (f a))")))
   (is equal "let () /  a" (draw (ui-for "(let () a)")))
-  (is equal "flet (f (x) /         x) /  f 1" (draw (ui-for "(flet ((f (x) x)) (f 1))")))
+  (is equal "flet (f /       (x) /       x) /  f 1" (draw (ui-for "(flet ((f (x) x)) (f 1))")))
   (is equal "symbol-macrolet (s car y) /  s" (draw (ui-for "(symbol-macrolet ((s (car y))) s)")))
   (is equal "'(a (b c) d)" (draw (ui-for "'(a (b c) d)")))
   (is equal "list () x" (draw (ui-for "(list () x)")))
@@ -1247,7 +1247,7 @@ second\"" (parse:str (parse::docstring code)))
         (is equal '((0 . 2) (0 . 1)) (spec "a" "b" "c")))
       (is equal '((0 . 1)) (spec "a" "\"first
 second\"" "c"))
-      (is equal '((0 . nil)) (spec "a" "\"first
+      (is equal '((0 . 1)) (spec "a" "\"first
 second\"")))))
 
 (define-test reader-marker-spacing-only-at-head :parent editing
@@ -1679,3 +1679,22 @@ second\"")))))
       (w::descend buffer '(:comment parse::trailing 1))
       (press buffer #\x)
       (is eq :block (parse::kind (focused buffer))))))
+
+(define-test record-field-keyword-layout :parent editing
+  (let* ((buffer (ui-for "(weave-utils:defrecord example ()
+                          ((value :init (progn 1 2) :mutable t :type t)))"))
+         (rendered (lines buffer :rows 30 :cols 80)))
+    (is eq t (some (lambda (line) (not (null (search ":init progn" line)))) rendered))
+    (is eq t (some (lambda (line) (not (null (search ":mutable t" line)))) rendered))
+    (is eq t (some (lambda (line) (not (null (search ":type t" line)))) rendered))))
+
+(define-test frontend-single-body-clause-fit :parent editing
+  (let ((buffer (ui-for "(trivia:match x ((list a b) (+ a b)) (_ (foo) (bar)))")))
+    (is equal '("trivia:match x" " ((list a b) a + b)" " (_" "  foo" "  bar )")
+        (lines buffer :rows 20 :cols 60))
+    (is eq t (> (length (lines buffer :rows 30 :cols 16)) 5))))
+
+(define-test frontend-record-fields-vertical :parent editing
+  (let ((buffer (ui-for "(weave-utils:defrecord sample ()
+                          ((a :init nil) (b :init nil) (c :init nil)))")))
+    (is = 4 (length (lines buffer :rows 20 :cols 100)))))

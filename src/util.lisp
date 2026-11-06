@@ -1,20 +1,13 @@
 ;;;;
 ;;;; misc utilities, :used everywhere
 ;;;;
-
-(uiop:define-package #:weave-utils
+(uiop/package:define-package #:weave-utils
   (:use :cl #:alexandria-2)
-  (:export #:disp #:addr-str
-           #:list-insert #:list-update #:list-remove
-           #:tree-ref #:tree-update
-           #:with-lookup #:or-f #:+fail+
-           #:string-drop #:split-string
-           #:flex-vector
-           #:external-symbol-p
-           #:defrecord #:shallow-copy-record
-           #:with-timing
-           #:strcat
-           ))
+  (:export #:disp #:addr-str #:list-insert #:list-update #:list-remove #:tree-ref
+           #:tree-update #:with-lookup #:or-f #:+fail+ #:string-drop #:split-string
+           #:flex-vector #:external-symbol-p #:defrecord #:shallow-copy-record
+           #:with-timing #:strcat))
+
 (in-package #:weave-utils)
 
 (defmacro disp (form &optional (stream t))
@@ -24,13 +17,12 @@
        ,res)))
 
 (defun addr-str (obj &optional (len 3))
-  (let* ((str (delete-if (lambda (c) (member c '(#\# #\< #\> #\Space #\{ #\})))
+  (let* ((str (delete-if (lambda (c)
+                           (member c '(#\# #\< #\> #\Space #\{ #\})))
                          (with-output-to-string (s)
                            (print-unreadable-object (obj s :identity t)))))
          (length (length str)))
-    (if (>= length len)
-        (subseq str (- length len))
-        str)))
+    (if (>= length len) (subseq str (- length len)) str)))
 
 (defun list-insert (list item i)
   "Functional insertion, may share structure"
@@ -46,7 +38,7 @@
 
 (defun array-copy (array)
   (let ((copy (make-array (array-dimensions array)
-                          :element-type (array-element-type array))))
+               :element-type (array-element-type array))))
     (dotimes (i (array-total-size array) copy)
       (setf (row-major-aref copy i) (row-major-aref array i)))))
 
@@ -57,25 +49,26 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
       tree
       (etypecase tree
         (cons (tree-ref (nth (car path) tree) (cdr path)))
-        (array (let ((rank (array-rank tree)))
-                 (tree-ref (apply #'aref tree (subseq path 0 rank)) (nthcdr rank path)))))))
+        (array
+         (let ((rank (array-rank tree)))
+           (tree-ref (apply #'aref tree (subseq path 0 rank)) (nthcdr rank path)))))))
 
 (defun tree-update (tree path new-value)
   "Functional replace, may share structure."
   (if (null path)
       new-value
       (etypecase tree
-        (cons (list-update tree (tree-update (nth (car path) tree) (cdr path) new-value)
-                           (car path)))
-        (array (let* ((rank (array-rank tree))
-                      (indices (subseq path 0 rank))
-                      (copy (array-copy tree)))
-                 (apply #'(setf aref)
-                        (tree-update (apply #'aref tree indices)
-                                     (nthcdr rank path)
-                                     new-value)
-                        copy indices)
-                 copy)))))
+        (cons
+         (list-update tree
+          (tree-update (nth (car path) tree) (cdr path) new-value) (car path)))
+        (array
+         (let* ((rank (array-rank tree))
+                (indices (subseq path 0 rank))
+                (copy (array-copy tree)))
+           (apply #'(setf aref)
+                  (tree-update (apply #'aref tree indices) (nthcdr rank path) new-value)
+                  copy indices)
+           copy)))))
 
 (defmacro with-lookup ((name (&rest mvcall) &optional otherwise) &body then)
   (with-gensyms (blockname present-p)
@@ -83,7 +76,9 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
        (multiple-value-bind (,name ,present-p)
            ,mvcall
          (when ,present-p
-           (return-from ,blockname (progn ,@then))))
+           (return-from ,blockname
+            (progn
+              ,@then))))
        ;; don't leak name to the else branch
        ,otherwise)))
 
@@ -119,15 +114,12 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
         ((list :representation (or :class :struct))
          (when seen-representation
            (error "Duplicate :REPRESENTATION"))
-         (setf seen-representation t
-               representation (second option)))
+         (setf seen-representation t representation (second option)))
         ((list :documentation (type string))
          (when seen-documentation
            (error "Duplicate :DOCUMENTATION"))
-         (setf seen-documentation t
-               documentation (second option)))
-        (t
-         (error "Invalid option spec: ~S" option))))
+         (setf seen-documentation t documentation (second option)))
+        (t (error "Invalid option spec: ~S" option))))
     (labels ((parse-slot (spec)
                (let* ((slot-name (car spec))
                       (mutable nil)
@@ -138,7 +130,7 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
                       (seen-type nil))
                  (unless (symbolp slot-name)
                    (error "Invalid slot name in ~S." spec))
-                 (alexandria:doplist (option value (cdr spec))
+                 (doplist (option value (cdr spec))
                    (case option
                      (:init
                       (when initformp
@@ -154,8 +146,7 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
                       (when seen-type
                         (error "Duplicate :TYPE in slot ~S." slot-name))
                       (setf seen-type t slot-type value))
-                     (otherwise
-                      (error "Bad slot spec ~S" spec))))
+                     (otherwise (error "Bad slot spec ~S" spec))))
                  (unless initformp
                    (setf initform `(error "~A not provided" ,(symbol-name slot-name))))
                  (list slot-name initform slot-type mutable))))
@@ -164,23 +155,20 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
           (:class
            `(progn
               (defclass ,name ,superclasses
-                ,(loop
-                   for (slot-name initform slot-type mutable)
-                     in parsed-slots
-                   collect
-                   `(,slot-name
-                     :initarg ,(alexandria:make-keyword slot-name)
-                     :initform ,initform
-                     :type ,slot-type
-                     ,@(if mutable
-                           `(:accessor ,slot-name)
-                           `(:reader ,slot-name))))
-                ,@(when seen-documentation `((:documentation ,documentation))))
+                ,(loop for (slot-name initform slot-type mutable) in parsed-slots
+                       collect `(,slot-name :initarg ,(make-keyword slot-name) :initform
+                                  ,initform :type ,slot-type
+                                  ,@(if mutable
+                                        `(:accessor ,slot-name)
+                                        `(:reader ,slot-name))))
+                ,@(when seen-documentation
+                    `((:documentation ,documentation))))
               ;; constructor
               ,@`((defun ,(symbolicate "MAKE-" name) (&rest initargs)
                     (apply #'make-instance ',name initargs)))
+              (setf (get ',(symbolicate "MAKE-" name) 'record-constructor) ',name)
               ;; type predicate
-              (defun ,(alexandria:symbolicate name "-P") (x)
+              (defun ,(symbolicate name "-P") (x)
                 (typep x ',name))
               ',name))
           (:struct
@@ -188,20 +176,20 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
              (error "Structures support single inheritance only."))
            `(progn
               (defstruct (,name (:copier nil)
-                                ,@(when superclasses `((:include ,(first superclasses)))))
+                           ,@(when superclasses
+                               `((:include ,(first superclasses)))))
                 ,@(when seen-documentation
                     `(,documentation))
-                ,@(loop
-                    for (slot-name initform slot-type mutable) in parsed-slots
-                    collect `(,slot-name ,initform :type ,slot-type
-                                                   :read-only ,(not mutable))))
+                ,@(loop for (slot-name initform slot-type mutable) in parsed-slots
+                        collect `(,slot-name ,initform :type ,slot-type :read-only
+                                   ,(not mutable))))
               ',name)))))))
 
 (defun shallow-copy-record (record)
   "Copies the bound slots of the class-backed `record', sharing their values."
   (let ((copy (allocate-instance (class-of record))))
-    (dolist (slot (closer-mop:class-slots (class-of record)) copy)
-      (let ((name (closer-mop:slot-definition-name slot)))
+    (dolist (slot (sb-mop:class-slots (class-of record)) copy)
+      (let ((name (sb-mop:slot-definition-name slot)))
         (when (slot-boundp record name)
           (setf (slot-value copy name) (slot-value record name)))))))
 
@@ -214,7 +202,9 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
 (defun strcat (&rest designators)
   "Returns a fresh string formed by concatenating `designators'."
   (declare (optimize speed))
-  (let* ((total-length (reduce #'+ designators :key (lambda (d) (length (string d)))))
+  (let* ((total-length (reduce #'+ designators
+                               :key (lambda (d)
+                                      (length (string d)))))
          (out (make-string total-length)))
     (loop with i = 0
           for d in designators
