@@ -1331,30 +1331,6 @@ second\"")))))
         (is = 1 (length (w::buffers ui)))
         (is eq nil (eq scratch (w::focused-buffer ui)))))))
 
-(define-test close-debugger-aborts-original-event :parent editing
-  (let* ((buffer (ui-for "a"))
-         (ui (w::buffer-ui buffer))
-         (run-loop (fdefinition 'tui:run-loop))
-         (entered nil)
-         (continued nil))
-    (render-buffer buffer)
-    (unwind-protect
-         (progn
-           (setf (fdefinition 'tui:run-loop)
-                 (lambda (recursive-ui &key redisplay-on-input)
-                   (declare (ignore redisplay-on-input))
-                   (setf entered t)
-                   (is eq ui recursive-ui)
-                   (is = 2 (length (w::buffers ui)))
-                   (tui:dispatch-event ui (event '(:ctrl #\w)))
-                   (setf continued t)))
-           (tui:dispatch-event ui (event '(:ctrl #\e))))
-      (setf (fdefinition 'tui:run-loop) run-loop))
-    (is eq t entered)
-    (is eq nil continued)
-    (is equal (list buffer) (w::buffers ui))
-    (is eq buffer (w::focused-buffer ui))))
-
 (define-test literal-prefix-editing :parent editing
   (dolist (entry '(((#\- #\2) "-2" parse:integer-literal)
                    ((#\- #\a) "-A" parse:symbol-ref)
@@ -1690,7 +1666,7 @@ second\"")))))
 
 (define-test frontend-single-body-clause-fit :parent editing
   (let ((buffer (ui-for "(trivia:match x ((list a b) (+ a b)) (_ (foo) (bar)))")))
-    (is equal '("trivia:match x" " ((list a b) a + b)" " (_" "  foo" "  bar )")
+    (is equal '("trivia:match x" " ((list a b) a + b)" " (_" "  foo" "  bar)")
         (lines buffer :rows 20 :cols 60))
     (is eq t (> (length (lines buffer :rows 30 :cols 16)) 5))))
 
@@ -1698,3 +1674,24 @@ second\"")))))
   (let ((buffer (ui-for "(weave-utils:defrecord sample ()
                           ((a :init nil) (b :init nil) (c :init nil)))")))
     (is = 4 (length (lines buffer :rows 20 :cols 100)))))
+
+(define-test frontend-nested-layout-rules :parent editing
+  (is equal '("let (x progn" "        foo" "        bar" "     y 2)" " x")
+      (lines (ui-for "(let ((x (progn (foo) (bar))) (y 2)) x)") :rows 40 :cols 48))
+  (is equal '("defpackage #:example" " (:local-nicknames (:nick :package)"
+              "                   (:other :another-package))")
+      (lines (ui-for "(defpackage #:example (:local-nicknames (:nick :package) (:other :another-package)))")
+             :rows 40 :cols 48)))
+
+(define-test frontend-let-star-binding-layout :parent editing
+  (is equal '("let* (x progn" "         foo" "         bar" "      y 2)" " x")
+      (lines (ui-for "(let* ((x (progn (foo) (bar))) (y 2)) x)")
+             :rows 40 :cols 48)))
+
+(define-test frontend-macro-binding-rules :parent editing
+  (is equal '("dolist (x progn" "           foo" "           bar)" " baz x")
+      (lines (ui-for "(dolist (x (progn (foo) (bar))) (baz x))")
+             :rows 40 :cols 80))
+  (is equal '("multiple-value-bind (a b)" "   values 1 2" " foo a b")
+      (lines (ui-for "(multiple-value-bind (a b) (values 1 2) (foo a b))")
+             :rows 40 :cols 80)))

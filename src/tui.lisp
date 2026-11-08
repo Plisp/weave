@@ -451,6 +451,8 @@ construction, do not modify."))
                   rect))))))
 
 (defmethod render-node :around (node stack context rect &rest keys &key)
+  (unless (typep node '(or ref-list list))
+    (setf keys (remove-from-plist keys :layout-rule)))
   (let ((comments (anchored-comment-locations node))
         (trailing (anchored-comment-locations node '(parse::trailing)))
         (vals nil))
@@ -768,7 +770,13 @@ convention."
                                       (tui:pad 1))
                                     (tui:place (rect)
                                       (apply render element (cons loc stack) context rect
-                                             keys))
+                                             (if (eq render #'render-node)
+                                                 (list* :layout-rule
+                                                        (indent::child-rule
+                                                          (getf keys :layout-rule)
+                                                         (1- index))
+                                                        keys)
+                                                 (remove-from-plist keys :layout-rule))))
                                     (setf last-elt element)))))))))))
 
 (defun view-end (view)
@@ -825,31 +833,12 @@ Uses shared scratch cells and clears the touched scratch area on exit."
             for index from 0
             for measured = (apply #'measure-node (funcall transform element)
                                   (cons (funcall locate index) stack) measuring bounds
+                                  :layout-rule (indent::child-rule rule index)
                                   keys)
             always (and (= 1 (tui:rect-rows measured))
                         (<= (incf used (tui:rect-cols measured)) width))))))
 
-(defun clause-layout (location)
-  (let* ((parent (location-node location))
-         (child-id (location-id location))
-         (id (when (consp child-id)
-               (butlast child-id))))
-    (when (and (typep parent 'parse:macro-call)
-               (consp id)
-               (eq (first id) 'parse:body)
-               (= (length id) 2))
-      (let* ((rule (indent:indent-rule (cons (parse:op parent) (parse:body parent))))
-             (index (second id)))
-        (let ((child-rule (cond
-                            ((< index (length (getf rule :children)))
-                             (nth index (getf rule :children)))
-                            ((and (getf rule :header) (< index (getf rule :header))) nil)
-                            (t (getf rule :rest)))))
-          (when (listp child-rule)
-            child-rule))))))
-
 (defun ref-list-indentation (elements locate stack context rect keys)
-  "TODO document once settled"
   (let* ((max-width (max 1
                          (min (tui:rect-cols rect) (- *column-limit* (tui:rect-x rect)))))
          (measuring (make-buffer
@@ -863,7 +852,11 @@ Uses shared scratch cells and clears the touched scratch area on exit."
          (count 0)
          (previous nil))
     ;; e.g. cond, trivia:match
-    (when-let (rule (and elements (clause-layout (funcall locate 0))))
+    (when-let (rule
+               (and elements
+                    (getf keys :layout-rule)
+                    (listp (getf keys :layout-rule))
+                    (getf keys :layout-rule)))
       (when (eq (getf rule :break) :mandatory)
         (return-from ref-list-indentation '((0 . 1))))
       (when (getf rule :compact-body)
@@ -871,6 +864,18 @@ Uses shared scratch cells and clears the touched scratch area on exit."
          (if (compact-layout-p elements rule locate stack context rect keys)
              *horizontal*
              *vertical*))))
+    (let ((rule (getf keys :layout-rule)))
+      (when (and (listp rule) (getf rule :header))
+        (return-from ref-list-indentation `((0 . ,(1+ (getf rule :header))) (0 . 1))))
+      (when (and (listp rule) (eq (getf rule :break) :linear))
+        (let* ((head (apply #'measure-node (funcall transform (first elements))
+                            (cons (funcall locate 0) stack) measuring bounds keys))
+               (offset (1+ (tui:rect-cols head)))
+               (fits (compact-layout-p elements
+                      (list :compact-body t :header (- (length elements) 2)) locate stack
+                      context rect keys)))
+          (return-from ref-list-indentation
+           (if fits *horizontal* `((0 . 2) (,offset . 1)))))))
     ;;
     (when (and (>= (length elements) 3)
                (oddp (length elements))
@@ -912,7 +917,9 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                             (and (= index 1) (parse:unary-reader-marker-p previous)))
                         0
                         1)
-          do (when (> (tui:rect-rows measured) 1)
+          do (when (and (> (tui:rect-rows measured) 1)
+                        (not (let ((rule (getf keys :layout-rule)))
+                               (and (listp rule) (eq (getf rule :style) :list)))))
                (return-from ref-list-indentation '((0 . 1))))
              ;; line wrap
              (when (and (plusp count) (> (+ used gap size) max-width))
@@ -926,7 +933,8 @@ Uses shared scratch cells and clears the touched scratch area on exit."
     (or (nreverse rows) '((0 . nil)))))
 
 (defmethod render-node
-  ((l ref-list) stack context rect &key indent delimited (transform #'identity))
+  ((l ref-list) stack context rect
+   &key indent delimited layout-rule (transform #'identity))
   "A `delimited' list is drawn with `*list-delimiters*' around it, recursively unless
 `delimited' is :shallow. It's opening parens is selectable."
   (let* ((location (car stack))
@@ -944,11 +952,12 @@ Uses shared scratch cells and clears the touched scratch area on exit."
     (when (or (not (eq kind :list)) (parse::inside l))
       (setf delimited t))
     (flet ((contents (rect)
-             (let* ((keys `(,@(when (eq delimited t)
-                                '(:delimited t)) :transform
-                             ,transform
-                             ,@(when (functionp indent)
-                                 `(:indent ,indent))))
+             (let* ((keys `(:layout-rule ,layout-rule
+                            ,@(when (eq delimited t)
+                                '(:delimited t))
+                            :transform ,transform
+                            ,@(when (functionp indent)
+                                `(:indent ,indent))))
                     (spec (if indent
                               indent
                               (ref-list-indentation (elements l)
@@ -1017,12 +1026,12 @@ Uses shared scratch cells and clears the touched scratch area on exit."
             view)))))
 
 ;; for body lists
-(defmethod render-node ((l list) stack context rect &key (indent *horizontal*) delimited)
+(defmethod render-node
+  ((l list) stack context rect &key (indent *horizontal*) delimited layout-rule)
   (let* ((location (car stack))
          (view (render-elements l
                 indent (list-locator location) (cdr stack) context rect
-                (when delimited
-                  (list :delimited delimited)))))
+                (list :delimited delimited :layout-rule layout-rule))))
     (setf (tui:key-handler view) (global-key-handler l location)
           (tui:focused view) (location= location (focus context)))
     view))
@@ -1116,14 +1125,24 @@ Uses shared scratch cells and clears the touched scratch area on exit."
     (indent:operator-section-start (parse:resolve name) '(&key))))
 
 (defun function-call-indentation (node stack context rect)
-  "Packs arguments by width, keeping the &key tail paired per line."
-  (let* ((arguments (parse:body node))
-         (limit (max 1 (min (tui:rect-cols rect) (- *column-limit* (tui:rect-x rect)))))
-         (measuring (make-buffer
+  "TODO settle this and document"
+  (let* ((measuring (make-buffer
                      :buffer-ui (buffer-ui context)
                      :buffer-id (buffer-id context)
                      :buffer-state (buffer-state context)))
-         (bounds (tui:copy-rect rect :y 0 :cols limit))
+         (name-rect (measure-node (parse:name node)
+                     (cons (make-location :node node :id 'parse:name) stack) measuring
+                     rect))
+         (rect-limit (max 1
+                          (min (- *column-limit* (tui:rect-x rect)) (tui:rect-cols rect))))
+         (arguments (parse:body node))
+         (bound (tui:copy-rect rect :y 0 :cols rect-limit))
+         (arg1-bound (tui:copy-rect rect
+                                    :y 0
+                                    :cols (max 1
+                                               (min (tui:rect-cols rect)
+                                                    (- *column-limit*
+                                                       (1+ (tui:rect-x2 name-rect)))))))
          (widths (loop for arg in arguments
                        for index from 0
                        collect (tui:rect-cols (measure-node arg
@@ -1131,34 +1150,42 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                                                       :node node
                                                       :id (list 'parse:body index))
                                                      stack)
-                                               measuring bounds))))
+                                               measuring bound))))
          (keyword-start (function-keyword-start node stack)))
     (labels ((fits (widths)
                (<= (+ (reduce #'+ widths :initial-value 0) (max 0 (1- (length widths))))
-                   limit))
+                   rect-limit))
              (greedy (widths)
                (loop with used = 0
                      with count = 0
                      with rows = nil
+                     ;; include indenting space
+                     with limit = (max 1 (- *column-limit* 1 (tui:rect-x rect)))
                      for width in widths
+                     while width
                      do (when (and (plusp count) (> (+ used 1 width) limit))
-                          (push (cons 0 count) rows)
+                          (push (cons 1 count) rows)
                           (setf used 0 count 0))
                         (incf used (+ width (if (plusp count) 1 0)))
                         (incf count)
                      finally (when (plusp count)
-                               (push (cons 0 count) rows))
+                               (push (cons 1 count) rows))
                              (return (nreverse rows)))))
       (cond
-        ((fits widths) '((0 . nil)))
-        ((or (null keyword-start) (>= keyword-start (length widths))) (greedy widths))
+        ((fits (cons (tui:rect-cols name-rect) widths)) '((0 . nil)))
+        ((or (null keyword-start) (>= keyword-start (length widths)))
+         (if-let (arg1 (first arguments))
+           (let ((cols (tui:rect-cols (measure-node arg1
+                                       (cons (make-location :node node :id '(parse:body 0))
+                                             stack)
+                                       measuring arg1-bound))))
+             (if (<= (+ (tui:rect-cols name-rect) 1 cols) rect-limit)
+                 (cons '(0 . 2) (greedy (cdr widths)))
+                 (cons '(0 . 1) (greedy widths))))
+           '((0 . 1))))
         (t
-         (let ((keywords (nthcdr keyword-start widths)))
-           (append (greedy (subseq widths 0 keyword-start))
-                   (if (fits keywords)
-                       (list (cons 0 (length keywords)))
-                       ;; dangling kw
-                       '((0 . 2))))))))))
+         (cons '(0 . 1) ; name
+               (append (greedy (subseq widths 0 keyword-start)) '((0 . 2)))))))))
 
 (defmethod render-node ((node parse:function-call) stack context rect &key)
   (trivia:match (and (= 2 (length (parse:body node))) (is-binop-call node))
@@ -1292,32 +1319,22 @@ Uses shared scratch cells and clears the touched scratch area on exit."
           :children (list arg1-view op-view arg2-view)
           :key-handler (global-key-handler node location)
           :focused (location= location (focus context))))))
-    (_
-     (let* ((location (car stack))
-            (name-view (render-node (parse:name node)
-                        (cons (make-location :node node :id 'parse:name) stack) context
-                        rect))
-            (name-rect (tui:rect name-view))
-            (args-bounds (tui:clamp-rect
-                           (tui:copy-rect rect :x (+ 1 (tui:rect-x2 name-rect)))
-                          rect))
-            (args-view (render-elements (parse:body node)
-                        (function-call-indentation node stack context args-bounds)
-                        (list-locator (make-location :node node :id 'parse:body)) stack
-                        context args-bounds nil))
-            (args-rect (tui:rect args-view))
-            (fun-rect (tui:clamp-rect
-                        (tui:copy-rect rect
-                                       :rows (max 1 (tui:rect-rows args-rect))
-                                       :cols (+ (tui:rect-cols name-rect) 1
-                                                (tui:rect-cols args-rect)))
-                       rect)))
-       (make-instance 'ast-view
-        :location location
-        :rect fun-rect
-        :children (list name-view args-view)
-        :key-handler (global-key-handler node location)
-        :focused (location= location (focus context)))))))
+    (_ ; TODO wrapping for arith above
+      (let* ((location (car stack))
+             (render (render-elements (cons (parse:name node) (parse:body node))
+                      (function-call-indentation node stack context rect)
+                      (lambda (index)
+                        (if (zerop index)
+                            (make-location :node node :id 'parse:name)
+                            (make-location :node node :id (list 'parse:body (1- index)))))
+                      stack context rect nil))
+             (real-rect (tui:rect render)))
+        (make-instance 'ast-view
+         :location location
+         :rect real-rect
+         :children (list render)
+         :key-handler (global-key-handler node location)
+         :focused (location= location (focus context)))))))
 
 ;;; macro calls
 (defun loop-indentation (elements &optional (package *package*))
@@ -1334,18 +1351,17 @@ Uses shared scratch cells and clears the touched scratch area on exit."
          (loop-indentation elements package)))
       ((member s '(setf psetf psetq)) `((0 . 3) (,(1+ (length (string s))) . 2)))
       ((fboundp s)
-       (let ((index (indent:operator-section-start s '(&rest &body))))
-         (if index
-             (case index
-               (0 `((0 . 2) (,(1+ (length (string s))) . t)))
-               (1 `((0 . ,(1+ index)) (1 . t)))
-               (2
-                (if (uiop/utility:string-prefix-p "DEF" (string s))
-                    `((0 . 3) (1 . t)) ; e.g. defgeneric, deftype
-                    `((0 . 2) (3 . 1) (1 . t))))
-               (3 `((0 . 3) (1 . t))) ; e.g. defclass define-condition
-               (t `((0 . ,(1+ index)) (1 . t))))
-             *horizontal*)))
+       (if-let (index (indent:operator-section-start s '(&body &rest)))
+         (case index
+           (0 `((0 . 2) (,(1+ (length (string s))) . t)))
+           (1 `((0 . ,(1+ index)) (1 . t)))
+           (2
+            (if (starts-with-subseq "DEF" (string s))
+                `((0 . 3) (1 . t)) ; e.g. defgeneric, deftype
+                `((0 . 2) (3 . 1) (1 . t))))
+           (3 `((0 . 3) (1 . t))) ; e.g. defclass define-condition
+           (t `((0 . ,(1+ index)) (1 . t))))
+         *horizontal*))
       (t *horizontal*))
     *horizontal*))
 
@@ -1406,8 +1422,17 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                   (setf-indentation node stack context rect))
                  ((compact-layout-p elements rule locate stack context rect keys)
                   *horizontal*)
+                 ((getf rule :argument-break)
+                  (let* ((index (getf rule :argument-break))
+                         (header (getf rule :header)))
+                    (append `((0 . ,index) (3 . 1))
+                            (when (and header (> header index))
+                              `((0 . ,(- header index))))
+                            '((1 . 1)))))
+                 ((getf rule :header) `((0 . ,(1+ (getf rule :header))) (1 . 1)))
                  (t (macro-call-indentation (parse:op node) (buffer-package context)))))
-         (view (render-elements elements spec locate stack context rect keys)))
+         (view (render-elements elements
+                spec locate stack context rect (list* :layout-rule rule keys))))
     (make-instance 'ast-view
      :location location
      :children (list view)
@@ -1444,8 +1469,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
 ;;
 ;;; layout generation
 ;;
-(defvar *default-expansions*
-  (make-hash-table :test #'eq)
+(defvar *default-expansions* (make-hash-table :test #'eq)
   "Operator symbol -> closure constructing a default node for that form.")
 
 (defrecord layout ()
@@ -1544,6 +1568,15 @@ pairs building new elements of &rest and &body slots."))
                             (default-slot-value kind (layout-template layout slot))))))
 
 (defun slot-render-keys (node slot)
+  (when (and (typep node '(or parse:let-form parse:let*-form)) (eq slot 'parse:vars))
+    (return-from slot-render-keys
+     (list :indent *vertical* :delimited :shallow :layout-rule
+           (indent::child-rule
+             (indent:indent-rule
+               (list (make-instance 'parse:symbol-ref
+                      :name (symbol-name (parse:op node))
+                      :home-package (symbol-package (parse:op node)))))
+            1))))
   (case (cdr (assoc slot (parse:form-slot-kinds (type-of node))))
     (parse::&tree '(:delimited t))
     (parse::&declarations (list :indent *vertical* :delimited t))

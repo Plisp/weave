@@ -24,8 +24,7 @@
 
 (in-package #:weave-serialization)
 
-(defparameter *long-call-indent*
-  1
+(defparameter *long-call-indent* 1
   "Indentation from the opening parenthesis after a long call's first argument.")
 
 (defvar *comment-ended-line* nil)
@@ -252,13 +251,7 @@
                                      (member (resolve element) lambda-list-keywords))
                for operand = (if listp index (1- index))
                for bodyp = (and body-start (>= index body-start))
-               for child-rule = (cond
-                                  (data :data)
-                                  ((minusp operand) (getf spec :head))
-                                  ((< operand (length (getf spec :children)))
-                                   (nth operand (getf spec :children)))
-                                  ((and header (< operand header)) nil)
-                                  (t (getf spec :rest)))
+               for child-rule = (weave-indentation::child-rule rule index)
                do (when (plusp index)
                     (unless *comment-ended-line*
                       (write-char #\Space stream))

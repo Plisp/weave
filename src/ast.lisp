@@ -695,8 +695,7 @@ copy-env can exploit structure sharing, remember to PUSH!"
 (defun go-tag-p (x)
   (or (integerp x) (symbolp x)))
 
-(defvar *macroexpansion-observer*
-  nil
+(defvar *macroexpansion-observer* nil
   "Optional hook taking partial expansions, passed a form and env.")
 
 (defvar *macroexpansion-env* nil)

@@ -95,11 +95,10 @@ column. Returns NIL if not found."
 
 (setf (gethash (tui-sys:make-event :kind :up-arrow) *default-key-handlers*) #'move-up)
 
-(setf (gethash (tui-sys:make-event :kind #\e :controlp t) *default-key-handlers*)
-      (lambda (&rest args)
-        (declare (ignore args))
-        (break)))
-
+;; (setf (gethash (tui-sys:make-event :kind #\e :controlp t) *default-key-handlers*)
+;;       (lambda (&rest args)
+;;         (declare (ignore args))
+;;         (break)))
 (defun move-left (view buffer)
   (atom-move (lambda (atom-array this-rect)
                (let ((view (view-left atom-array (tui:rect-y this-rect)
@@ -1103,8 +1102,7 @@ already and focuses the hole."
               t)))))
 
 ;;; arbitrary
-(defparameter *layout-key-handlers*
-  (make-hash-table :test #'equal)
+(defparameter *layout-key-handlers* (make-hash-table :test #'equal)
   "Map from event to callbacks (layout, child-stack, buffer) -> bool whether to propagate.")
 
 (defmethod handle-key ((node parse:irregular-form) view location buffer event)

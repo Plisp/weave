@@ -142,7 +142,7 @@ its first are aligned with the first, and a loop without keywords has a line per
     (trivia:ematch :like trivia:match) (trivia:cmatch :like trivia:match)
     (if :break :linear) (and :break :linear) (or :break :linear) (setq :pairs t)
     (setf :pairs t) (psetq :pairs t) (psetf :pairs t)
-    (defvar :header 1 :body-break :linear) (defparameter :like defvar)
+    (defvar :header 2 :body-break :linear) (defparameter :like defvar)
     (defconstant :like defvar)
     (defclass :header 2 :children
      (nil :data (:style :list :break :mandatory :rest (:style :list))))
@@ -173,3 +173,15 @@ its first are aligned with the first, and a loop without keywords has a line per
                   (list :header position :children
                         (append (make-list (1- position)) (list '(:style :lambda))))))
               rule))))))
+
+(defun child-rule (rule index)
+  "Selects the nested rule for element `index', including the head."
+  (cond
+    ((eq rule :data) :data)
+    (t
+     (let ((operand (if (member (getf rule :style) '(:list :lambda)) index (1- index))))
+       (cond
+         ((minusp operand) (getf rule :head))
+         ((< operand (length (getf rule :children))) (nth operand (getf rule :children)))
+         ((and (getf rule :header) (< operand (getf rule :header))) nil)
+         (t (getf rule :rest)))))))
