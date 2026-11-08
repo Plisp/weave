@@ -107,6 +107,7 @@ its first are aligned with the first, and a loop without keywords has a line per
 ;; and :rest supplies the role for remaining operands (or all list elements)
 (defparameter *indent-rules*
   '((defpackage :header 1 :rest (:break :linear))
+    (uiop:define-package :like defpackage)
     (defun :header 2 :children (nil (:style :lambda))) (defmacro :like defun)
     (deftype :like defun) (defgeneric :like defun) (define-setf-expander :like defun)
     (lambda :header 1 :children ((:style :lambda))) (defmethod :method t)

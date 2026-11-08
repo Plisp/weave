@@ -39,6 +39,8 @@
 ;; dynamic vars for debugging, should not be used
 (defvar *state* nil)
 
+(defvar *debug* nil)
+
 (defvar *log* (sb-concurrency:make-mailbox :name "log")) ; XXX conditionalize
 
 (defvar *log-stop* (gensym))
@@ -569,7 +571,7 @@ since these aren't a proper location."
   (with-accessors ((text text))
       node
     (let* ((location (car stack))
-           (text (if (string= text "") "hole" text))
+           (text (if (string= text "") (parse:inlay node) text))
            (focused (location= location (focus context))))
       (tui:puts* text 1 1 rect
                  (if (and focused (buffer-focused-p context))
@@ -852,11 +854,9 @@ Uses shared scratch cells and clears the touched scratch area on exit."
          (count 0)
          (previous nil))
     ;; e.g. cond, trivia:match
-    (when-let (rule
-               (and elements
-                    (getf keys :layout-rule)
-                    (listp (getf keys :layout-rule))
-                    (getf keys :layout-rule)))
+    (when-let (rule (when elements
+                      (when-let (rule (getf keys :layout-rule))
+                        (and (listp rule) rule))))
       (when (eq (getf rule :break) :mandatory)
         (return-from ref-list-indentation '((0 . 1))))
       (when (getf rule :compact-body)
@@ -867,6 +867,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
     (let ((rule (getf keys :layout-rule)))
       (when (and (listp rule) (getf rule :header))
         (return-from ref-list-indentation `((0 . ,(1+ (getf rule :header))) (0 . 1))))
+      ;;
       (when (and (listp rule) (eq (getf rule :break) :linear))
         (let* ((head (apply #'measure-node (funcall transform (first elements))
                             (cons (funcall locate 0) stack) measuring bounds keys))
@@ -935,8 +936,8 @@ Uses shared scratch cells and clears the touched scratch area on exit."
 (defmethod render-node
   ((l ref-list) stack context rect
    &key indent delimited layout-rule (transform #'identity))
-  "A `delimited' list is drawn with `*list-delimiters*' around it, recursively unless
-`delimited' is :shallow. It's opening parens is selectable."
+  "If `delimited' is true, the contents are drawn with `*list-delimiters*' surrounding,
+recursively unless `delimited' is :shallow. It's opening parens is selectable."
   (let* ((location (car stack))
          (rootp (and (listp (location-node location)) (integerp (location-id location))))
          (contents-location (if rootp (make-location :node l :id 'elements) location))
@@ -1185,7 +1186,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
            '((0 . 1))))
         (t
          (cons '(0 . 1) ; name
-               (append (greedy (subseq widths 0 keyword-start)) '((0 . 2)))))))))
+               (append (greedy (subseq widths 0 keyword-start)) '((1 . 2)))))))))
 
 (defmethod render-node ((node parse:function-call) stack context rect &key)
   (trivia:match (and (= 2 (length (parse:body node))) (is-binop-call node))
@@ -1319,7 +1320,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
           :children (list arg1-view op-view arg2-view)
           :key-handler (global-key-handler node location)
           :focused (location= location (focus context))))))
-    (_ ; TODO wrapping for arith above
+    (_
       (let* ((location (car stack))
              (render (render-elements (cons (parse:name node) (parse:body node))
                       (function-call-indentation node stack context rect)
@@ -1824,7 +1825,8 @@ ASSUMES we never focus a plain list body."
          (lambda-list-view (render-node (parse:lambda-list node)
                             (cons (make-location :node node :id 'parse:lambda-list) stack)
                             context rect
-                            :delimited t))
+                            :delimited t
+                            :indent *horizontal*))
          (ll-rect (tui:rect lambda-list-view))
          (docstring (parse:docstring node))
          (docstring-view (when docstring
@@ -2346,6 +2348,9 @@ as `viewport'."
 
 (defmethod tui:render ((ui ui))
   (tui::clear-buffer tui::*put-buffer*)
+  ;; (sb-sprof:with-profiling (:sample-interval 0.001
+  ;;                           :threads (list sb-thread:*current-thread*)
+  ;;                           :loop t))
   (dolist (buffer (buffers ui))
     (render-buffer buffer))
   ;; completion is global
@@ -2441,25 +2446,28 @@ as `viewport'."
 ;; TODO capture use-value/store-value using gray streams
 (let ((redisplay-failed nil))
   (defmethod tui:redisplay :around ((ui ui))
-    (slynk-backend:call-with-debugger-hook
-      (lambda (condition previous-hook)
-        (declare (ignore previous-hook))
-        (reset-ui)
-        (if redisplay-failed
-            (progn
-              (slog 'fallback-redisplay-failed)
-              (tui:stop ui))
-            (progn
-              (setf redisplay-failed t)
-              (enter-debugger-loop ui condition))))
-     (lambda ()
-       (unless (redisplayed-since-input ui)
-         (with-timing (lambda (time)
-                        (slog* (format nil "~aRedisplay done in ~Ams"
-                                       (make-string 70 :initial-element #\-)
-                                       (truncate time 1000))))
-           (call-next-method))
-         (setf redisplay-failed nil))))))
+    (flet ((do-redisplay ()
+             (unless (redisplayed-since-input ui)
+               (with-timing (lambda (time)
+                              (slog* (format nil "~aRedisplay done in ~Ams"
+                                             (make-string 70 :initial-element #\-)
+                                             (truncate time 1000))))
+                 (call-next-method))
+               (setf redisplay-failed nil))))
+      (if *debug*
+          (slynk-backend:call-with-debugger-hook
+           (lambda (condition previous-hook)
+             (declare (ignore previous-hook))
+             (reset-ui)
+             (if redisplay-failed
+                 (progn
+                   (slog 'fallback-redisplay-failed)
+                   (tui:stop ui))
+                 (progn
+                   (setf redisplay-failed t)
+                   (enter-debugger-loop ui condition))))
+           #'do-redisplay)
+          (do-redisplay)))))
 
 (defun buffer-at-point (ui row col)
   "Finds the *last drawn* buffer containing the absolute point `row', `col' (1-based)."
@@ -2656,14 +2664,16 @@ as `viewport'."
         ;; XXX every global rebound by events must be saved here as needed
         ;; e.g. the problem with eval was that standard-output was rebound around the error,
         ;; suppressing redraw
-        (let ((out *standard-output*))
-          (slynk-backend:call-with-debugger-hook
-            (lambda (condition previous-hook)
-              (declare (ignore previous-hook))
-              (let ((*standard-output* out))
-                (enter-debugger-loop ui condition)))
-           (lambda ()
-             (call-next-method)))))
+        (if *debug*
+            (let ((out *standard-output*))
+              (slynk-backend:call-with-debugger-hook
+               (lambda (condition previous-hook)
+                 (declare (ignore previous-hook))
+                 (let ((*standard-output* out))
+                   (enter-debugger-loop ui condition)))
+               (lambda ()
+                 (call-next-method))))
+            (call-next-method)))
     (unless (and (tui-sys:mouse-event-p event)
                  (eq :hover (tui-sys:mouse-data-button (tui-sys:event-kind event))))
       (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled)))))

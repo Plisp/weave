@@ -16,7 +16,7 @@
            #:block-position-p #:lexical-symbol-ref #:unexpanded-macro-op-p #:function-call
            #:irregular-form #:macro-call #:subforms #:path-at #:expanded #:function-code
            #:docstring #:declarations #:lambda-list #:unevaluated #:body #:name #:str
-           #:vars #:op #:hole #:text #:ref-list #:gen-list-p #:gen-tree-ref #:elements
+           #:vars #:op #:hole #:text #:inlay #:ref-list #:gen-list-p #:gen-tree-ref #:elements
            #:with-elements #:home-package))
 
 (in-package #:weave-parser)
@@ -95,7 +95,8 @@
   (:documentation "Represents a binder, NOT a reference in evaluation position."))
 
 (defrecord hole ()
-  ((text :init "" :mutable t :type simple-string))
+  ((inlay :init "hole" :mutable t :type simple-string)
+   (text :init "" :mutable t :type simple-string))
   (:documentation "Stands in for a reader atom, or evaluated form."))
 
 (defun hole (&optional (text ""))

@@ -449,8 +449,8 @@ addressed by indices."
                              count t)
                        0)))
     (append old-body
-            (loop repeat (max 0 (- argcount (length old-body)))
-                  collect (hole)))))
+            (loop for i below (max 0 (- argcount (length old-body)))
+                  collect (make-instance 'parse:hole :inlay (string-downcase (nth i arglist)))))))
 
 (defun build-call (ref &optional old-body)
   "ref must be a symbol-ref"
