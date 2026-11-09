@@ -13,6 +13,7 @@
                #:uncursed
                #+sbcl #:sb-concurrency
                #+sbcl #:sb-cltl2
+               #+sbcl #:sb-sprof
                )
   :pathname "src"
   :components ((:file "util")

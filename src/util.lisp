@@ -3,10 +3,24 @@
 ;;;;
 (uiop/package:define-package #:weave-utils
   (:use :cl #:alexandria-2)
-  (:export #:disp #:addr-str #:list-insert #:list-update #:list-remove #:tree-ref
-           #:tree-update #:with-lookup #:or-f #:+fail+ #:string-drop #:split-string
-           #:flex-vector #:external-symbol-p #:defrecord #:shallow-copy-record
-           #:with-timing #:strcat))
+  (:export #:disp
+           #:addr-str
+           #:list-insert
+           #:list-update
+           #:list-remove
+           #:tree-ref
+           #:tree-update
+           #:with-lookup
+           #:or-f
+           #:+fail+
+           #:string-drop
+           #:split-string
+           #:flex-vector
+           #:external-symbol-p
+           #:defrecord
+           #:shallow-copy-record
+           #:with-timing
+           #:strcat))
 
 (in-package #:weave-utils)
 

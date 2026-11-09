@@ -4,20 +4,77 @@
 ;;
 (uiop/package:define-package #:weave-parser
   (:use :cl #:alexandria-2 #:weave-utils)
-  (:export #:make-env #:make-client #:parse-from-string #:parse-syntax #:ast-parse-error
-           #:is-atom #:get-body #:copy-node #:to-syntax #:copy-syntax #:update
-           #:get-location #:node-at #:location-sort #:locsort #:location-env #:env-lookup
-           #:form-slot-kinds #:form-optional-slots #:eval-form #:symbol-ref #:binder
-           #:literal #:string-literal #:character-literal #:integer-literal #:float-literal
-           #:bitvector-literal #:ratio-literal #:integer-hole #:reader-literal
-           #:numerator-node #:denominator-node #:reader-marker #:read-quasiquote
-           #:read-quote #:read-function #:read-eval #:string-and-package=
-           #:unary-reader-marker-p #:resolve #:value-at-path #:function-position-p
-           #:block-position-p #:lexical-symbol-ref #:unexpanded-macro-op-p #:function-call
-           #:irregular-form #:macro-call #:subforms #:path-at #:expanded #:function-code
-           #:docstring #:declarations #:lambda-list #:unevaluated #:body #:name #:str
-           #:vars #:op #:hole #:text #:inlay #:ref-list #:gen-list-p #:gen-tree-ref #:elements
-           #:with-elements #:home-package))
+  (:export #:make-env
+           #:make-client
+           #:parse-from-string
+           #:parse-syntax
+           #:ast-parse-error
+           #:is-atom
+           #:get-body
+           #:copy-node
+           #:to-syntax
+           #:copy-syntax
+           #:update
+           #:get-location
+           #:node-at
+           #:location-sort
+           #:locsort
+           #:location-env
+           #:env-lookup
+           #:form-slot-kinds
+           #:form-optional-slots
+           #:eval-form
+           #:symbol-ref
+           #:binder
+           #:literal
+           #:string-literal
+           #:character-literal
+           #:integer-literal
+           #:float-literal
+           #:bitvector-literal
+           #:ratio-literal
+           #:integer-hole
+           #:reader-literal
+           #:numerator-node
+           #:denominator-node
+           #:reader-marker
+           #:read-quasiquote
+           #:read-quote
+           #:read-function
+           #:read-eval
+           #:string-and-package=
+           #:unary-reader-marker-p
+           #:resolve
+           #:value-at-path
+           #:function-position-p
+           #:block-position-p
+           #:lexical-symbol-ref
+           #:unexpanded-macro-op-p
+           #:function-call
+           #:irregular-form
+           #:macro-call
+           #:subforms
+           #:path-at
+           #:expanded
+           #:function-code
+           #:docstring
+           #:declarations
+           #:lambda-list
+           #:unevaluated
+           #:body
+           #:name
+           #:str
+           #:vars
+           #:op
+           #:hole
+           #:text
+           #:inlay
+           #:ref-list
+           #:gen-list-p
+           #:gen-tree-ref
+           #:elements
+           #:with-elements
+           #:home-package))
 
 (in-package #:weave-parser)
 

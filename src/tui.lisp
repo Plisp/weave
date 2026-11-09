@@ -854,9 +854,10 @@ Uses shared scratch cells and clears the touched scratch area on exit."
          (count 0)
          (previous nil))
     ;; e.g. cond, trivia:match
-    (when-let (rule (when elements
-                      (when-let (rule (getf keys :layout-rule))
-                        (and (listp rule) rule))))
+    (when-let (rule
+               (when elements
+                 (when-let (rule (getf keys :layout-rule))
+                   (and (listp rule) rule))))
       (when (eq (getf rule :break) :mandatory)
         (return-from ref-list-indentation '((0 . 1))))
       (when (getf rule :compact-body)
@@ -1125,8 +1126,14 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
       (return-from function-keyword-start nil))
     (indent:operator-section-start (parse:resolve name) '(&key))))
 
+(defparameter *function-indent-cache* (make-hash-table :test #'equalp))
+
 (defun function-call-indentation (node stack context rect)
-  "TODO settle this and document"
+  (ensure-gethash (cons node rect)
+   *function-indent-cache* (function-call-indentation-uncached node stack context rect)))
+
+(defun function-call-indentation-uncached (node stack context rect)
+  "TODO settle this and document, also determine if copy is required"
   (let* ((measuring (make-buffer
                      :buffer-ui (buffer-ui context)
                      :buffer-id (buffer-id context)
@@ -1321,21 +1328,21 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
           :key-handler (global-key-handler node location)
           :focused (location= location (focus context))))))
     (_
-      (let* ((location (car stack))
-             (render (render-elements (cons (parse:name node) (parse:body node))
-                      (function-call-indentation node stack context rect)
-                      (lambda (index)
-                        (if (zerop index)
-                            (make-location :node node :id 'parse:name)
-                            (make-location :node node :id (list 'parse:body (1- index)))))
-                      stack context rect nil))
-             (real-rect (tui:rect render)))
-        (make-instance 'ast-view
-         :location location
-         :rect real-rect
-         :children (list render)
-         :key-handler (global-key-handler node location)
-         :focused (location= location (focus context)))))))
+     (let* ((location (car stack))
+            (render (render-elements (cons (parse:name node) (parse:body node))
+                     (function-call-indentation node stack context rect)
+                     (lambda (index)
+                       (if (zerop index)
+                           (make-location :node node :id 'parse:name)
+                           (make-location :node node :id (list 'parse:body (1- index)))))
+                     stack context rect nil))
+            (real-rect (tui:rect render)))
+       (make-instance 'ast-view
+        :location location
+        :rect real-rect
+        :children (list render)
+        :key-handler (global-key-handler node location)
+        :focused (location= location (focus context)))))))
 
 ;;; macro calls
 (defun loop-indentation (elements &optional (package *package*))
@@ -2349,8 +2356,11 @@ as `viewport'."
 (defmethod tui:render ((ui ui))
   (tui::clear-buffer tui::*put-buffer*)
   ;; (sb-sprof:with-profiling (:sample-interval 0.001
+  ;;                           :reset t
   ;;                           :threads (list sb-thread:*current-thread*)
-  ;;                           :loop t))
+  ;;                           :loop t)
+  ;;   (dolist (buffer (buffers ui))
+  ;;     (render-buffer buffer)))
   (dolist (buffer (buffers ui))
     (render-buffer buffer))
   ;; completion is global
@@ -2456,16 +2466,16 @@ as `viewport'."
                (setf redisplay-failed nil))))
       (if *debug*
           (slynk-backend:call-with-debugger-hook
-           (lambda (condition previous-hook)
-             (declare (ignore previous-hook))
-             (reset-ui)
-             (if redisplay-failed
-                 (progn
-                   (slog 'fallback-redisplay-failed)
-                   (tui:stop ui))
-                 (progn
-                   (setf redisplay-failed t)
-                   (enter-debugger-loop ui condition))))
+            (lambda (condition previous-hook)
+              (declare (ignore previous-hook))
+              (reset-ui)
+              (if redisplay-failed
+                  (progn
+                    (slog 'fallback-redisplay-failed)
+                    (tui:stop ui))
+                  (progn
+                    (setf redisplay-failed t)
+                    (enter-debugger-loop ui condition))))
            #'do-redisplay)
           (do-redisplay)))))
 
@@ -2667,10 +2677,10 @@ as `viewport'."
         (if *debug*
             (let ((out *standard-output*))
               (slynk-backend:call-with-debugger-hook
-               (lambda (condition previous-hook)
-                 (declare (ignore previous-hook))
-                 (let ((*standard-output* out))
-                   (enter-debugger-loop ui condition)))
+                (lambda (condition previous-hook)
+                  (declare (ignore previous-hook))
+                  (let ((*standard-output* out))
+                    (enter-debugger-loop ui condition)))
                (lambda ()
                  (call-next-method))))
             (call-next-method)))

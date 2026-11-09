@@ -298,8 +298,44 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
     (push loc (stack buffer))
     loc))
 
+(defun clear-function-indent-cache (stack)
+  "Clear entries in `stack' which should be no longer displayed."
+  (dolist (loc stack)
+    (let ((node (location-node loc))
+          to-remove)
+      (when (typep node 'parse:function-call)
+        (maphash (lambda (k v)
+                   (declare (ignore v))
+                   (when (eq (car k) node)
+                     (push k to-remove)))
+                 *function-indent-cache*)
+        ;; avoid iteration issues
+        (dolist (k to-remove)
+          (remhash k *function-indent-cache*))))))
+
+;; these two are the main entry points for editing
+(defun swap-node (location newnode buffer)
+  "saves undo history, removes spine from render cache"
+  (when (eq (location-id location) :open)
+    (setf location (second (member location (stack buffer) :test #'location=))))
+  (when (or (null (edit-loc buffer)) (not (location= location (edit-loc buffer))))
+    (save-history buffer))
+  (clear-function-indent-cache (stack buffer))
+  ;; perform the insertion
+  (let ((newloc (if (and (typep (location-node location) 'parse:macro-call)
+                         (not (parse::comment-location-p (location-id location))))
+                    (replace-in-macro-call location newnode buffer)
+                    (ast-replace location
+                     (constantly newnode) buffer
+                     (member-if (lambda (l)
+                                  (eq (location-node location) (location-node l)))
+                                (stack buffer))))))
+    (setf (future buffer) nil (edit-loc buffer) newloc)))
+
 (defun edit-list (loc updater focus-id buffer stack)
-  "Replaces the list at `loc' using `updater' and focuses `focus-id'."
+  "Replaces the list at `loc' using `updater' and focuses `focus-id'.
+Removes spine from render cache."
+  (clear-function-indent-cache stack)
   (if (typep (location-node loc) 'parse:macro-call)
       (replace-in-macro-call loc (funcall updater (node-at loc)) buffer focus-id)
       (progn
@@ -354,23 +390,6 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
                        (list (location-id location)))))
         (push (make-location :node (node-at (focus buffer)) :id id) (stack buffer)))
       (focus buffer))))
-
-(defun swap-node (location newnode buffer)
-  "saves undo history"
-  (when (eq (location-id location) :open)
-    (setf location (second (member location (stack buffer) :test #'location=))))
-  (when (or (null (edit-loc buffer)) (not (location= location (edit-loc buffer))))
-    (save-history buffer))
-  ;; perform the insertion
-  (let ((newloc (if (and (typep (location-node location) 'parse:macro-call)
-                         (not (parse::comment-location-p (location-id location))))
-                    (replace-in-macro-call location newnode buffer)
-                    (ast-replace location
-                     (constantly newnode) buffer
-                     (member-if (lambda (l)
-                                  (eq (location-node location) (location-node l)))
-                                (stack buffer))))))
-    (setf (future buffer) nil (edit-loc buffer) newloc)))
 
 (defun symbol-char-p (c)
   (or (alphanumericp c) (find c "+-*/=<>!?&%$_~^.:@[]{}")))
@@ -450,7 +469,7 @@ addressed by indices."
                        0)))
     (append old-body
             (loop for i below (max 0 (- argcount (length old-body)))
-                  collect (make-instance 'parse:hole :inlay (string-downcase (nth i arglist)))))))
+                  collect (make-instance 'hole :inlay (string-downcase (nth i arglist)))))))
 
 (defun build-call (ref &optional old-body)
   "ref must be a symbol-ref"
