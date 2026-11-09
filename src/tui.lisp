@@ -3,9 +3,16 @@
 ;;;;
 ;;
 ;; note: if a function takes a single rect argument, then any geometry it returns is in the
-;; same space as the supplied bounds unless specified.
-;; Importantly, the render-* functions produce rendered views with rects relative to
-;; their parent buffer's top left corner.
+;;       same space as the supplied bounds unless specified.
+;;       Importantly, the render-* functions produce rendered views with rects relative to
+;;       their parent buffer's top left corner.
+;; note: the buffer must be cloned before command processing, since state from
+;;       failed commands need to be discarded upon return from the debugger.
+;; note: redisplays are automatically aborted upon return from the debugger, so the only
+;;       obligation of render-state is not to leave invalid records in the caches.
+;;       e.g. node-views must be overwritten with up-to-date entries
+;;       TODO check if an offscreen focus can be ghost-drawn due to measuring,
+;;            doesn't matter atm since we wrap aggressively
 ;; note: debugger code must NOT error, catch any printing errors
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
@@ -204,6 +211,26 @@ construction, do not modify."))
    (revision :init 0 :mutable t :type (integer 0)))
   (:representation :class))
 
+;; mutable per-render cache, needed for movement commands
+(defrecord render-state ()
+  ;; rect has absolute coordinates
+  ((floating-rect :init nil :mutable t :type (or null tui:rect))
+   ;; has staging coordinates
+   (buffer-view :init nil :mutable t :type (or null tui:view))
+   (stage-cache :init (make-hash-table :test #'eq) :type hash-table)
+   (redisplay-cache :init (make-hash-table :test #'equal) :type hash-table)
+   (scroll-state :init
+    (make-scroll-state
+     :position (make-scroll-position :index 0)
+     :rows 0
+     :viewport 0
+     :segments nil)
+    :mutable t :type scroll-state)
+   ;; both below use staging coordinates
+   (focus-rect :init nil :mutable t :type (or null tui:rect))
+   (node-views :init (make-hash-table) :type hash-table))
+  (:representation :class))
+
 ;; MUST BE shallow copyable, always update immutably
 (defrecord buffer-state ()
   ((floating :init nil :mutable t :type boolean)
@@ -225,31 +252,13 @@ construction, do not modify."))
 (defun copy-buffer-state (state)
   (shallow-copy-record state))
 
-;; mutable per-render cache, needed for movement commands
-(defrecord render-state ()
-  ;; rect has absolute coordinates
-  ((floating-rect :init nil :mutable t :type (or null tui:rect))
-   ;; has staging coordinates
-   (buffer-view :init nil :mutable t :type (or null tui:view))
-   (stage-cache :init (make-hash-table :test #'eq) :type hash-table)
-   (redisplay-cache :init (make-hash-table :test #'equal) :type hash-table)
-   (scroll-state :init
-    (make-scroll-state
-     :position (make-scroll-position :index 0)
-     :rows 0
-     :viewport 0
-     :segments nil)
-    :mutable t :type scroll-state)
-   ;; both below use staging coordinates
-   (focus-rect :init nil :mutable t :type (or null tui:rect))
-   (node-views :init (make-hash-table) :type hash-table))
-  (:representation :class))
-
 (defrecord buffer ()
   ((buffer-ui)
    (buffer-id :init (gensym "BUFFER-"))
    (buffer-state :mutable t :type buffer-state)
-   (render-state :init (make-render-state) :mutable t :type render-state))
+   (render-state :init (make-render-state) :mutable t :type render-state)
+   ;; (node . cols) -> indentation spec
+   (indent-cache :init (make-hash-table :test #'equal) :type hash-table))
   (:representation :class))
 
 (defrecord debug-state ()
@@ -302,18 +311,6 @@ construction, do not modify."))
 (defgeneric render-node (node stack context rect &key &allow-other-keys)
   (:documentation "Drawn contents MUST fit within the provided `rect'."))
 
-(defmacro with-redisplay-cache ((buffer key) &body body)
-  "The value of `body', computed once per redisplay of `buffer' for `key'."
-  (once-only (buffer key)
-    (with-gensyms (value found)
-      `(multiple-value-bind (,value ,found)
-           (gethash ,key (redisplay-cache ,buffer))
-         (if ,found
-             ,value
-             (setf (gethash ,key (redisplay-cache ,buffer))
-                   (progn
-                     ,@body)))))))
-
 (defvar *render-environments*)
 
 (defun environment-table (node)
@@ -365,7 +362,7 @@ construction, do not modify."))
                         (visit (make-location :node value :id slot) env))))))))
       (visit location (parse:make-env)))))
 
-(defun uncached-environment-at (stack)
+(defun environment-at-uncached (stack)
   (let ((env (parse:make-env)))
     (dolist (loc (reverse stack))
       (when (member (locsort loc) '(parse:eval-form parse:function-code))
@@ -376,7 +373,7 @@ construction, do not modify."))
   (declare (type list stack))
   (let ((loc (car stack)))
     (or (gethash (location-id loc) (environment-table (location-node loc)))
-        (uncached-environment-at stack))))
+        (environment-at-uncached stack))))
 
 (defun compute-focus-binder (node stack buffer)
   (declare (ignore buffer))
@@ -395,8 +392,9 @@ construction, do not modify."))
 
 (defun focus-binder (buffer)
   "The binder referenced by the symbol-ref under the cursor."
-  (with-redisplay-cache (buffer :focus-binder)
-    (compute-focus-binder (node-at (focus buffer)) (stack buffer) buffer)))
+  (ensure-gethash :focus-binder
+   (redisplay-cache buffer)
+   (compute-focus-binder (node-at (focus buffer)) (stack buffer) buffer)))
 
 (defun symbol-ref-boundp (node stack buffer)
   (declare (ignore buffer))
@@ -677,8 +675,8 @@ since these aren't a proper location."
      :focused focused)))
 
 (defun render-symbol-space (op loc stack context rect)
-  "Renders `loc' as a bare focusable token for `op', a string designator,
-with a space after it unless specified."
+  "Renders the string designator `op' under `loc', with a space after it
+unless specified in *reader-punctuation*."
   (let* ((text (if-let (exp (assoc-value *reader-punctuation* op))
                  (string exp)
                  (if-let (exp (assoc-value *symbol-mappings* op))
@@ -788,6 +786,7 @@ convention."
     (let ((r (tui:rect view)))
       (values (tui:rect-x2 r) (tui:rect-y r)))))
 
+;; TODO changing this/display methods should invalidate indent caches
 (defparameter *column-limit* 92)
 
 ;; note: must be adjustable, bound to *put-buffer* during measurement
@@ -825,16 +824,12 @@ Uses shared scratch cells and clears the touched scratch area on exit."
   (when (and (getf rule :compact-body) (= (length elements) (+ (getf rule :header) 2)))
     (let* ((width (max 0 (min (tui:rect-cols rect) (- *column-limit* (tui:rect-x rect)))))
            (bounds (tui:copy-rect rect :y 0 :rows 2 :cols width))
-           (measuring (make-buffer
-                       :buffer-ui (buffer-ui context)
-                       :buffer-id (buffer-id context)
-                       :buffer-state (buffer-state context)))
            (transform (or (getf keys :transform) #'identity))
            (used (1- (length elements))))
       (loop for element in elements
             for index from 0
             for measured = (apply #'measure-node (funcall transform element)
-                                  (cons (funcall locate index) stack) measuring bounds
+                                  (cons (funcall locate index) stack) context bounds
                                   :layout-rule (indent::child-rule rule index)
                                   keys)
             always (and (= 1 (tui:rect-rows measured))
@@ -843,10 +838,6 @@ Uses shared scratch cells and clears the touched scratch area on exit."
 (defun ref-list-indentation (elements locate stack context rect keys)
   (let* ((max-width (max 1
                          (min (tui:rect-cols rect) (- *column-limit* (tui:rect-x rect)))))
-         (measuring (make-buffer
-                     :buffer-ui (buffer-ui context)
-                     :buffer-id (buffer-id context)
-                     :buffer-state (buffer-state context)))
          (bounds (tui:copy-rect rect :y 0 :rows 2 :cols max-width))
          (transform (or (getf keys :transform) #'identity))
          (rows nil)
@@ -871,7 +862,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
       ;;
       (when (and (listp rule) (eq (getf rule :break) :linear))
         (let* ((head (apply #'measure-node (funcall transform (first elements))
-                            (cons (funcall locate 0) stack) measuring bounds keys))
+                            (cons (funcall locate 0) stack) context bounds keys))
                (offset (1+ (tui:rect-cols head)))
                (fits (compact-layout-p elements
                       (list :compact-body t :header (- (length elements) 2)) locate stack
@@ -894,7 +885,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
             do (loop for original in group
                      for firstp = t then nil
                      for measured = (apply #'measure-node (funcall transform original)
-                                           (cons (funcall locate index) stack) measuring
+                                           (cons (funcall locate index) stack) context
                                            bounds keys)
                      do (incf index)
                         (when (> (tui:rect-rows measured) 1)
@@ -913,7 +904,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
           for index from 0
           for element = (funcall transform original)
           for measured = (apply #'measure-node element (cons (funcall locate index) stack)
-                                measuring bounds keys)
+                                context bounds keys)
           for size = (tui:rect-cols measured)
           for gap = (if (or (zerop count)
                             (and (= index 1) (parse:unary-reader-marker-p previous)))
@@ -1126,21 +1117,15 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
       (return-from function-keyword-start nil))
     (indent:operator-section-start (parse:resolve name) '(&key))))
 
-(defparameter *function-indent-cache* (make-hash-table :test #'equalp))
-
 (defun function-call-indentation (node stack context rect)
-  (ensure-gethash (cons node rect)
-   *function-indent-cache* (function-call-indentation-uncached node stack context rect)))
+  (ensure-gethash (cons node (tui:rect-cols rect))
+   (indent-cache context) (function-call-indentation-uncached node stack context rect)))
 
 (defun function-call-indentation-uncached (node stack context rect)
-  "TODO settle this and document, also determine if copy is required"
-  (let* ((measuring (make-buffer
-                     :buffer-ui (buffer-ui context)
-                     :buffer-id (buffer-id context)
-                     :buffer-state (buffer-state context)))
-         (name-rect (measure-node (parse:name node)
-                     (cons (make-location :node node :id 'parse:name) stack) measuring
-                     rect))
+  "All on same line if possible, otherwise one argument on first line and
+rest indented by 1, keeping keywords in pairs."
+  (let* ((name-rect (measure-node (parse:name node)
+                     (cons (make-location :node node :id 'parse:name) stack) context rect))
          (rect-limit (max 1
                           (min (- *column-limit* (tui:rect-x rect)) (tui:rect-cols rect))))
          (arguments (parse:body node))
@@ -1158,7 +1143,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                                                       :node node
                                                       :id (list 'parse:body index))
                                                      stack)
-                                               measuring bound))))
+                                               context bound))))
          (keyword-start (function-keyword-start node stack)))
     (labels ((fits (widths)
                (<= (+ (reduce #'+ widths :initial-value 0) (max 0 (1- (length widths))))
@@ -1186,7 +1171,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
            (let ((cols (tui:rect-cols (measure-node arg1
                                        (cons (make-location :node node :id '(parse:body 0))
                                              stack)
-                                       measuring arg1-bound))))
+                                       context arg1-bound))))
              (if (<= (+ (tui:rect-cols name-rect) 1 cols) rect-limit)
                  (cons '(0 . 2) (greedy (cdr widths)))
                  (cons '(0 . 1) (greedy widths))))
@@ -1378,10 +1363,6 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
   (let* ((indent (1+ (length (symbol-ref-text (parse:op node) (buffer-package context)))))
          (available (max 0
                          (min (tui:rect-cols rect) (- *column-limit* (tui:rect-x rect)))))
-         (measuring (make-buffer
-                     :buffer-ui (buffer-ui context)
-                     :buffer-id (buffer-id context)
-                     :buffer-state (buffer-state context)))
          (bounds (tui:copy-rect rect
                                 :x (+ (tui:rect-x rect) (min indent available))
                                 :y 0
@@ -1394,7 +1375,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                                         :node node
                                         :id (list 'parse:body index))
                                        stack)
-                                 measuring bounds :delimited t :transform
+                                 context bounds :delimited t :transform
                                  (lambda (elt)
                                    (or (car (gethash elt (parse:subforms node))) elt)))))
                  (tui:rect-cols measured))))
@@ -1994,14 +1975,17 @@ The returned view uses staging coordinates but all drawing is done to a local bu
           for segment = (render-one-toplevel i
                          start forms buffer screen-rows (tui:rect-cols bounds))
           do (when (and (= i index) (<= index focus-index))
+               ;; can be smaller following deletion
                (setf viewport
                      (+ start (min (scroll-position-row scroll) (segment-rows segment)))))
+             ;; TODO horizontal scrolling? some kind of handling for offscreen focuses
              (when (= i focus-index)
-               (let ((rect (tui:rect (gethash :focus-view (redisplay-cache buffer)))))
+               (when-let* ((focus-view (gethash :focus-view (redisplay-cache buffer)))
+                           (focus-rect (tui:rect focus-view)))
                  (setf viewport
                        (if (< focus-index index)
-                           (tui:rect-y rect)
-                           (reveal-focus-row viewport rect screen-rows)))))
+                           (tui:rect-y focus-rect)
+                           (reveal-focus-row viewport focus-rect screen-rows)))))
           collect segment into segments
           ;; include one whole successor beyond the resolved viewport and focus.
           until (and (> i focus-index) (>= start (+ viewport screen-rows)))
@@ -2043,8 +2027,6 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
                     :children (mapcar #'segment-view segments)
                     :key-handler (global-key-handler forms location)
                     :focused nil))
-             (focus-view (gethash :focus-view (redisplay-cache buffer)))
-             (rect (tui:rect focus-view))
              ;; y-offset relative to the staging coordinates
              (viewport (max 0 (min initial-viewport (- height rows)))))
         ;; copy segments to the screen
@@ -2066,7 +2048,10 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
                :segments segments
                :viewport viewport))
         ;; edit: split up setf
-        (setf (focus-rect buffer) rect (gethash forms (node-views buffer)) root)
+        (setf (focus-rect buffer)
+              (with-lookup (focus-view (gethash :focus-view (redisplay-cache buffer)))
+                (tui:rect focus-view)))
+        (setf (gethash forms (node-views buffer)) root)
         root))))
 
 ;;
@@ -2174,12 +2159,14 @@ as `viewport'."
          (height 0)
          (width 0))
     (when (and (plusp rows) (plusp cols))
-      (let ((measuring (make-buffer
-                        :buffer-ui ui
-                        :buffer-id (buffer-id buffer)
-                        :buffer-state (buffer-state buffer))))
+      (let ((context (make-buffer
+                      :buffer-ui ui
+                      :buffer-id (buffer-id buffer)
+                      :buffer-state (buffer-state buffer)
+                      :render-state (render-state buffer)
+                      :indent-cache (indent-cache buffer))))
         (loop for index below (length (ast buffer))
-              for segment = (render-one-toplevel index 0 (ast buffer) measuring rows cols)
+              for segment = (render-one-toplevel index 0 (ast buffer) context rows cols)
               do (incf height (+ (segment-rows segment) (if (zerop index) 0 1)))
                  (setf width
                        (max width (tui:rect-x2 (tui:rect (segment-view segment))))))))
@@ -2342,9 +2329,11 @@ as `viewport'."
                    :buffer-state (buffer-state buffer)
                    :render-state (make-render-state
                                   :stage-cache (copy-hash-table (stage-cache old))
-                                  :scroll-state (scroll-state old)))))
+                                  :scroll-state (scroll-state old))
+                   :indent-cache (indent-cache buffer))))
     (draw-buffer working (buffer-state working))
-    ;; commit only after success, old version can be used recursively by debugging
+    ;; old version can be used recursively by debugging, skipping this write on return
+    ;; by throwing to next-redisplay
     (setf (render-state buffer) (render-state working))))
 
 (defmethod tui:render :around ((ui ui))
@@ -2380,7 +2369,7 @@ as `viewport'."
       (old-render-method nil)
       (old-redisplay-method nil)
       (fnames '(render-toplevel-window render-buffer draw-buffer-border debugger-text
-                restart-depth enter-debugger-loop measure-node function-call-indentation
+                restart-depth enter-debugger-loop function-call-indentation
                 anchored-comment-locations render-trailing-comments ref-list-indentation
                 symbol-ref-prefix symbol-ref-text render-literal-text render-literal-line
                 render-delimiter render-symbol-space render-elements render-layout-slot

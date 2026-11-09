@@ -298,7 +298,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
     (push loc (stack buffer))
     loc))
 
-(defun clear-function-indent-cache (stack)
+(defun clear-function-indent-cache (stack buffer)
   "Clear entries in `stack' which should be no longer displayed."
   (dolist (loc stack)
     (let ((node (location-node loc))
@@ -308,10 +308,10 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                    (declare (ignore v))
                    (when (eq (car k) node)
                      (push k to-remove)))
-                 *function-indent-cache*)
+                 (indent-cache buffer))
         ;; avoid iteration issues
         (dolist (k to-remove)
-          (remhash k *function-indent-cache*))))))
+          (remhash k (indent-cache buffer)))))))
 
 ;; these two are the main entry points for editing
 (defun swap-node (location newnode buffer)
@@ -320,7 +320,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
     (setf location (second (member location (stack buffer) :test #'location=))))
   (when (or (null (edit-loc buffer)) (not (location= location (edit-loc buffer))))
     (save-history buffer))
-  (clear-function-indent-cache (stack buffer))
+  (clear-function-indent-cache (stack buffer) buffer)
   ;; perform the insertion
   (let ((newloc (if (and (typep (location-node location) 'parse:macro-call)
                          (not (parse::comment-location-p (location-id location))))
@@ -335,7 +335,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 (defun edit-list (loc updater focus-id buffer stack)
   "Replaces the list at `loc' using `updater' and focuses `focus-id'.
 Removes spine from render cache."
-  (clear-function-indent-cache stack)
+  (clear-function-indent-cache stack buffer)
   (if (typep (location-node loc) 'parse:macro-call)
       (replace-in-macro-call loc (funcall updater (node-at loc)) buffer focus-id)
       (progn
