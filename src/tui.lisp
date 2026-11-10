@@ -4,10 +4,8 @@
 ;;
 ;; note: if a function takes a single rect argument, then any geometry it returns is in the
 ;;       same space as the supplied bounds unless specified.
-;;       Importantly, the render-* functions produce rendered views with rects relative to
-;;       their parent buffer's top left corner.
 ;; note: the buffer must be cloned before command processing, since state from
-;;       failed commands need to be discarded upon return from the debugger.
+;;       failed commands should be discarded upon return from the debugger.
 ;; note: redisplays are automatically aborted upon return from the debugger, so the only
 ;;       obligation of render-state is not to leave invalid records in the caches.
 ;;       e.g. node-views must be overwritten with up-to-date entries
@@ -32,7 +30,8 @@
                 #:gen-list-p
                 #:gen-tree-ref
                 #:hole
-                #:text)
+                #:text
+                #:inlay)
   (:local-nicknames (#:parse #:weave-parser)
                     (#:tui #:uncursed)
                     (#:tui-sys #:uncursed-sys)
@@ -307,7 +306,8 @@ construction, do not modify."))
 
 ;;; rendering helpers
 (defgeneric render-node (node stack context rect &key measuring &allow-other-keys)
-  (:documentation "Drawn contents MUST fit within the provided `rect'."))
+  (:documentation "Drawn contents MUST fit within the provided `rect'.
+Must NOT perform context side effects if `measuring'."))
 
 (defvar *render-environments*)
 
@@ -470,14 +470,14 @@ construction, do not modify."))
                                (render-form rect)))
                            (render-form rect)))
              (view (first vals)))
-        ;; save view for anchoring
         (unless measuring
+          ;; save view for anchoring
           (setf (gethash node (node-views context)) view)
           (when (location= (car stack) (focus context))
-            (setf (gethash :focus-view (redisplay-cache context)) view)))
-        ;; save for event handling
-        (when (typep view 'ast-view)
-          (setf (view-stack view) stack))
+            (setf (gethash :focus-view (redisplay-cache context)) view))
+          ;; save stack for event handling
+          (when (typep view 'ast-view)
+            (setf (view-stack view) stack)))
         (values-list (cons combined (rest vals)))))))
 
 ;;; event handling
@@ -503,49 +503,53 @@ since these aren't a proper location."
                    always (when-let (position (position c text :start start))
                             (setf start (1+ position))))))))
 
-(defun global-key-handler (node location)
-  "Handler receives its working buffer explicitly at dispatch time."
+(defun global-key-handler (view event buffer node location)
+  "redefinition hook for key handling"
+  (slog* (format nil "event: ~a" event))
+  (assert (location= location (focus buffer)))
+  ;; (slog (butlast (stack buffer))) ; suppress toplevel list
+  (or (when-let (handler (gethash event *global-key-handlers*))
+        (funcall handler view buffer))
+      ;; propagate
+      (loop for thisnode = node then (location-node location)
+            for location in (stack buffer)
+            thereis (when (handle-key thisnode view location buffer event)
+                      (slog* `(handled-at ,node))
+                      t))
+      ;; contextual handlers
+      (when-let (handler (gethash event *default-key-handlers*))
+        ;;(slog* (format nil "default handler called at ~a" (focus buffer)))
+        (funcall handler view buffer)))
+  ;; state updates here
+  (when-let (completion (completion-state buffer))
+    (setf (completion-state buffer)
+          (when (eq (node-at (focus buffer)) (anchor completion))
+            (let* ((name (parse:name (anchor completion)))
+                   (valid (delete-if-not
+                            (lambda (s)
+                              (completion-match-p name s))
+                           (copy-seq (candidates completion)))))
+              (copy-completion-state completion
+               :selection (min (selection completion) (max 0 (1- (length valid))))
+               :candidates (stable-sort valid
+                            (lambda (s1 s2)
+                              (let ((e1 (string= name s1))
+                                    (e2 (string= name s2)))
+                                (cond
+                                  ((and e1 e2) nil)
+                                  (e1 t)
+                                  (e2 nil)
+                                  (t (string< s1 s2)))))
+                            :key #'string))))))
+  ;;
+  (assert (not (plain-body-location-p (focus buffer))) () "focused the body ~a of ~a"
+    (location-id (focus buffer))
+    (type-of (location-node (focus buffer)))))
+
+(defun make-key-handler (node location)
+  "Captures `node', `location' and receives its working data explicitly at dispatch time."
   (lambda (view event buffer)
-    (slog* (format nil "event: ~a" event))
-    (assert (location= location (focus buffer)))
-    ;; (slog (butlast (stack buffer))) ; suppress toplevel list
-    (or (when-let (handler (gethash event *global-key-handlers*))
-          (funcall handler view buffer))
-        ;; propagate
-        (loop for thisnode = node then (location-node location)
-              for location in (stack buffer)
-              thereis (when (handle-key thisnode view location buffer event)
-                        (slog* `(handled-at ,node))
-                        t))
-        ;; contextual handlers
-        (when-let (handler (gethash event *default-key-handlers*))
-          (slog* "default handler called")
-          (funcall handler view buffer)))
-    ;; state updates here
-    (when-let (completion (completion-state buffer))
-      (setf (completion-state buffer)
-            (when (eq (node-at (focus buffer)) (anchor completion))
-              (let* ((name (parse:name (anchor completion)))
-                     (valid (delete-if-not
-                              (lambda (s)
-                                (completion-match-p name s))
-                             (copy-seq (candidates completion)))))
-                (copy-completion-state completion
-                 :selection (min (selection completion) (max 0 (1- (length valid))))
-                 :candidates (stable-sort valid
-                              (lambda (s1 s2)
-                                (let ((e1 (string= name s1))
-                                      (e2 (string= name s2)))
-                                  (cond
-                                    ((and e1 e2) nil)
-                                    (e1 t)
-                                    (e2 nil)
-                                    (t (string< s1 s2)))))
-                              :key #'string))))))
-    ;;
-    (assert (not (plain-body-location-p (focus buffer))) () "focused the body ~a of ~a"
-      (location-id (focus buffer))
-      (type-of (location-node (focus buffer))))))
+    (global-key-handler view event buffer node location)))
 
 (defun fname (node)
   (parse:name (parse:name node)))
@@ -570,7 +574,7 @@ since these aren't a proper location."
   (with-accessors ((text text))
       node
     (let* ((location (car stack))
-           (text (if (string= text "") (parse:inlay node) text))
+           (text (if (string= text "") (inlay node) text))
            (focused (location= location (focus context))))
       (tui:puts* text 1 1 rect
                  (if (and focused (buffer-focused-p context))
@@ -584,7 +588,7 @@ since these aren't a proper location."
        :hoverable t
        ;; leaf handler never called unless focused
        :key-handler (when focused
-                      (global-key-handler node location))
+                      (make-key-handler node location))
        :focused focused))))
 
 (defun is-regular-char-event (event)
@@ -658,7 +662,7 @@ since these aren't a proper location."
      :location location
      :hoverable t
      :key-handler (when focused
-                    (global-key-handler node location))
+                    (make-key-handler node location))
      :focused focused)))
 
 (defmethod render-node ((node parse:binder) stack context rect &key)
@@ -672,7 +676,7 @@ since these aren't a proper location."
      :location location
      :hoverable t
      :key-handler (when focused
-                    (global-key-handler node location))
+                    (make-key-handler node location))
      :focused focused)))
 
 (defun render-symbol-space (op loc stack context rect measuring)
@@ -691,7 +695,7 @@ unless specified in *reader-punctuation*."
                 :location loc
                 :hoverable t
                 :key-handler (when focused
-                               (global-key-handler op loc))
+                               (make-key-handler op loc))
                 :focused focused)))
     (tui:puts* text 1 1 rect)
     (setf (view-stack view) (cons loc stack))
@@ -984,12 +988,12 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                            location stack
                            (tui:clamp-rect (tui:copy-rect rect :x end-x :y end-y) rect)))))
             (when (location= handle (focus context))
-              (setf (tui:key-handler open) (global-key-handler l handle)
+              (setf (tui:key-handler open) (make-key-handler l handle)
                     (tui:focused open) t
                     (gethash :focus-view (redisplay-cache context)) open))
             (make-instance 'ast-view
              :location (car stack)
-             :key-handler (global-key-handler l location)
+             :key-handler (make-key-handler l location)
              :focused focused
              :rect (tui:clamp-rect
                      (tui:copy-rect rect
@@ -1003,7 +1007,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                  (view (if (elements l)
                            (make-instance 'ast-view
                             :location (car stack)
-                            :key-handler (global-key-handler l location)
+                            :key-handler (make-key-handler l location)
                             :focused focused
                             :rect (tui:clamp-rect
                                     (tui:copy-rect rect
@@ -1018,7 +1022,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                                      (cdr *list-delimiters*))
                             location stack rect
                             :hoverable t))))
-            (setf (tui:key-handler view) (global-key-handler l location)
+            (setf (tui:key-handler view) (make-key-handler l location)
                   (tui:focused view) focused)
             view)))))
 
@@ -1030,7 +1034,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                 indent (list-locator location) (cdr stack) context rect
                 (list :measuring measuring :delimited delimited :layout-rule
                       layout-rule))))
-    (setf (tui:key-handler view) (global-key-handler l location)
+    (setf (tui:key-handler view) (make-key-handler l location)
           (tui:focused view) (location= location (focus context)))
     view))
 
@@ -1060,7 +1064,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
      :children (list contents)
      :hoverable t
      :key-handler (when focused
-                    (global-key-handler node location))
+                    (make-key-handler node location))
      :focused focused)))
 
 (defmethod render-node ((node parse:ratio-literal) stack context rect &key measuring)
@@ -1085,7 +1089,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
      :children (list contents)
      :focused focused
      :key-handler (when focused
-                    (global-key-handler node location)))))
+                    (make-key-handler node location)))))
 
 (defmethod render-node ((node parse::comment) stack context rect &key)
   (let* ((location (car stack))
@@ -1103,7 +1107,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
      :hoverable t
      :focused focused
      :key-handler (when focused
-                    (global-key-handler node location)))))
+                    (make-key-handler node location)))))
 
 (defmethod render-node ((node parse:literal) stack context rect &key)
   (render-literal-text node (format nil "~a" (parse:str node)) stack context rect))
@@ -1215,7 +1219,7 @@ rest indented by 1, keeping keywords in pairs."
                                                :cols width
                                                :y (tui:rect-y2 arg1-rect))
                                rect)
-                        :key-handler (global-key-handler (parse:name node) div-loc)
+                        :key-handler (make-key-handler (parse:name node) div-loc)
                         :focused (location= div-loc (focus context)))))
        (unless measuring
          (setf (gethash (parse:name node) (node-views context)) line-view)
@@ -1234,7 +1238,7 @@ rest indented by 1, keeping keywords in pairs."
                                         (tui:rect-rows arg2-rect)))
                rect)
         :children (list arg1-view line-view arg2-view)
-        :key-handler (global-key-handler node location)
+        :key-handler (make-key-handler node location)
         :focused (location= location (focus context)))))
     ;; need wrapper for args
     ((and op (not nil))
@@ -1324,7 +1328,7 @@ rest indented by 1, keeping keywords in pairs."
                                           (if arg2-bracketed 1 0)))
                  rect)
           :children (list arg1-view op-view arg2-view)
-          :key-handler (global-key-handler node location)
+          :key-handler (make-key-handler node location)
           :focused (location= location (focus context))))))
     (_
      (let* ((location (car stack))
@@ -1340,7 +1344,7 @@ rest indented by 1, keeping keywords in pairs."
         :location location
         :rect real-rect
         :children (list render)
-        :key-handler (global-key-handler node location)
+        :key-handler (make-key-handler node location)
         :focused (location= location (focus context)))))))
 
 ;;; macro calls
@@ -1441,7 +1445,7 @@ rest indented by 1, keeping keywords in pairs."
      :location location
      :children (list view)
      :rect (tui:rect view)
-     :key-handler (global-key-handler node location)
+     :key-handler (make-key-handler node location)
      :focused (location= location (focus context)))))
 
 ;;; quasiquote
@@ -1468,7 +1472,7 @@ rest indented by 1, keeping keywords in pairs."
                             :rows (tui:rect-rows view-rect)
                             :cols (+ (tui:rect-cols op-rect) (tui:rect-cols view-rect)))
             rect)
-     :key-handler (global-key-handler node location)
+     :key-handler (make-key-handler node location)
      :focused (location= location (focus context)))))
 
 ;;
@@ -1655,7 +1659,7 @@ pairs building new elements of &rest and &body slots."))
      :location location
      :children (list vertical)
      :rect (tui:rect vertical)
-     :key-handler (global-key-handler node location)
+     :key-handler (make-key-handler node location)
      :focused (location= location (focus context)))))
 
 (defun register-layout (layout)
@@ -1884,7 +1888,7 @@ ASSUMES we never focus a plain list body."
                                           :key (lambda (c)
                                                  (tui:rect-cols (tui:rect c)))))
             rect)
-     :key-handler (global-key-handler node location)
+     :key-handler (make-key-handler node location)
      :focused (location= location (focus context)))))
 
 ;;; completions
@@ -2049,7 +2053,7 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
              (root (make-instance 'ordered-view
                     :rect (tui:make-rect :x 0 :y 0 :rows height :cols cols)
                     :children (mapcar #'segment-view segments)
-                    :key-handler (global-key-handler forms location)
+                    :key-handler (make-key-handler forms location)
                     :focused nil))
              ;; y-offset relative to the staging coordinates
              (viewport (max 0 (min initial-viewport (- height rows)))))
@@ -2113,7 +2117,21 @@ as `viewport'."
        (let* ((stack (view-stack view))
               (node (node-at (car stack)))
               (rect (staging-to-absolute-coordinates (tui:rect view) viewport buffer-rect))
-              (real-stack-len (1- (length stack)))
+              (real-stack-len (count-if-not
+                                (lambda (l)
+                                  (trivia:match (location-node l)
+                                    ;; determined by indent
+                                    ((and (class parse:irregular-form) node)
+                                     (let ((id (location-id l)))
+                                       (cond
+                                         ((symbolp id) t)
+                                         ((listp id)
+                                          (when (and (<= (length id) 2)
+                                                     (parse:location-sort node
+                                                      (append-id id 0)))
+                                            t)))))
+                                    ((class parse:reader-marker) t)))
+                               stack))
               (i (cond
                    ((<= 0 real-stack-len (1- (length *grayramp*)))
                     (truncate (svref *grayramp*

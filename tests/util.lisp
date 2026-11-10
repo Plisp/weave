@@ -87,7 +87,7 @@
 (defun press (ui &rest keys)
   (dolist (key keys ui)
     (lines ui)
-    (funcall (w::global-key-handler (w::node-at (w::focus ui)) (w::focus ui))
+    (funcall (w::make-key-handler (w::node-at (w::focus ui)) (w::focus ui))
              nil (event key) ui)))
 
 (defun focus-path (ui)

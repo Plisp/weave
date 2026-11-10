@@ -479,17 +479,22 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defun id-slot (id)
   (if (consp id) (car id) id))
 
-;; don't error so that a user may probe locations prior to there being something there.
+;; Don't error so that a user may probe locations prior to there being something there.
+;; Unlike get-location, there's no good reason to compute in absolute syntax indices,
+;; so no ast interface is provided. Use path-at for conversion where necessary.
+;; The raw syntax return value is used by the method `update' ((node macro-call))
 (defgeneric location-sort (node id)
   (:documentation "Sort lookups are total: an invalid id gives NIL.
-A method may return the contents at `id' as a second value, NIL when absent.")
+A method may return the ast at `id' as a second value, NIL when absent.
+Note: at macro calls, this returns raw syntax, similarly to get-location.")
   (:method (node id) (declare (ignore node id)) nil))
 
 (defun locsort (location)
   (location-sort (location-node location) (location-id location)))
 
 (defgeneric get-location (node id)
-  (:documentation "Returns the current value at `id'."))
+  (:documentation "Returns the current value at `id'. Note: this is raw syntax
+from macro-calls. Use node-at instead."))
 
 (defmethod get-location ((node anchor) id)
   (error "Invalid location ~s in ~s" id node))
@@ -3661,12 +3666,18 @@ Returns NIL when the call is unparseable or fails to expand."
   (trivia:match id
     ((eql 'op) (values 'symbol-ref (op node)))
     ((list* (eql 'body) indices)
-     (let ((thing (gen-tree-ref (body node) indices)))
-       (values (cond
-                 ((typep thing 'binder) 'binder)
-                 ((gethash thing (subforms node)) 'eval-form)
-                 (thing 'unevaluated))
-               thing)))))
+     (labels ((macro-tree-ref (tree path)
+                "gen-tree-ref but accounting for tabled forms"
+                (cond
+                  ((null path) (values (if (binder-p tree) 'binder 'unevaluated) tree))
+                  ((gen-list-p tree)
+                   (let ((next (gen-nth (car path) tree)))
+                     (if-let (thing (gethash next (subforms node)))
+                       (if (null (cdr path)) (values 'eval-form next) nil)
+                       (if (null next) nil (macro-tree-ref next (cdr path))))))
+                  ;; gone too far
+                  (t nil))))
+       (macro-tree-ref (body node) indices)))))
 
 (defmethod suffix-path ((node function-code) suffix)
   (when suffix
