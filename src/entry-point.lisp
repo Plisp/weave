@@ -103,7 +103,9 @@ If `define-packages' is true, also evaluates top-level defpackage forms."
       (unwind-protect (tui:run tui
                                :redisplay-on-input t ; :mouse :hover
                                )
-        (slog *log-stop*)))))
+        (slog *log-stop*)
+        (format *terminal-io* "~c]110;#ffffff~c" #\esc (code-char 7))
+        (format *terminal-io* "~c]111;#000000~c" #\esc (code-char 7))))))
 
 (defun main (&optional (file (first (uiop/image:command-line-arguments))))
   (multiple-value-bind (ast system component end length package)
