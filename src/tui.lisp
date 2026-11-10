@@ -11,8 +11,6 @@
 ;; note: redisplays are automatically aborted upon return from the debugger, so the only
 ;;       obligation of render-state is not to leave invalid records in the caches.
 ;;       e.g. node-views must be overwritten with up-to-date entries
-;;       TODO check if an offscreen focus can be ghost-drawn due to measuring,
-;;            doesn't matter atm since we wrap aggressively
 ;; note: debugger code must NOT error, catch any printing errors
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
@@ -308,7 +306,7 @@ construction, do not modify."))
   (car (stack buffer)))
 
 ;;; rendering helpers
-(defgeneric render-node (node stack context rect &key &allow-other-keys)
+(defgeneric render-node (node stack context rect &key measuring &allow-other-keys)
   (:documentation "Drawn contents MUST fit within the provided `rect'."))
 
 (defvar *render-environments*)
@@ -423,7 +421,7 @@ construction, do not modify."))
                        when (typep comment 'parse::comment)
                        collect (make-location :node node :id (list :comment slot index))))))
 
-(defun render-trailing-comments (view comments stack context rect)
+(defun render-trailing-comments (view comments stack context rect &rest keys)
   (if (null comments)
       view
       (multiple-value-bind (x y)
@@ -435,8 +433,8 @@ construction, do not modify."))
                                  do (unless firstp
                                       (tui:pad 1))
                                     (tui:place (bounds)
-                                      (render-node (node-at location)
-                                       (cons location stack) context bounds)))))
+                                      (apply #'render-node (node-at location)
+                                             (cons location stack) context bounds keys)))))
                (end (tui:rect trailing)))
           (make-instance 'tui:view
            :children (list view trailing)
@@ -450,7 +448,7 @@ construction, do not modify."))
                                            (tui:rect-y rect)))
                   rect))))))
 
-(defmethod render-node :around (node stack context rect &rest keys &key)
+(defmethod render-node :around (node stack context rect &rest keys &key measuring)
   (unless (typep node '(or ref-list list))
     (setf keys (remove-from-plist keys :layout-rule)))
   (let ((comments (anchored-comment-locations node))
@@ -460,23 +458,26 @@ construction, do not modify."))
              (setf vals
                    (multiple-value-list
                      (apply #'call-next-method node stack context bounds keys)))
-             (render-trailing-comments (first vals) trailing stack context bounds)))
+             (apply #'render-trailing-comments (first vals) trailing stack context bounds
+                    keys)))
       (let* ((combined (if comments
                            (tui:with-vertical (rect)
                              (dolist (location comments)
                                (tui:place (rect)
-                                 (render-node (node-at location)
-                                  (cons location stack) context rect)))
+                                 (apply #'render-node (node-at location)
+                                        (cons location stack) context rect keys)))
                              (tui:place (rect)
                                (render-form rect)))
                            (render-form rect)))
              (view (first vals)))
-        ;; for future comment completion
-        (setf (gethash node (node-views context)) view)
+        ;; save view for anchoring
+        (unless measuring
+          (setf (gethash node (node-views context)) view)
+          (when (location= (car stack) (focus context))
+            (setf (gethash :focus-view (redisplay-cache context)) view)))
+        ;; save for event handling
         (when (typep view 'ast-view)
           (setf (view-stack view) stack))
-        (when (location= (car stack) (focus context))
-          (setf (gethash :focus-view (redisplay-cache context)) view))
         (values-list (cons combined (rest vals)))))))
 
 ;;; event handling
@@ -559,9 +560,9 @@ since these aren't a proper location."
     ((or < > <= >= = /=) 1)))
 
 (defun is-binop-call (node)
-  (and (typep node 'parse:function-call)
-       (typep (parse:name node) 'parse:symbol-ref)
-       (find (parse:resolve (parse:name node)) *arb-arity-binops*)))
+  (trivia:match node
+    ((class parse:function-call :name (and (class parse:symbol-ref) op))
+     (find (parse:resolve op) *arb-arity-binops*))))
 
 ;;; hole
 ;; note: holes only replace symbols or evaluation contexts
@@ -674,7 +675,7 @@ since these aren't a proper location."
                     (global-key-handler node location))
      :focused focused)))
 
-(defun render-symbol-space (op loc stack context rect)
+(defun render-symbol-space (op loc stack context rect measuring)
   "Renders the string designator `op' under `loc', with a space after it
 unless specified in *reader-punctuation*."
   (let* ((text (if-let (exp (assoc-value *reader-punctuation* op))
@@ -694,7 +695,7 @@ unless specified in *reader-punctuation*."
                 :focused focused)))
     (tui:puts* text 1 1 rect)
     (setf (view-stack view) (cons loc stack))
-    (when focused
+    (when (and focused (not measuring))
       (setf (gethash :focus-view (redisplay-cache context)) view))
     view))
 
@@ -812,7 +813,8 @@ Uses shared scratch cells and clears the touched scratch area on exit."
   (let* ((tui::*put-buffer* (ensure-measurement-scratch rect))
          (touched rect))
     (unwind-protect (setf touched
-                          (tui:rect (apply #'render-node node stack context rect keys)))
+                          (tui:rect (apply #'render-node node stack context rect
+                                           (list* :measuring t keys))))
       (loop for y from (tui:rect-y touched) below (tui:rect-y2 touched)
             do (loop for x from (tui:rect-x touched) below (tui:rect-x2 touched)
                      for cell = (aref tui::*put-buffer* y x)
@@ -927,7 +929,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
 
 (defmethod render-node
   ((l ref-list) stack context rect
-   &key indent delimited layout-rule (transform #'identity))
+   &key measuring indent delimited layout-rule (transform #'identity))
   "If `delimited' is true, the contents are drawn with `*list-delimiters*' surrounding,
 recursively unless `delimited' is :shallow. It's opening parens is selectable."
   (let* ((location (car stack))
@@ -950,7 +952,9 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                                 '(:delimited t))
                             :transform ,transform
                             ,@(when (functionp indent)
-                                `(:indent ,indent))))
+                                `(:indent ,indent))
+                            ,@(when measuring
+                                `(:measuring t))))
                     (spec (if indent
                               indent
                               (ref-list-indentation (elements l)
@@ -962,10 +966,10 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                       *horizontal*
                       (lambda (index)
                         (nth index comments))
-                      stack context rect nil))
+                      stack context rect (list :measuring measuring)))
                    (render-elements (elements l)
                     spec (list-locator contents-location) contents-stack context rect
-                    keys)))))
+                    (list* :measuring measuring keys))))))
       (if (and delimited (not (parse:unary-reader-marker-p head)))
           (let* ((handle (make-location :node l :id :open))
                  (open (render-delimiter open-text
@@ -1020,11 +1024,12 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
 
 ;; for body lists
 (defmethod render-node
-  ((l list) stack context rect &key (indent *horizontal*) delimited layout-rule)
+  ((l list) stack context rect &key measuring (indent *horizontal*) delimited layout-rule)
   (let* ((location (car stack))
          (view (render-elements l
                 indent (list-locator location) (cdr stack) context rect
-                (list :delimited delimited :layout-rule layout-rule))))
+                (list :measuring measuring :delimited delimited :layout-rule
+                      layout-rule))))
     (setf (tui:key-handler view) (global-key-handler l location)
           (tui:focused view) (location= location (focus context)))
     view))
@@ -1058,20 +1063,22 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                     (global-key-handler node location))
      :focused focused)))
 
-(defmethod render-node ((node parse:ratio-literal) stack context rect &key)
+(defmethod render-node ((node parse:ratio-literal) stack context rect &key measuring)
   (let* ((location (car stack))
          (focused (location= location (focus context)))
          (contents (tui:with-horizontal (rect)
                      (tui:place (rect)
                        (render-node (parse:numerator-node node)
                         (cons (make-location :node node :id 'parse:numerator-node) stack)
-                        context rect))
+                        context rect
+                        :measuring measuring))
                      (tui:place (rect)
                        (render-literal-line "/" stack context rect))
                      (tui:place (rect)
                        (render-node (parse:denominator-node node)
                         (cons (make-location :node node :id 'parse:denominator-node) stack)
-                        context rect)))))
+                        context rect
+                        :measuring measuring)))))
     (make-instance 'ast-view
      :rect (tui:rect contents)
      :location location
@@ -1180,20 +1187,22 @@ rest indented by 1, keeping keywords in pairs."
          (cons '(0 . 1) ; name
                (append (greedy (subseq widths 0 keyword-start)) '((1 . 2)))))))))
 
-(defmethod render-node ((node parse:function-call) stack context rect &key)
+(defmethod render-node ((node parse:function-call) stack context rect &key measuring)
   (trivia:match (and (= 2 (length (parse:body node))) (is-binop-call node))
     ;; note this case must go first since division is a binop
     ('/
      (let* ((location (car stack))
             (arg1-view (render-node (first (parse:body node))
                         (cons (make-location :node node :id '(parse:body 0)) stack) context
-                        rect))
+                        rect
+                        :measuring measuring))
             (arg1-rect (tui:rect arg1-view))
             (arg2-view (render-node (second (parse:body node))
                         (cons (make-location :node node :id '(parse:body 1)) stack) context
                         (tui:clamp-rect
                           (tui:copy-rect rect :y (1+ (tui:rect-y2 arg1-rect)))
-                         rect)))
+                         rect)
+                        :measuring measuring))
             (arg2-rect (tui:rect arg2-view))
             (width (1+ (max (tui:rect-cols arg1-rect) (tui:rect-cols arg2-rect))))
             (div-loc (make-location :node node :id 'parse:name))
@@ -1208,10 +1217,11 @@ rest indented by 1, keeping keywords in pairs."
                                rect)
                         :key-handler (global-key-handler (parse:name node) div-loc)
                         :focused (location= div-loc (focus context)))))
-       (setf (gethash (parse:name node) (node-views context)) line-view)
+       (unless measuring
+         (setf (gethash (parse:name node) (node-views context)) line-view)
+         (when (and (location= div-loc (focus context)))
+           (setf (gethash :focus-view (redisplay-cache context)) line-view)))
        (setf (view-stack line-view) (cons div-loc stack))
-       (when (location= div-loc (focus context))
-         (setf (gethash :focus-view (redisplay-cache context)) line-view))
        (tui:puts* (make-string width :initial-element #\─) (1+ (tui:rect-rows arg1-rect)) 1
                   rect)
        ;;
@@ -1241,16 +1251,19 @@ rest indented by 1, keeping keywords in pairs."
                               context
                               (tui:clamp-rect
                                 (tui:copy-rect rect :x (1+ (tui:rect-x rect)))
-                               rect))
+                               rect)
+                              :measuring measuring)
                              (render-node arg1
                               (cons (make-location :node node :id '(parse:body 0)) stack)
-                              context rect)))
+                              context rect
+                              :measuring measuring)))
               (arg1-rect (tui:rect arg1-view))
               (op-view (render-node (parse:name node)
                         (cons (make-location :node node :id 'parse:name) stack) context
                         (tui:clamp-rect
                           (tui:copy-rect rect :x (1+ (tui:rect-x2 arg1-rect)))
-                         rect)))
+                         rect)
+                        :measuring measuring))
               (op-rect (tui:rect op-view))
               (arg2 (second (parse:body node)))
               (arg2-bracketed (is-bracketed arg2))
@@ -1259,7 +1272,8 @@ rest indented by 1, keeping keywords in pairs."
                           context
                           (tui:clamp-rect
                             (tui:copy-rect rect :x (1+ (tui:rect-x2 op-rect)))
-                           rect)))
+                           rect)
+                          :measuring measuring))
               (arg2-rect (tui:rect arg2-view)))
          ;; draw parens
          (when arg1-bracketed
@@ -1320,7 +1334,7 @@ rest indented by 1, keeping keywords in pairs."
                        (if (zerop index)
                            (make-location :node node :id 'parse:name)
                            (make-location :node node :id (list 'parse:body (1- index)))))
-                     stack context rect nil))
+                     stack context rect (list :measuring measuring)))
             (real-rect (tui:rect render)))
        (make-instance 'ast-view
         :location location
@@ -1394,7 +1408,7 @@ rest indented by 1, keeping keywords in pairs."
                    (push (cons row-indent (+ count (if (cdr tail) 1 0))) rows))))
     (or (nreverse rows) '((0 . 1)))))
 
-(defmethod render-node ((node parse:macro-call) stack context rect &key)
+(defmethod render-node ((node parse:macro-call) stack context rect &key measuring)
   (let* ((location (car stack))
          (elements (cons (parse:op node) (parse:body node)))
          (locate (lambda (index)
@@ -1421,7 +1435,8 @@ rest indented by 1, keeping keywords in pairs."
                  ((getf rule :header) `((0 . ,(1+ (getf rule :header))) (1 . 1)))
                  (t (macro-call-indentation (parse:op node) (buffer-package context)))))
          (view (render-elements elements
-                spec locate stack context rect (list* :layout-rule rule keys))))
+                spec locate stack context rect
+                (list* :measuring measuring :layout-rule rule keys))))
     (make-instance 'ast-view
      :location location
      :children (list view)
@@ -1430,14 +1445,15 @@ rest indented by 1, keeping keywords in pairs."
      :focused (location= location (focus context)))))
 
 ;;; quasiquote
-(defmethod render-node ((node parse:quasiquote-form) stack context rect &key)
+(defmethod render-node ((node parse:quasiquote-form) stack context rect &key measuring)
   (let* ((location (car stack))
          (op-view (render-symbol-space 'parse:read-quasiquote
-                   (make-location :node node :id 'parse:op) stack context rect))
+                   (make-location :node node :id 'parse:op) stack context rect measuring))
          (op-rect (tui:rect op-view))
          (view (render-node (parse:thing node)
                 (cons (make-location :node node :id 'parse:thing) stack) context
                 (tui:clamp-rect (tui:copy-rect rect :x (tui:rect-x2 op-rect)) rect)
+                :measuring measuring
                 :delimited t
                 :indent (lambda (elements)
                           (let ((spec (macro-call-indentation (first elements)
@@ -1572,7 +1588,7 @@ pairs building new elements of &rest and &body slots."))
     (&rest (list :indent *vertical* :delimited :shallow))
     (t (list :indent *vertical*))))
 
-(defun render-setf-function-name (node stack context rect)
+(defun render-setf-function-name (node stack context rect measuring)
   (tui:with-horizontal (rect)
     (tui:place (rect)
       (render-literal-line "(" stack context rect))
@@ -1581,55 +1597,59 @@ pairs building new elements of &rest and &body slots."))
         (tui:pad 1))
       (tui:place (rect)
         (render-node (funcall slot node)
-         (cons (make-location :node node :id slot) stack) context rect)))
+         (cons (make-location :node node :id slot) stack) context rect
+         :measuring measuring)))
     (tui:place (rect)
       (render-literal-line ")" stack context rect))))
 
-(defun render-layout-slot (node item stack context rect)
+(defun render-layout-slot (node item stack context rect measuring)
   (cond
     ((consp item)
      (destructuring-bind (slot spec)
          item
        (apply #'render-node (funcall slot node)
               (cons (make-location :node node :id slot) stack) context rect
+              :measuring measuring
               :indent spec
               (slot-render-keys node slot))))
     ((eq item 'parse:op)
      (render-symbol-space (parse:op node)
-      (make-location :node node :id 'parse:op) stack context rect))
+      (make-location :node node :id 'parse:op) stack context rect measuring))
     ((and (eq item 'parse:name)
           (typep node '(or parse:defun-form parse:defmethod-form))
           (slot-boundp node 'parse:setf-op))
-     (render-setf-function-name node stack context rect))
+     (render-setf-function-name node stack context rect measuring))
     ((symbolp item)
      (apply #'render-node (funcall item node)
             (cons (make-location :node node :id item) stack) context rect
+            :measuring measuring
             (slot-render-keys node item)))
     (t (cerror "unexpected layout element ~a" item))))
 
-(defun render-horizontal-layout (node across-layout stack context rect)
+(defun render-horizontal-layout (node across-layout stack context rect measuring)
   (tui:with-horizontal (rect)
     (dolist (item across-layout)
       (if (integerp item)
           (tui:pad item)
           (tui:place (rect)
-            (render-layout-slot node item stack context rect))))))
+            (render-layout-slot node item stack context rect measuring))))))
 
-(defun render-vertical-layout (node down-layout stack context rect)
+(defun render-vertical-layout (node down-layout stack context rect measuring)
   (tui:with-vertical (rect)
     (dolist (item down-layout)
       (cond
         ((integerp item) (tui:pad item))
         ((consp item)
          (tui:place (rect)
-           (render-horizontal-layout node item stack context rect)))
+           (render-horizontal-layout node item stack context rect measuring)))
         (t
          (tui:place (rect)
-           (render-layout-slot node item stack context rect)))))))
+           (render-layout-slot node item stack context rect measuring)))))))
 
-(defmethod render-node ((node parse:irregular-form) stack context rect &key)
+(defmethod render-node ((node parse:irregular-form) stack context rect &key measuring)
   (let* ((layout (gethash (type-of node) *layouts*))
-         (vertical (render-vertical-layout node (layout-rows layout) stack context rect))
+         (vertical (render-vertical-layout node
+                    (layout-rows layout) stack context rect measuring))
          (location (car stack)))
     (make-instance 'ast-view
      :location location
@@ -1808,11 +1828,12 @@ ASSUMES we never focus a plain list body."
 
 ;;; function-code (lambda-list, documentation and body, shared by defun/defmacro/
 ;;; defmethod/lambda/flet/labels), including declarations.
-(defmethod render-node ((node parse:function-code) stack context rect &key)
+(defmethod render-node ((node parse:function-code) stack context rect &key measuring)
   (let* ((location (car stack))
          (lambda-list-view (render-node (parse:lambda-list node)
                             (cons (make-location :node node :id 'parse:lambda-list) stack)
                             context rect
+                            :measuring measuring
                             :delimited t
                             :indent *horizontal*))
          (ll-rect (tui:rect lambda-list-view))
@@ -1825,7 +1846,8 @@ ASSUMES we never focus a plain list body."
                               (tui:copy-rect rect
                                              :x (tui:rect-x rect)
                                              :y (tui:rect-y2 ll-rect))
-                             rect))))
+                             rect)
+                            :measuring measuring)))
          (declarations-y (if docstring-view
                              (tui:rect-y2 (tui:rect docstring-view))
                              (tui:rect-y2 ll-rect)))
@@ -1835,6 +1857,7 @@ ASSUMES we never focus a plain list body."
                                      stack)
                                context
                                (tui:clamp-rect (tui:copy-rect rect :y declarations-y) rect)
+                               :measuring measuring
                                :indent *vertical*
                                :delimited t)))
          (body-y (if declarations-view
@@ -1845,7 +1868,7 @@ ASSUMES we never focus a plain list body."
                      stack context
                      (tui:clamp-rect (tui:copy-rect rect :x (tui:rect-x rect) :y body-y)
                       rect)
-                     nil))
+                     (list :measuring measuring)))
          (children (remove nil
                            (list lambda-list-view docstring-view declarations-view
                                  body-view))))
@@ -1890,7 +1913,8 @@ ASSUMES we never focus a plain list body."
   (when-let (state (completion-state buffer))
     (let* ((bounds (tui:screen-rect))
            (anchor (anchor state))
-           (anchor-rect (node-screen-rect buffer anchor))
+           (anchor-rect (or (node-screen-rect buffer anchor)
+                            (return-from render-completion-window)))
            (package-prefix (or (symbol-ref-prefix anchor (buffer-package buffer)) ""))
            (maxlen (loop for candidate across (candidates state)
                          maximize (tui-sys:display-width (string candidate))))
@@ -2077,10 +2101,9 @@ as `viewport'."
 
 (defun node-screen-rect (buffer node)
   "Returns the clipped screen rect for `node' in `buffer'."
-  (if-let (view (gethash node (node-views buffer)))
+  (when-let (view (gethash node (node-views buffer)))
     (staging-to-absolute-coordinates (tui:rect view)
-     (scroll-state-viewport (scroll-state buffer)) (buffer-rect buffer))
-    (error "no staged view corresponding to ~a" node)))
+     (scroll-state-viewport (scroll-state buffer)) (buffer-rect buffer))))
 
 (defun draw-semantic-backgrounds (buffer view viewport buffer-rect)
   "`viewport' is relative to the `buffer's staging area and hence all rendered node views."

@@ -462,11 +462,13 @@ addressed by indices."
 (defun build-arglist (fname &optional old-body)
   (let* ((arglist (when (fboundp fname)
                     (slynk-backend:arglist fname)))
-         (argcount (if (proper-list-p arglist)
-                       (loop for a in arglist
-                             until (member a lambda-list-keywords)
-                             count t)
-                       0)))
+         (argcount (cond
+                     ((not (proper-list-p arglist)) 0) ; macro
+                     ((eq fname '+) 1)
+                     (t
+                      (loop for a in arglist
+                            until (member a lambda-list-keywords)
+                            count t)))))
     (append old-body
             (loop for i below (max 0 (- argcount (length old-body)))
                   collect (make-instance 'hole :inlay (string-downcase (nth i arglist)))))))
@@ -559,8 +561,8 @@ addressed by indices."
         (let ((ref (node-at (focus buffer))))
           (when (and (eq 'parse:eval-form (locsort (focus buffer)))
                      (or (typep ref 'parse:symbol-ref)
-                         (and (typep ref 'hole)
-                              (or (string= (text ref) "+") (string= (text ref) "-")))))
+                         (trivia:match ref
+                           ((class hole :text (or (string (or #\+ #\-)))) t))))
             (when (typep ref 'hole)
               (setf ref
                     (make-instance 'parse:symbol-ref
