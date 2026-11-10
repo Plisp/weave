@@ -255,7 +255,7 @@ construction, do not modify."))
    (buffer-state :mutable t :type buffer-state)
    (render-state :init (make-render-state) :mutable t :type render-state)
    ;; (node . cols) -> indentation spec
-   (indent-cache :init (make-hash-table :test #'equal) :type hash-table))
+   (indent-cache :init (make-hash-table :test #'equalp) :type hash-table))
   (:representation :class))
 
 (defrecord debug-state ()
@@ -1129,7 +1129,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
     (indent:operator-section-start (parse:resolve name) '(&key))))
 
 (defun function-call-indentation (node stack context rect)
-  (ensure-gethash (cons node (tui:rect-cols rect))
+  (ensure-gethash (cons node rect)
    (indent-cache context) (function-call-indentation-uncached node stack context rect)))
 
 (defun function-call-indentation-uncached (node stack context rect)
@@ -1163,8 +1163,8 @@ rest indented by 1, keeping keywords in pairs."
                (loop with used = 0
                      with count = 0
                      with rows = nil
-                     ;; include indenting space
-                     with limit = (max 1 (- *column-limit* 1 (tui:rect-x rect)))
+                     ;; subtract one for the indenting space
+                     with limit = (max 1 (1- rect-limit))
                      for width in widths
                      while width
                      do (when (and (plusp count) (> (+ used 1 width) limit))
