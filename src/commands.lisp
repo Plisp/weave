@@ -565,10 +565,27 @@ addressed by indices."
     (when (< (selection state) (length (candidates state)))
       (expand-symbol (aref (candidates state) (selection state)) buffer))))
 
+(defun commit-quoted-sign (buffer)
+  (let ((node (node-at (focus buffer))))
+    (when (and (typep node 'hole)
+               (member (text node) '("+" "-") :test #'string=)
+               (eq (locsort (focus buffer)) 'parse:unevaluated)
+               (some (lambda (location)
+                       (typep (location-node location)
+                              '(or parse:quote-form parse:quasiquote-form)))
+                     (stack buffer)))
+      (swap-node (focus buffer)
+                 (make-instance 'parse:symbol-ref
+                  :name (text node)
+                  :home-package (buffer-package buffer))
+                 buffer)
+      t)))
+
 (setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
       (lambda (view buffer)
         (declare (ignore view))
         (or (accept-completion nil buffer)
+            (commit-quoted-sign buffer)
             (let ((node (node-at (focus buffer))))
               (when (typep node 'parse:symbol-ref)
                 (let ((symbol (parse:resolve node)))
@@ -686,13 +703,73 @@ addressed by indices."
              buffer)
   (start-completion nil buffer))
 
+(defun quasiquote-depth (stack)
+  "Counts reader quasiquotes surrounding the location at the top of `stack'."
+  (let ((depth 0))
+    (dolist (location (reverse stack) depth)
+      (let ((node (location-node location)) (id (location-id location)))
+        (when (and (typep node 'parse:quasiquote-form)
+                   (eq (if (consp id) (first id) id) 'parse:thing))
+          (incf depth))
+        (when (and (consp id) (symbolp (first id)))
+          (loop with prefix = (first id)
+                for index in (rest id)
+                for value = (node-at (make-location :node node :id prefix))
+                do (when (and (eql index 1) (typep value 'ref-list)
+                              (typep (first (elements value)) 'parse:reader-marker))
+                     (case (parse:resolve (first (elements value)))
+                       ((parse:read-quasiquote eclector.reader:quasiquote) (incf depth))
+                       ((eclector.reader:unquote eclector.reader:unquote-splicing)
+                        (decf depth))))
+                   (setf prefix (append-id prefix index))))))))
+
+(defun unquote-marker (splice)
+  (make-instance 'parse:reader-marker
+   :name (if splice "UNQUOTE-SPLICING" "UNQUOTE")
+   :home-package (find-package :eclector.reader)))
+
+(defun splice-unquote (location buffer)
+  (let ((id (location-id location)))
+    (when (and (consp id) (eql (car (last id)) 1))
+      (let* ((parent (make-location :node (location-node location) :id (parent-id id)))
+             (form (node-at parent)))
+        (when (and (typep form 'ref-list)
+                   (typep (first (elements form)) 'parse:reader-marker)
+                   (eq (parse:resolve (first (elements form))) 'eclector.reader:unquote))
+          (swap-node parent (ref-list (unquote-marker t) (second (elements form))) buffer)
+          (refocus buffer (append-id (location-id (focus buffer)) 1))
+          t)))))
+
 (defmethod handle-key :around ((node hole) view location buffer event)
   (let ((c (tui-sys:event-kind event)))
-    (if (and (is-regular-char-event event)
-             (member (locsort location) '(parse:eval-form parse:unevaluated string))
-             (start-literal node location buffer c))
-        t
-        (call-next-method))))
+    (cond
+      ((and (is-regular-char-event event) (eql c #\,)
+            (zerop (length (text node))) (plusp (quasiquote-depth (stack buffer))))
+       (swap-node location (ref-list (unquote-marker nil) (hole)) buffer)
+       (refocus buffer (append-id (location-id (focus buffer)) 1))
+       t)
+      ((and (is-regular-char-event event) (eql c #\@)
+            (zerop (length (text node))) (splice-unquote location buffer)) t)
+      ((and (is-regular-char-event event)
+            (eql c #\`)
+            (member (locsort location) '(parse:eval-form parse:unevaluated)))
+       (let ((quoted (make-instance 'parse:quasiquote-form
+                      :op 'parse:read-quasiquote
+                      :thing (hole))))
+         (swap-node location
+                    (if (eq (locsort location) 'parse:unevaluated)
+                        (parse:to-syntax quoted)
+                        quoted)
+                    buffer)
+         (if (typep (node-at (focus buffer)) 'parse:quasiquote-form)
+             (descend buffer 'parse:thing)
+             (refocus buffer (append-id (location-id (focus buffer)) 1))))
+       t)
+      ((and (is-regular-char-event event)
+            (member (locsort location) '(parse:eval-form parse:unevaluated string))
+            (start-literal node location buffer c))
+       t)
+      (t (call-next-method)))))
 
 (defmethod handle-key ((node hole) view location buffer event)
   (let ((c (tui-sys:event-kind event)))
@@ -1271,6 +1348,20 @@ already and focuses the hole."
 (setf (gethash (tui-sys:make-event :kind #\rubout) *layout-key-handlers*) #'layout-rubout
       (gethash (tui-sys:make-event :kind #\space) *layout-key-handlers*) #'layout-space
       (gethash (tui-sys:make-event :kind #\() *layout-key-handlers*) #'layout-wrap)
+
+(defmethod handle-key ((node parse:quasiquote-form) view location buffer event)
+  (when (is-regular-char-event event)
+    (let* ((stack (stack buffer))
+           (loc (car stack))
+           (id (location-id loc)))
+      (case (tui:event-kind event)
+        (#\space
+         (insert-or-jump (make-location :node node :id (parent-id id))
+                         (1+ (lastcar id)) buffer stack)
+         t)
+        (#\( (wrap-in-list loc buffer stack) t)
+        (#\rubout
+         (rubout-tree-slot loc stack buffer))))))
 
 ;;; lambdas
 (defparameter *fun-code-key-handlers* (make-hash-table :test #'equal))
