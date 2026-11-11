@@ -373,8 +373,45 @@ Must NOT perform context side effects if `measuring'."))
     (or (gethash (location-id loc) (environment-table (location-node loc)))
         (environment-at-uncached stack))))
 
+(defun function-definitions (stack buffer)
+  "Indexes lexical function definitions by binder identity along `stack'."
+  (let ((table (ensure-gethash :function-definitions
+                (redisplay-cache buffer) (make-hash-table :test #'eq))))
+    (dolist (location stack)
+      (let* ((node (location-node location))
+             (definitions (typecase node
+                            ((or parse:flet-form parse:labels-form) (parse:funs node))
+                            (parse:macrolet-form (parse:macro-defs node)))))
+        (when definitions
+          (dolist (definition (elements definitions))
+            (let ((parts (elements definition)))
+              (when (and (typep (first parts) 'parse:binder)
+                         (typep (second parts) 'parse:function-code))
+                (setf (gethash (first parts) table) (second parts))))))))
+    table))
+
+(defun function-signature (name stack buffer)
+  "Returns `name's lambda-list and whether it has a lexical binding."
+  (multiple-value-bind (entry kind)
+      (parse:env-lookup name :function (environment-at-uncached stack))
+    (if (eq kind :lexical)
+        (let ((code (gethash (ensure-car entry) (function-definitions stack buffer))))
+          (values (when code
+                    (mapcar (lambda (parameter)
+                              (typecase parameter
+                                (parse:symbol-ref
+                                 (or (parse:resolve parameter)
+                                     (make-symbol (parse:name parameter))))
+                                (t nil)))
+                            (elements (parse:lambda-list code))))
+                  t))
+        (let ((symbol (if (symbolp name) name (parse:resolve name))))
+          (values (when (and symbol (fboundp symbol))
+                    (slynk-backend:arglist symbol))
+                  nil)))))
+
 (defun compute-focus-binder (node stack buffer)
-  (declare (ignore buffer))
+  (function-definitions stack buffer)
   (let ((loc (car stack)))
     (when (parse:lexical-symbol-ref node loc)
       (let ((kind (cond
@@ -856,7 +893,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                  (when-let (rule (getf keys :layout-rule))
                    (and (listp rule) rule))))
       (when (eq (getf rule :break) :mandatory)
-        (return-from ref-list-indentation '((0 . 1))))
+        (return-from ref-list-indentation '((0 . t))))
       (when (getf rule :compact-body)
         (return-from ref-list-indentation
          (if (compact-layout-p elements rule locate stack context rect keys)
@@ -864,7 +901,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
              *vertical*))))
     (let ((rule (getf keys :layout-rule)))
       (when (and (listp rule) (getf rule :header))
-        (return-from ref-list-indentation `((0 . ,(1+ (getf rule :header))) (0 . 1))))
+        (return-from ref-list-indentation `((0 . ,(1+ (getf rule :header))) (0 . t))))
       ;;
       (when (and (listp rule) (eq (getf rule :break) :linear))
         (let* ((head (apply #'measure-node (funcall transform (first elements))
@@ -919,7 +956,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
           do (when (and (> (tui:rect-rows measured) 1)
                         (not (let ((rule (getf keys :layout-rule)))
                                (and (listp rule) (eq (getf rule :style) :list)))))
-               (return-from ref-list-indentation '((0 . 1))))
+               (return-from ref-list-indentation '((0 . t))))
              ;; line wrap
              (when (and (plusp count) (> (+ used gap size) max-width))
                (push (cons 0 count) rows)
@@ -1118,15 +1155,11 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
 ;; - unary operators have space removed
 ;; - for 2 arguments, draw *arb-arity-binops* infix
 ;;   - higher arity duplicated op views break invariant: always a single focused view
-(defun function-keyword-start (node stack)
+(defun function-keyword-start (node stack buffer)
   "Returns the positional argument count before &key, or NIL if not present."
   (let ((name (parse:name node)))
-    (unless (typep name 'parse:symbol-ref)
-      (return-from function-keyword-start nil))
-    (when (eq :lexical
-              (nth-value 1 (parse:env-lookup name :function (environment-at stack))))
-      (return-from function-keyword-start nil))
-    (indent:operator-section-start (parse:resolve name) '(&key))))
+    (when (typep name 'parse:symbol-ref)
+      (lambda-list-section-start (function-signature name stack buffer) '(&key)))))
 
 (defun function-call-indentation (node stack context rect)
   (ensure-gethash (cons node rect)
@@ -1155,7 +1188,8 @@ rest indented by 1, keeping keywords in pairs."
                                                       :id (list 'parse:body index))
                                                      stack)
                                                context bound))))
-         (keyword-start (function-keyword-start node stack)))
+         ;; TODO changes to function bindings should invalidate cache of children
+         (keyword-start (function-keyword-start node stack context)))
     (labels ((fits (widths)
                (<= (+ (reduce #'+ widths :initial-value 0) (max 0 (1- (length widths))))
                    rect-limit))
@@ -1920,22 +1954,35 @@ ASSUMES we never focus a plain list body."
            (anchor-rect (or (node-screen-rect buffer anchor)
                             (return-from render-completion-window)))
            (package-prefix (or (symbol-ref-prefix anchor (buffer-package buffer)) ""))
+           (prefixes (map 'vector
+                          (lambda (candidate)
+                            (if (plusp (length package-prefix))
+                                package-prefix
+                                (or (symbol-ref-prefix
+                                      (make-instance 'parse:symbol-ref
+                                       :name (symbol-name candidate)
+                                       :home-package (symbol-package candidate))
+                                     (buffer-package buffer))
+                                    "")))
+                          (candidates state)))
            (maxlen (loop for candidate across (candidates state)
-                         maximize (tui-sys:display-width (string candidate))))
+                         for prefix across prefixes
+                         maximize (+ (tui-sys:display-width prefix)
+                                     (tui-sys:display-width (string candidate)))))
            (rect (tui:clamp-rect
                    (tui:make-rect
                                   :x (tui:rect-x anchor-rect)
                                   :y (tui:rect-y2 anchor-rect)
                                   :rows (tui:rect-rows bounds)
-                                  :cols (+ (tui-sys:display-width package-prefix) maxlen))
+                                  :cols maxlen)
                   bounds)))
       (let ((view (tui:with-vertical (rect)
                     (loop for candidate across (candidates state)
+                          for prefix across prefixes
                           for index from 0
                           until (tui:full)
                           do (tui:place (rect)
-                               (render-completion candidate
-                                index state rect package-prefix))))))
+                               (render-completion candidate index state rect prefix))))))
         (setf (tui:key-handler view) #'handle-completion-key)
         view))))
 

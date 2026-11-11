@@ -1727,7 +1727,7 @@
       (with-output-to-string (stream)
         (weave-serialization:serialize (list (parse "(alexandria:once-only (x) (print x) x)"))
                          stream :package *package*)))
-  (is = 1 (weave-indentation:lambda-list-section-start
+  (is = 1 (weave-utils:lambda-list-section-start
            '(&whole form x &environment env &body body) '(&body &rest))))
 
 (defun serialization-keyword-example (&key alpha beta)

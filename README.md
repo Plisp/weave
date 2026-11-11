@@ -32,8 +32,8 @@ In emacs, sly-connect to 4005 and
 
 ### Keybindings:
 * `Space` inserts or moves to the next hole
-* `Tab` triggers completion, use ctrl-n/p to select
-* `Enter` expands the symbol/completion at point into a call, useful for locals
+* `Tab/Backtab` scroll completions
+* `Enter` expands the symbol/completion at point into a call
 * `Ctrl-n/p/b/f` (and arrow keys) move by atom and goal column
 * `Alt-n/p` move by parent stack
 * `Alt-P` move by parent until reaching a non-evaluated position

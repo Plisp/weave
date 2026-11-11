@@ -441,7 +441,10 @@ addressed by indices."
                             (hole-path node slot)))
                (dolist (id path)
                  (descend buffer id))
-               (return)))))
+               (return))
+          finally (cond
+                    ((typep node 'parse:function-call) (descend buffer 'parse:name))
+                    ((typep node 'parse:macro-call) (descend buffer 'parse:op))))))
 
 (setf (gethash (tui-sys:make-event :kind #\space) *global-key-handlers*)
       (lambda (view buffer)
@@ -459,23 +462,40 @@ addressed by indices."
                  (cons (make-location :node newroot :id (1+ i)) (rest stack)) newroot)))))))
 
 ;;; completion
-(defun build-arglist (fname &optional old-body)
-  (let* ((arglist (when (fboundp fname)
-                    (slynk-backend:arglist fname)))
-         (argcount (cond
-                     ((not (proper-list-p arglist)) 0) ; macro
-                     ((eq fname '+) 1)
-                     (t
-                      (loop for a in arglist
-                            until (member a lambda-list-keywords)
-                            count t)))))
+(defun build-arglist
+  (fname
+   &optional old-body
+             (arglist (when (fboundp fname)
+                        (slynk-backend:arglist fname)))
+             lexicalp)
+  (let* ((required (nth-value 1
+                              (lambda-list-section-start arglist
+                               (set-difference lambda-list-keywords
+                                '(&whole &environment)))))
+         (count (if (and (not lexicalp) (eq fname '+)) 1 (length required))))
     (append old-body
-            (loop for i below (max 0 (- argcount (length old-body)))
-                  collect (make-instance 'hole :inlay (string-downcase (nth i arglist)))))))
+            (loop for i from (length old-body) below count
+                  for parameter = (nth i required)
+                  collect (make-instance 'hole
+                           :inlay (if (and parameter (symbolp parameter))
+                                      (string-downcase parameter)
+                                      "hole"))))))
 
-(defun build-call (ref &optional old-body)
+(defun build-call (ref &optional old-body buffer)
   "ref must be a symbol-ref"
   (check-type ref parse:symbol-ref)
+  (when buffer
+    (multiple-value-bind (signature lexicalp)
+        (function-signature ref (stack buffer) buffer)
+      (when lexicalp
+        (return-from build-call
+         (parse::parse (apply #'ref-list (parse:copy-node ref)
+                              (build-arglist (parse:resolve ref)
+                               (mapcar (lambda (node)
+                                         (parse:copy-syntax (parse:to-syntax node)))
+                                       old-body)
+                               signature t))
+                       (environment-at-uncached (stack buffer)) #'parse::copy-anchors)))))
   (let ((fname (parse:resolve ref)))
     (if-let (expansion (gethash fname *default-expansions*))
       (funcall expansion)
@@ -484,25 +504,25 @@ addressed by indices."
                             (mapcar (lambda (form)
                                       (parse:copy-syntax (parse:to-syntax form)))
                                     old-body)))))
-        (handler-case (slog (parse:parse-syntax syntax))
+        (handler-case (parse:parse-syntax syntax)
           (parse:ast-parse-error ()
             nil))))))
 
 (defun expand-symbol (s buffer)
   "Expands the symbol-ref `s' to an appropriate operator call."
   (cond
-    ((fboundp s)
+    ((or (fboundp s) (nth-value 1 (function-signature s (stack buffer) buffer)))
      (let ((name-node (make-instance 'parse:symbol-ref
                        :name (symbol-name s)
                        :home-package (symbol-package s)))
            (sort (locsort (focus buffer))))
        (case sort
          (parse:eval-form
-          (when-let (call (build-call name-node))
+          (when-let (call (build-call name-node nil buffer))
             (swap-node (focus buffer) call buffer)
             (focus-first-hole buffer)))
          (parse:unevaluated
-          (when-let (call (build-call name-node))
+          (when-let (call (build-call name-node nil buffer))
             (swap-node (focus buffer) (parse:to-syntax call) buffer)
             (focus-first-hole buffer)))
          (parse:fun-designator
@@ -510,14 +530,14 @@ addressed by indices."
             (parse:function-form
              (if (eq s 'lambda)
                  (progn
-                   (swap-node (focus buffer) (build-call name-node) buffer)
+                   (swap-node (focus buffer) (build-call name-node nil buffer) buffer)
                    (focus-first-hole buffer))
                  (swap-node (focus buffer) name-node buffer)))
             (parse:function-call
              (when (eq (locsort (second (stack buffer))) 'parse:eval-form)
                (when-let (call
                           (build-call name-node
-                           (parse:body (location-node (focus buffer)))))
+                           (parse:body (location-node (focus buffer))) buffer))
                  (swap-node (second (stack buffer)) call buffer)
                  (focus-first-hole buffer))))))
          (t t))))
@@ -548,12 +568,17 @@ addressed by indices."
 (setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
       (lambda (view buffer)
         (declare (ignore view))
-        (let ((node (node-at (focus buffer))))
-          (when (typep node 'parse:symbol-ref)
-            (let ((symbol (parse:resolve node)))
-              (when (and symbol
-                         (or (fboundp symbol) (gethash symbol *default-expansions*)))
-                (expand-symbol symbol buffer)))))))
+        (or (accept-completion nil buffer)
+            (let ((node (node-at (focus buffer))))
+              (when (typep node 'parse:symbol-ref)
+                (let ((symbol (parse:resolve node)))
+                  (when (and symbol
+                             (or (fboundp symbol)
+                                 (gethash symbol *default-expansions*)
+                                 (nth-value 1
+                                            (function-signature node
+                                             (stack buffer) buffer))))
+                    (expand-symbol symbol buffer))))))))
 
 (setf (gethash (tui-sys:make-event :kind #\newline) *default-key-handlers*)
       (lambda (view buffer)
@@ -569,7 +594,7 @@ addressed by indices."
                      :name (text ref)
                      :home-package (buffer-package buffer))))
             ;;
-            (when-let (call (build-call ref))
+            (when-let (call (build-call ref nil buffer))
               (swap-node (focus buffer) call buffer)
               (focus-first-hole buffer)
               t)))))
@@ -689,12 +714,6 @@ addressed by indices."
            ((digit-char-p c)
             (let ((newnode (make-instance 'parse:integer-literal :str (string c))))
               (swap-node location newnode buffer)))
-           ;; TODO needs to deal with comma depth and insertion
-           ;; ((char= c #\`)
-           ;;  (let ((newnode (make-instance 'parse:quasiquote-form :thing (hole))))
-           ;;    (swap-node location newnode buffer)
-           ;;    (focus-first-hole buffer)
-           ;;    t))
            ((char= c #\')
             (let ((newnode (make-instance 'parse:quote-form
                             :op 'parse:read-quote
@@ -874,23 +893,36 @@ addressed by indices."
 
 ;;; symbols
 (defun completion-candidates (buffer &optional (node (node-at (focus buffer))))
-  "Collects visible symbols, or the visibility suggested by `node's package prefix."
+  "Collects accessible and globally exported symbols for unqualified name prefixes.
+A package prefix on `node' restricts candidates to that package and visibility."
   (let* ((prefix (and (typep node 'parse:symbol-ref)
                       (symbol-ref-prefix node (buffer-package buffer))))
          (package (if prefix (parse:home-package node) (buffer-package buffer)))
          (result (make-array 0 :adjustable t :fill-pointer 0))
          (seen (make-hash-table :test #'eq)))
-    (unless package
-      (return-from completion-candidates result))
     ;;
-    (do-symbols (symbol package)
-      (when (and (not (gethash symbol seen))
-                 (or (null prefix)
-                     (eq (nth-value 1 (find-symbol (symbol-name symbol) package))
-                         (if (ends-with-subseq "::" prefix) :internal :external))))
-        (setf (gethash symbol seen) t)
-        (unless (zerop (length (string symbol)))
-          (vector-push-extend symbol result))))
+    (flet ((collect (symbol)
+             (when (and (plusp (length (symbol-name symbol))) (not (gethash symbol seen)))
+               (setf (gethash symbol seen) t)
+               (vector-push-extend symbol result))))
+      (if prefix
+          (when package
+            (do-symbols (symbol package)
+              (when (or (null prefix)
+                        (eq (nth-value 1 (find-symbol (symbol-name symbol) package))
+                            (if (ends-with-subseq "::" prefix) :internal :external)))
+                (collect symbol))))
+          ;; no prefix
+          (progn
+            (dolist (entry
+                     (parse::function-bindings (environment-at-uncached (stack buffer))))
+              (let ((name (ensure-car entry)))
+                (when (and (typep name 'parse:symbol-ref) (parse:home-package name))
+                  (collect (intern (parse:name name) (parse:home-package name))))))
+            (dolist (loaded (list-all-packages))
+              (do-external-symbols (symbol loaded)
+                (unless (keywordp symbol)
+                  (collect symbol)))))))
     result))
 
 (defmethod handle-key ((node parse:symbol-ref) view location buffer event)
@@ -1037,27 +1069,39 @@ if none, surround current atom"
              :candidates (completion-candidates buffer node)))
       t)))
 
-(setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
-      #'accept-completion
-      (gethash (tui-sys:make-event :kind #\tab) *global-key-handlers*) #'accept-completion)
+(defun cycle-completion (buffer backwards)
+  (when-let (state (completion-state buffer))
+    (let ((count (length (candidates state))))
+      (when (plusp count)
+        (setf (completion-state buffer)
+              (copy-completion-state state
+               :selection (mod (+ (selection state) (if backwards -1 1)) count)))))
+    t))
 
-(remhash (tui-sys:make-event :kind #\tab :shiftp t) *global-key-handlers*)
+(defun completion-tab-p (event)
+  (and (not (or (tui-sys:event-altp event) (tui-sys:event-metap event)))
+       (or (and (eql (tui-sys:event-kind event) #\Tab)
+                (not (tui-sys:event-controlp event)))
+           (and (tui-sys:event-controlp event)
+                (member (tui-sys:event-kind event) '(#\i #\I))))))
 
 (defun handle-completion-key (view event buffer)
   (declare (ignore view))
-  (when (and buffer
-             (tui-sys:event-controlp event)
-             (not (or (tui-sys:event-altp event) (tui-sys:event-metap event)))
-             (member (tui-sys:event-kind event) '(#\n #\p)))
-    (when-let (state (completion-state buffer))
-      (let ((count (length (candidates state))))
-        (when (plusp count)
-          (setf (completion-state buffer)
-                (copy-completion-state state
-                 :selection (mod (+ (selection state)
-                                    (if (char= (tui-sys:event-kind event) #\n) 1 -1))
-                                 count)))))
-      t)))
+  (when buffer
+    (cond
+      ((completion-tab-p event) (cycle-completion buffer (tui-sys:event-shiftp event)))
+      ((and (eql (tui-sys:event-kind event) #\Newline)
+            (not (or (tui-sys:event-controlp event)
+                     (tui-sys:event-altp event)
+                     (tui-sys:event-metap event))))
+       (accept-completion nil buffer)))))
+
+(setf (gethash (tui-sys:make-event :kind #\i :controlp t) *global-key-handlers*)
+      (lambda (view buffer)
+        (or (cycle-completion buffer nil) (start-completion view buffer)))
+      (gethash (tui-sys:make-event :kind #\Tab :shiftp t) *global-key-handlers*)
+      (lambda (view buffer)
+        (or (cycle-completion buffer t) (start-completion view buffer))))
 
 ;;; macros
 (defparameter *macro-call-key-handlers* (make-hash-table :test #'equal))

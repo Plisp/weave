@@ -20,7 +20,8 @@
            #:defrecord
            #:shallow-copy-record
            #:with-timing
-           #:strcat))
+           #:strcat
+           #:lambda-list-section-start))
 
 (in-package #:weave-utils)
 
@@ -226,3 +227,24 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
           do (replace out str :start1 i)
              (incf i (length str)))
     out))
+
+(defun lambda-list-section-start (arglist keywords)
+  "Counts positional parameters before a member of `keywords' in `arglist'.
+Returns the preceding parameters as a second value."
+  (when (proper-list-p arglist)
+    (loop with count = 0
+          with parameters = nil
+          for tail on arglist
+          for parameter = (car tail)
+          do (when (member parameter keywords)
+               (return (values count (nreverse parameters))))
+             (case parameter
+               ((&rest &body &whole &environment) (pop tail))
+               (&aux (return nil))
+               ((&optional &allow-other-keys))
+               (otherwise
+                (when (member parameter lambda-list-keywords)
+                  (return nil))
+                (push parameter parameters)
+                (incf count)))
+          finally (return (values nil (nreverse parameters))))))

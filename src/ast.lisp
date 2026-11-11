@@ -140,6 +140,7 @@
   ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
    (home-package :type (or null package))
+   ;; note: if set, this corresponds to home-package
    (input-prefix :init nil :type (or null string)))
   (:documentation "Represents a symbol, possibly referring to a symbol macro."))
 

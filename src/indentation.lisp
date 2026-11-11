@@ -2,7 +2,6 @@
   (:use #:cl #:alexandria-2 #:weave-utils #:weave-parser)
   (:export #:loop-indentation
            #:find-loop-keyword
-           #:lambda-list-section-start
            #:operator-section-start
            #:indent-rule
            #:*indent-rules*))
@@ -75,23 +74,6 @@ its first are aligned with the first, and a loop without keywords has a line per
                         (member (name element) *loop-operand-keywords* :test #'string=))
                    previous element))
     (nreverse rows)))
-
-(defun lambda-list-section-start (arglist keywords)
-  "Counts positional parameters before a member of `keywords' in `arglist'."
-  (when (proper-list-p arglist)
-    (loop with count = 0
-          for tail on arglist
-          for parameter = (car tail)
-          do (when (member parameter keywords)
-               (return count))
-             (case parameter
-               ((&rest &body &whole &environment) (pop tail))
-               (&aux (return nil))
-               ((&optional &allow-other-keys))
-               (otherwise
-                (when (member parameter lambda-list-keywords)
-                  (return nil))
-                (incf count))))))
 
 (defun operator-section-start (symbol keywords)
   "Counts positional args before `keywords' in `symbol's global lambda list."
