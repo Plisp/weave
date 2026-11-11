@@ -315,7 +315,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 
 ;; these two are the main entry points for editing
 (defun swap-node (location newnode buffer)
-  "saves undo history, removes spine from render cache"
+  "saves undo history, removes spine from render cache. Returns the new focus."
   (when (eq (location-id location) :open)
     (setf location (second (member location (stack buffer) :test #'location=))))
   (when (or (null (edit-loc buffer)) (not (location= location (edit-loc buffer))))
@@ -707,7 +707,8 @@ addressed by indices."
   "Counts reader quasiquotes surrounding the location at the top of `stack'."
   (let ((depth 0))
     (dolist (location (reverse stack) depth)
-      (let ((node (location-node location)) (id (location-id location)))
+      (let ((node (location-node location))
+            (id (location-id location)))
         (when (and (typep node 'parse:quasiquote-form)
                    (eq (if (consp id) (first id) id) 'parse:thing))
           (incf depth))
@@ -715,7 +716,8 @@ addressed by indices."
           (loop with prefix = (first id)
                 for index in (rest id)
                 for value = (node-at (make-location :node node :id prefix))
-                do (when (and (eql index 1) (typep value 'ref-list)
+                do (when (and (eql index 1)
+                              (typep value 'ref-list)
                               (typep (first (elements value)) 'parse:reader-marker))
                      (case (parse:resolve (first (elements value)))
                        ((parse:read-quasiquote eclector.reader:quasiquote) (incf depth))
@@ -743,13 +745,18 @@ addressed by indices."
 (defmethod handle-key :around ((node hole) view location buffer event)
   (let ((c (tui-sys:event-kind event)))
     (cond
-      ((and (is-regular-char-event event) (eql c #\,)
-            (zerop (length (text node))) (plusp (quasiquote-depth (stack buffer))))
+      ((and (is-regular-char-event event)
+            (eql c #\,)
+            (zerop (length (text node)))
+            (plusp (quasiquote-depth (stack buffer))))
        (swap-node location (ref-list (unquote-marker nil) (hole)) buffer)
        (refocus buffer (append-id (location-id (focus buffer)) 1))
        t)
-      ((and (is-regular-char-event event) (eql c #\@)
-            (zerop (length (text node))) (splice-unquote location buffer)) t)
+      ((and (is-regular-char-event event)
+            (eql c #\@)
+            (zerop (length (text node)))
+            (splice-unquote location buffer))
+       t)
       ((and (is-regular-char-event event)
             (eql c #\`)
             (member (locsort location) '(parse:eval-form parse:unevaluated)))
@@ -1040,11 +1047,13 @@ A package prefix on `node' restricts candidates to that package and visibility."
               (replace-ref "" home (strcat prefix ":"))))
            t)
           ((symbol-char-p c)
-           (if (string= ":" name) ; keyword
-               (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":")
-               (replace-ref (strcat name (string (char-upcase c))) home prefix nil)))
+           (cond ((parse:unary-reader-marker-p node) nil)
+                 ((string= ":" name) ; keyword
+                  (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":"))
+                 (t (replace-ref (strcat name (string (char-upcase c))) home prefix nil))))
           ((char= c #\Rubout)
            (cond
+             ((parse:unary-reader-marker-p node) nil)
              ((plusp (length name))
               (if (and (= 1 (length name)) (null prefix))
                   (swap-node location (hole) buffer)
@@ -1056,9 +1065,9 @@ A package prefix on `node' restricts candidates to that package and visibility."
                   (swap-node location (hole) buffer)
                   (progn
                     (replace-ref (subseq prefix 0 (1- (length prefix)))
-                     (buffer-package buffer) nil)
-                    (setf (completion-state buffer) nil)))))
-           t))))))
+                                 (buffer-package buffer) nil)
+                    (setf (completion-state buffer) nil)))
+              t))))))))
 
 (defmethod handle-key ((node parse:binder) view location buffer event)
   (when (is-regular-char-event event)
@@ -1185,17 +1194,14 @@ if none, surround current atom"
 
 (defmethod handle-key ((node parse:macro-call) view location buffer event)
   (declare (ignore view))
-  (when-let ((handler (gethash event *macro-call-key-handlers*)))
-    (let ((i (position-if
-               (lambda (l)
-                 (location= location l))
-              (stack buffer))))
-      (unless (zerop i)
-        (funcall handler (nthcdr (1- i) (stack buffer)) buffer)))))
+  (when-let ((handler (gethash event *macro-call-key-handlers*))
+             (stack (member node (stack buffer) :key #'location-node)))
+    (funcall handler stack buffer)))
 
 (defun wrap-in-list (loc buffer stack)
   "Wraps the value at `loc' in a syntax list, adding a hole afterwards unless it is
-already and focuses the hole."
+already and focuses the hole. Saves history and returns a true value."
+  (save-history buffer)
   (let ((holep (typep (node-at loc) 'hole)))
     (edit-list loc
                (lambda (thing)
@@ -1209,9 +1215,7 @@ already and focuses the hole."
       (lambda (stack buffer)
         (let ((loc (car stack)))
           (when (macro-body-id-p (location-id loc))
-            (save-history buffer)
-            (wrap-in-list loc buffer stack)
-            t))))
+            (wrap-in-list loc buffer stack)))))
 
 (setf (gethash (tui-sys:make-event :kind #\space) *macro-call-key-handlers*)
       (lambda (stack buffer)
@@ -1250,13 +1254,9 @@ already and focuses the hole."
 (defmethod handle-key ((node parse:irregular-form) view location buffer event)
   (declare (ignore view))
   (when-let ((layout (gethash (type-of node) *layouts*))
-             (handler (gethash event *layout-key-handlers*)))
-    (let ((i (position-if
-               (lambda (l)
-                 (location= location l))
-              (stack buffer))))
-      (unless (zerop i)
-        (funcall handler layout (nthcdr (1- i) (stack buffer)) buffer)))))
+             (handler (gethash event *layout-key-handlers*))
+             (stack (member node (stack buffer) :key #'location-node)))
+    (funcall handler layout stack buffer)))
 
 (defun layout-rubout (layout stack buffer)
   "Deletes the focused element of a list slot, or restores the slot to its template."
@@ -1266,6 +1266,13 @@ already and focuses the hole."
          (slot (ensure-car id))
          (template (layout-template layout slot)))
     (cond
+      ;; special case for no initializer (NIL)
+      ((and (typep node '(or parse:let-form parse:let*-form))
+            (consp id) (eq slot 'parse:vars) (= (length id) 3)
+            (= (third id) 1) (typep (node-at loc) 'hole))
+       (save-history buffer)
+       (ast-delete (make-location :node node :id (parent-id id)) 1 buffer stack)
+       t)
       (template
        (let ((rest-loc (make-location :node node :id slot)))
          (flet ((reset ()
@@ -1341,40 +1348,62 @@ already and focuses the hole."
   (let ((loc (car stack)))
     (when (member (slot-kind layout (ensure-car (location-id loc)))
                   '(parse::&tree parse::&declarations))
-      (save-history buffer)
-      (wrap-in-list loc buffer stack)
-      t)))
+      (wrap-in-list loc buffer stack))))
 
 (setf (gethash (tui-sys:make-event :kind #\rubout) *layout-key-handlers*) #'layout-rubout
       (gethash (tui-sys:make-event :kind #\space) *layout-key-handlers*) #'layout-space
       (gethash (tui-sys:make-event :kind #\() *layout-key-handlers*) #'layout-wrap)
 
+(defun under-qq-reader-wrapper-p (node id)
+  (and (not (symbolp id))
+       (let ((ref (parse:get-location node (parent-id id))))
+         (and (gen-list-p ref)
+              (parse:unary-reader-marker-p (parse::gen-car ref))))))
+
+(defun outer-qq-reader-wrapper-id (node id)
+  (if (under-qq-reader-wrapper-p node id)
+      (outer-qq-reader-wrapper-id node (parent-id id))
+      id))
+
 (defmethod handle-key ((node parse:quasiquote-form) view location buffer event)
   (when (is-regular-char-event event)
-    (let* ((stack (stack buffer))
-           (loc (car stack))
-           (id (location-id loc)))
-      (case (tui:event-kind event)
-        (#\space
-         (insert-or-jump (make-location :node node :id (parent-id id))
-                         (1+ (lastcar id)) buffer stack)
-         t)
-        (#\( (wrap-in-list loc buffer stack) t)
-        (#\rubout
-         (rubout-tree-slot loc stack buffer))))))
+    ;; cannot expose unevaluated source into a parent evaluated location
+    ;; TODO be more permissive in unevaluated source, also for quote
+    (when-let ((stack (member node (stack buffer) :key #'location-node)))
+      (let* ((loc (car stack))
+             (id (location-id loc)))
+        (unless (eq id 'parse:op)
+          (case (tui-sys:event-kind event)
+            (#\space
+             (let ((id (outer-qq-reader-wrapper-id node id)))
+               (when (consp id)
+                 (insert-or-jump (make-location :node node :id (parent-id id))
+                                 (1+ (lastcar id)) buffer stack))))
+            (#\rubout
+             (cond
+               ((not (under-qq-reader-wrapper-p node id))
+                (if (eq (locsort loc) 'parse:eval-form)
+                    (progn (rubout-eval-form buffer) t)
+                    (rubout-tree-slot loc stack buffer)))
+               ((zerop (id-index id))
+                (let ((wrapper (make-location :node node :id (parent-id id))))
+                  (swap-node wrapper (second (elements (node-at wrapper))) buffer)))
+               ((typep (node-at loc) 'hole)
+                (rubout-tree-slot (make-location :node node
+                                                 :id (outer-qq-reader-wrapper-id node id))
+                                  stack buffer))))
+            (#\(
+             (unless (eq (locsort loc) 'parse:eval-form)
+               (wrap-in-list loc buffer stack)))))))))
 
 ;;; lambdas
 (defparameter *fun-code-key-handlers* (make-hash-table :test #'equal))
 
 (defmethod handle-key ((node parse:function-code) view location buffer event)
   (declare (ignore view))
-  (when-let ((handler (gethash event *fun-code-key-handlers*)))
-    (let ((i (position-if
-               (lambda (l)
-                 (location= location l))
-              (stack buffer))))
-      (unless (zerop i)
-        (funcall handler (nthcdr (1- i) (stack buffer)) buffer)))))
+  (when-let ((handler (gethash event *fun-code-key-handlers*))
+             (stack (member node (stack buffer) :key #'location-node)))
+    (funcall handler stack buffer)))
 
 (setf (gethash (tui-sys:make-event :kind #\rubout) *fun-code-key-handlers*)
       (lambda (stack buffer)
@@ -1413,9 +1442,7 @@ already and focuses the hole."
         (let ((loc (car stack)))
           (trivia:match (location-id loc)
             ((list* (eql 'parse:declarations) _)
-             (save-history buffer)
-             (wrap-in-list loc buffer stack)
-             t)
+             (wrap-in-list loc buffer stack))
             ((or (list (eql 'parse:lambda-list) (type integer))
               (list (eql 'parse:lambda-list) (type integer) (type integer)))
              (save-history buffer)
@@ -1448,6 +1475,12 @@ already and focuses the hole."
                (node (location-node loc))
                (ll-loc (make-location :node node :id 'parse:lambda-list)))
           (trivia:match (location-id loc)
+            ((list (eql 'parse:body) (type integer))
+             (when (location= loc (focus buffer))
+               (if (and (= (length (parse:body node)) 1)
+                        (typep (node-at loc) 'hole))
+                   t
+                   (rubout-eval-form buffer))))
             ((list* (eql 'parse:declarations) _) (rubout-tree-slot loc stack buffer))
             ((list (eql 'parse:lambda-list) (and (type integer) i))
              (save-history buffer)

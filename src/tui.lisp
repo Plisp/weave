@@ -543,6 +543,9 @@ since these aren't a proper location."
 (defun global-key-handler (view event buffer node location)
   "redefinition hook for key handling"
   (slog* (format nil "event: ~a" event))
+  (slog* (format nil "focus: ~a" (if (<= 2 (length (stack buffer)))
+                                     (car (stack buffer))
+                                     "stack too small")))
   (assert (location= location (focus buffer)))
   ;; (slog (butlast (stack buffer))) ; suppress toplevel list
   (or (when-let (handler (gethash event *global-key-handlers*))
@@ -551,7 +554,7 @@ since these aren't a proper location."
       (loop for thisnode = node then (location-node location)
             for location in (stack buffer)
             thereis (when (handle-key thisnode view location buffer event)
-                      (slog* `(handled-at ,node))
+                      (slog* `(handled-at ,thisnode))
                       t))
       ;; contextual handlers
       (when-let (handler (gethash event *default-key-handlers*))

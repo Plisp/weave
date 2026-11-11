@@ -1309,11 +1309,12 @@ last position is a return value rather than documentation."
 
 (defun declaration-specials (declarations)
   (loop for declaration in declarations
-        append (loop for spec in (gen-cdr declaration)
-                     when (and (gen-list-p spec)
-                               (typep (gen-car spec) 'symbol-like)
-                               (eq (ref-coerce-symbol (gen-car spec)) 'special))
-                     append (gen-cdr spec))))
+        when (gen-list-p declaration)
+          append (loop for spec in (gen-cdr declaration)
+                       when (and (gen-list-p spec)
+                                 (typep (gen-car spec) 'symbol-like)
+                                 (eq (ref-coerce-symbol (gen-car spec)) 'special))
+                         append (gen-cdr spec))))
 
 ;;
 ;;; parsing
@@ -1518,7 +1519,7 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
                                                                                             new-value))
                                                                                       i)))))
                           update-clauses))
-                   ;; a &body slot is an ordinary list of the forms it holds
+                   ;; a &body slot is an ordinary list
                    ((&body &rest-qualifiers)
                     (push `((list (eql ',part) (and (type integer) i)) (nth i
                                                                             (,part node)))
