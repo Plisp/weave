@@ -172,10 +172,10 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
               (defclass ,name ,superclasses
                 ,(loop for (slot-name initform slot-type mutable) in parsed-slots
                        collect `(,slot-name :initarg ,(make-keyword slot-name) :initform
-                                  ,initform :type ,slot-type
-                                  ,@(if mutable
-                                        `(:accessor ,slot-name)
-                                        `(:reader ,slot-name))))
+                                 ,initform :type ,slot-type
+                                 ,@(if mutable
+                                       `(:accessor ,slot-name)
+                                       `(:reader ,slot-name))))
                 ,@(when seen-documentation
                     `((:documentation ,documentation))))
               ;; constructor
@@ -191,13 +191,13 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
              (error "Structures support single inheritance only."))
            `(progn
               (defstruct (,name (:copier nil)
-                           ,@(when superclasses
-                               `((:include ,(first superclasses)))))
+                          ,@(when superclasses
+                              `((:include ,(first superclasses)))))
                 ,@(when seen-documentation
                     `(,documentation))
                 ,@(loop for (slot-name initform slot-type mutable) in parsed-slots
                         collect `(,slot-name ,initform :type ,slot-type :read-only
-                                   ,(not mutable))))
+                                  ,(not mutable))))
               ',name)))))))
 
 (defun shallow-copy-record (record)

@@ -213,7 +213,8 @@
          (listp (or data
                     lambdap
                     (eq (getf spec :style) :list)
-                    (not (eq (kind node) :list))))
+                    (not (eq (kind node) :list))
+                    (not (typep (first elements) 'symbol-ref))))
          (header (getf spec :header))
          (body-start (and header (1+ header)))
          (body-break (if (getf spec :compact-body)

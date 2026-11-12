@@ -178,7 +178,7 @@
                              (lambda (body)
                                (let ((elts (elements body)))
                                  `(,@(subseq elts 0 index) ,@forms
-                                    ,@(subseq elts (1+ index)))))
+                                   ,@(subseq elts (1+ index)))))
                              (append-id slot index) buffer stack)))
               (progn
                 (save-history buffer)
@@ -274,7 +274,7 @@ forms past the end of a selection taking the sort of its last position."
                                  (lambda (body)
                                    (let ((elts (elements body)))
                                      `(,@(subseq elts 0 low) ,@forms
-                                        ,@(subseq elts (1+ high)))))
+                                       ,@(subseq elts (1+ high)))))
                                  (zipper-stack zipper))))))
 
 (defun paste-zipper (buffer zipper)
@@ -292,7 +292,7 @@ modifying the ast."
                        (lambda (body)
                          (let ((elts (elements body)))
                            `(,@(subseq elts 0 low) ,(fill-zipper zipper forms)
-                              ,@(subseq elts (1+ high)))))
+                             ,@(subseq elts (1+ high)))))
                        (append-id slot low) buffer (stack buffer))))
         (when (eq 'parse:eval-form (locsort focus))
           (swap-node focus (fill-zipper zipper (list (node-at focus))) buffer)))

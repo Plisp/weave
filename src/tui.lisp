@@ -1754,7 +1754,8 @@ ASSUMES we never focus a plain list body."
                          (make-instance 'parse:function-code
                           :lambda-list-kind :lambda
                           :lambda-list (ref-list)
-                          :body (list (hole))))) (parse:body . (hole)))
+                          :body (list (hole)))))
+   (parse:body . (hole)))
   (parse:op parse:funs)
   (1 parse:decls)
   (1 parse:body))
@@ -1765,7 +1766,8 @@ ASSUMES we never focus a plain list body."
                          (make-instance 'parse:function-code
                           :lambda-list-kind :lambda
                           :lambda-list (ref-list)
-                          :body (list (hole))))) (parse:body . (hole)))
+                          :body (list (hole)))))
+   (parse:body . (hole)))
   (parse:op parse:funs)
   (1 parse:decls)
   (1 parse:body))
@@ -1776,7 +1778,8 @@ ASSUMES we never focus a plain list body."
               (make-instance 'parse:function-code
                :lambda-list-kind :macro-lambda
                :lambda-list (ref-list)
-               :body (list (hole))))) (parse:body . (hole)))
+               :body (list (hole)))))
+   (parse:body . (hole)))
   (parse:op parse:macro-defs)
   (1 parse:decls)
   (1 parse:body))

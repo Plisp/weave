@@ -1075,7 +1075,7 @@ A package prefix on `node' restricts candidates to that package and visibility."
            (cond
              ((parse:unary-reader-marker-p node) nil)
              ((string= ":" name) ; keyword
-               (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":"))
+              (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":"))
              (t (replace-ref (strcat name (string (char-upcase c))) home prefix nil))))
           ((char= c #\Rubout)
            (cond
