@@ -543,9 +543,10 @@ since these aren't a proper location."
 (defun global-key-handler (view event buffer node location)
   "redefinition hook for key handling"
   (slog* (format nil "event: ~a" event))
-  (slog* (format nil "focus: ~a" (if (<= 2 (length (stack buffer)))
-                                     (car (stack buffer))
-                                     "stack too small")))
+  (slog* (format nil "focus: ~a"
+                 (if (<= 2 (length (stack buffer)))
+                     (car (stack buffer))
+                     "stack too small")))
   (assert (location= location (focus buffer)))
   ;; (slog (butlast (stack buffer))) ; suppress toplevel list
   (or (when-let (handler (gethash event *global-key-handlers*))
@@ -866,7 +867,7 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                               (tui::cell-style cell) tui-sys:*default-style*))))))
 
 (defun compact-layout-p (elements rule locate stack context rect keys)
-  "Whether the complete header and single body form fit on one rendered row."
+  "Do the complete header and single body form fit on one rendered row."
   (when (and (getf rule :compact-body) (= (length elements) (+ (getf rule :header) 2)))
     (let* ((width (max 0 (min (tui:rect-cols rect) (- *column-limit* (tui:rect-x rect)))))
            (bounds (tui:copy-rect rect :y 0 :rows 2 :cols width))
@@ -1559,12 +1560,13 @@ pairs building new elements of &rest and &body slots."))
 
 (defun slot-end-position (node slot)
   "The last focusable position of `slot', or NIL."
-  (let ((value (node-at (make-location :node node :id slot))))
-    (cond
-      ((null value) nil)
-      ;; plain list bodies are never focused, see `deflayout'
-      ((listp value) (append-id slot (1- (length value))))
-      (t slot))))
+  (when (slot-boundp node slot)
+    (let ((value (node-at (make-location :node node :id slot))))
+      (cond
+        ((null value) nil)
+        ;; plain list bodies are never focused, see `deflayout'
+        ((listp value) (append-id slot (1- (length value))))
+        (t slot)))))
 
 (defun move-back (node id)
   "The position preceding `id' in `node' for deletions. Returns `id' if first."
@@ -1601,7 +1603,7 @@ pairs building new elements of &rest and &body slots."))
     (t (hole))))
 
 (defun default-node (layout)
-  "Initializes the slots of `layout', leaving unused alternative slots unbound."
+  "Initializes the slots of `layout', leaving unused alternatives and optional slots unbound."
   (apply #'make-instance (layout-op layout)
          (loop with visible = (layout-slots layout)
                with optional = (parse:form-optional-slots (layout-op layout))
@@ -1609,7 +1611,8 @@ pairs building new elements of &rest and &body slots."))
                                       (parse:form-slot-kinds (layout-op layout))
                                      :key #'car
                                      :from-end t)
-               unless (and (member slot optional) (not (member slot visible)))
+               unless (or (eq kind '&optional)
+                          (and (member slot optional) (not (member slot visible))))
                append (list (make-keyword slot)
                             (default-slot-value kind (layout-template layout slot))))))
 
@@ -1667,9 +1670,19 @@ pairs building new elements of &rest and &body slots."))
             (slot-render-keys node item)))
     (t (cerror "unexpected layout element ~a" item))))
 
+(defun bound-layout-items (node items &optional pairs)
+  "Collects bound slots among `items' and the padding before them.
+`pairs' indicates that list items are (slot spec) rather than rows."
+  (flet ((unbound-p (item)
+           (let ((slot (if (and pairs (consp item)) (car item) item)))
+             (and slot (symbolp slot) (not (slot-boundp node slot))))))
+    (loop for (item next) on items
+          unless (or (unbound-p item) (and (integerp item) (unbound-p next)))
+          collect item)))
+
 (defun render-horizontal-layout (node across-layout stack context rect measuring)
   (tui:with-horizontal (rect)
-    (dolist (item across-layout)
+    (dolist (item (bound-layout-items node across-layout t))
       (if (integerp item)
           (tui:pad item)
           (tui:place (rect)
@@ -1677,7 +1690,7 @@ pairs building new elements of &rest and &body slots."))
 
 (defun render-vertical-layout (node down-layout stack context rect measuring)
   (tui:with-vertical (rect)
-    (dolist (item down-layout)
+    (dolist (item (bound-layout-items node down-layout))
       (cond
         ((integerp item) (tui:pad item))
         ((consp item)

@@ -1926,3 +1926,60 @@
                         (key "#-weave-save-test (hidden 3) (list 2)")))
       (is eq nil (equal (key "#+weave-save-test (list 1)")
                         (key "(list 1)"))))))
+
+(define-test optional-tails :parent parser
+  (let ((form (parse "(let ((a 1) (b) c) a)")))
+    (is eq 'parse:binder (parse:location-sort form '(parse:vars 0 0)))
+    (is eq 'parse:eval-form (parse:location-sort form '(parse:vars 0 1)))
+    (is eq nil (parse:location-sort form '(parse:vars 0 2)))
+    (is equal "(LET ((A 1) (B) C) A)" (sx (parse:to-syntax form))))
+  (fail (parse "(let ((a 1 2)) a)"))
+  (fail (parse "(let* ((a 1 2)) a)"))
+  (let ((form (parse "(load-time-value (f x))")))
+    (is eq nil (slot-boundp form 'parse:read-only-p))
+    (is equal "(LOAD-TIME-VALUE (F X))" (sx (parse:to-syntax form)))
+    (is equal '(parse:form) (parse::suffix-path form '(1))))
+  (let ((form (parse "(load-time-value (f x) t)")))
+    (is eq 'parse:unevaluated (parse:location-sort form 'parse:read-only-p))
+    (is equal "(LOAD-TIME-VALUE (F X) T)" (sx (parse:to-syntax form)))
+    (is equal '(parse:read-only-p) (parse::suffix-path form '(2))))
+  (fail (parse "(load-time-value (f x) t 3)")))
+
+(define-test element-patterns :parent parser
+  (let ((form (parse "(let ((a 1) b) a)")))
+    (is equal '(parse:name &optional parse::init) (parse:rest-element-pattern form 'parse:vars 0))
+    (is eq nil (parse:rest-element-pattern form 'parse:vars 1)))
+  (let ((code (parse:fun-code (parse "(defun g (&optional (b 1) &key ((:k v) 2) (w 3) &aux (z 1)) b)"))))
+    (is equal '(parse::var &optional parse::init parse::svar)
+        (parse:lambda-list-element-pattern code '(1)))
+    (is equal '((keyword parse::var) &optional parse::init parse::svar)
+        (parse:lambda-list-element-pattern code '(3)))
+    (is equal '(keyword parse::var) (parse:lambda-list-element-pattern code '(3 0)))
+    (is equal '(parse::var &optional parse::init parse::svar)
+        (parse:lambda-list-element-pattern code '(4)))
+    (is equal '(parse::var &optional parse::init parse::svar)
+        (parse:lambda-list-element-pattern code '(6))))
+  (is equal '(parse::var parse::specializer)
+      (parse:lambda-list-element-pattern (parse:fun-code (parse "(defmethod m ((x integer)) x)")) '(0)))
+  (is eq nil (parse:lambda-list-element-pattern (parse:macro-code (parse "(defmacro m ((a b)) a)")) '(0)))
+  (is eq t (not (null (parse:pattern-allows-insertion-p '(name &optional init) 1 1))))
+  (is eq nil (parse:pattern-allows-insertion-p '(name &optional init) 2 1))
+  (is eq nil (parse:pattern-allows-insertion-p '(name &optional init) 2 2))
+  (is eq t (not (null (parse:pattern-allows-insertion-p '(name &body init) 2 1))))
+  (is eq nil (parse:pattern-allows-deletion-p '(var &optional init svar) 3 1))
+  (is eq t (not (null (parse:pattern-allows-deletion-p '(var &optional init svar) 3 2))))
+  (is eq nil (parse:pattern-allows-deletion-p '(name &lambda funcode) 2 1)))
+
+(define-test single-element-parameters-keep-their-list :parent parser
+  (is equal "(LAMBDA (&AUX (Z) (W 1) Q) Z)"
+      (sx (parse:to-syntax (parse "(lambda (&aux (z) (w 1) q) z)"))))
+  (is equal "(DEFMETHOD M ((X) Y) X)" (sx (parse:to-syntax (parse "(defmethod m ((x) y) x)")))))
+
+(define-test ordinary-lambda-lists-take-the-key-form :parent parser
+  (dolist (source '("(lambda (a &optional ((:k v) 1 s)) v)"
+                    "(lambda (a &aux ((:k v) 1 s)) v)"
+                    "(lambda (((:k v) 1 s)) v)"))
+    (let ((form (parse source)))
+      (is equal (string-upcase (remove #\: source)) (sx (parse:to-syntax form)))))
+  (fail (parse "(lambda (a &rest ((:k v) 1 s)) v)"))
+  (fail (parse "(defmethod m (((:k v) 1 s)) v)")))

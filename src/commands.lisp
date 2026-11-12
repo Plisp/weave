@@ -285,14 +285,14 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
       (multiple-value-call #'commit-edit buffer (rebuild-spine loc updater stack))))
 
 (defun refocus (buffer id)
-  "Moves the focus to another location in the node it is already within."
+  "Moves the focus to another location in the node it is already within. Returns true."
   (end-selection-mode buffer)
   (let ((loc (make-location :node (location-node (focus buffer)) :id id)))
     (setf (stack buffer) (cons loc (cdr (stack buffer))))
     loc))
 
 (defun descend (buffer id)
-  "Moves the focus to a location-id inside the currently focused node."
+  "Moves the focus to a location-id inside the currently focused node. Returns true."
   (end-selection-mode buffer)
   (let ((loc (make-location :node (node-at (focus buffer)) :id id)))
     (push loc (stack buffer))
@@ -334,7 +334,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
 
 (defun edit-list (loc updater focus-id buffer stack)
   "Replaces the list at `loc' using `updater' and focuses `focus-id'.
-Removes spine from render cache."
+Removes spine from render cache. Returns true."
   (clear-function-indent-cache stack buffer)
   (if (typep (location-node loc) 'parse:macro-call)
       (replace-in-macro-call loc (funcall updater (node-at loc)) buffer focus-id)
@@ -343,7 +343,7 @@ Removes spine from render cache."
         (refocus buffer focus-id))))
 
 (defun ast-insert (item loc index buffer &optional (stack (stack buffer)) tail)
-  "Focuses the inserted item, optionally descends the path `tail'."
+  "Focuses the inserted item, optionally descends the path `tail'. Returns true."
   (edit-list loc
              (lambda (body)
                (list-insert (elements body) item index))
@@ -351,7 +351,7 @@ Removes spine from render cache."
              stack))
 
 (defun ast-delete (loc index buffer &optional (stack (stack buffer)))
-  "assumes that list has length > 1"
+  "assumes that list has length > 1. Returns true."
   (edit-list loc
              (lambda (body)
                (list-remove (elements body) index))
@@ -360,7 +360,7 @@ Removes spine from render cache."
 (defun insert-or-jump (loc index buffer stack &key (item (hole)) tail)
   "Moves to the hole at `index' of the list at `loc' and down the ids in `tail' if passed,
 otherwise inserts `item' at `index' and focuses down `tail' within it. `stack' is the
-part of the buffer stack starting from the node of `loc'."
+part of the buffer stack starting from the node of `loc'. Returns true."
   (let ((path (cons index tail)))
     (if (typep (parse:value-at-path loc path) 'hole)
         (progn
@@ -369,6 +369,30 @@ part of the buffer stack starting from the node of `loc'."
         (progn
           (save-history buffer)
           (ast-insert item loc index buffer stack tail)))))
+
+(defun positional-insert-hole (list-loc pattern index buffer stack)
+  "Moves from `index' of the syntax list at `list-loc' to the next element, inserting a hole
+only where `pattern' allows. Returns NIL at the end of a full list."
+  (let ((length (length (elements (node-at list-loc))))
+        (next (1+ index)))
+    (cond
+      ((or (null pattern) (parse:pattern-allows-insertion-p pattern length next))
+       (insert-or-jump list-loc next buffer stack))
+      ((< next length)
+       (setf (stack buffer) stack)
+       (refocus buffer (append-id (location-id list-loc) next))))))
+
+(defun positional-delete-hole (list-loc pattern index buffer stack)
+  "Deletes the hole at `index' of the syntax list at `list-loc' where `pattern' allows.
+Returns true at a hole, consuming the event regardless of whether the deletion is allowed."
+  (let ((list (node-at list-loc)))
+    (when (typep (nth index (elements list)) 'hole)
+      (when (if pattern
+                (parse:pattern-allows-deletion-p pattern (length (elements list)) index)
+                (plusp index))
+        (save-history buffer)
+        (ast-delete list-loc index buffer stack))
+      t)))
 
 (defun replace-in-macro-call (location newnode buffer &optional focus-id)
   "Replaces the syntax at `location' in a macro call, which may reparse part of it into a
@@ -433,12 +457,13 @@ addressed by indices."
   (let ((node (node-at (focus buffer))))
     (loop for (slot . kind) in (parse:form-slot-kinds (type-of node))
           do (when-let (path
-                        (if (and (member kind
-                                         '(&rest &body parse::&tree parse::&declarations))
-                                 (gen-list-p
-                                   (node-at (make-location :node node :id slot))))
-                            (list-hole-path node slot)
-                            (hole-path node slot)))
+                        (cond
+                          ((not (slot-boundp node slot)) nil)
+                          ((and (member kind
+                                        '(&rest &body parse::&tree parse::&declarations))
+                                (gen-list-p (node-at (make-location :node node :id slot))))
+                           (list-hole-path node slot))
+                          (t (hole-path node slot))))
                (dolist (id path)
                  (descend buffer id))
                (return))
@@ -578,8 +603,7 @@ addressed by indices."
                  (make-instance 'parse:symbol-ref
                   :name (text node)
                   :home-package (buffer-package buffer))
-                 buffer)
-      t)))
+                 buffer))))
 
 (setf (gethash (tui-sys:make-event :kind #\newline) *global-key-handlers*)
       (lambda (view buffer)
@@ -639,8 +663,7 @@ addressed by indices."
                   (edit-list body-loc
                              (lambda (body)
                                (list-remove (elements body) (id-index id)))
-                             (move-back parent id) buffer (stack buffer)))
-              t))
+                             (move-back parent id) buffer (stack buffer)))))
            ((and (integerp id) (< 1 (length (ast buffer))))
             (setf (ast buffer) (list-remove (ast buffer) id))
             (setf (stack buffer)
@@ -653,7 +676,7 @@ addressed by indices."
 
 ;;; literals
 (defun start-literal (node location buffer c)
-  "Convert generic holes to the appropriate literal type"
+  "Convert generic holes to the appropriate literal type, returning true if converted."
   (let* ((prefix (text node))
          (new (cond
                 ((string= prefix "#")
@@ -731,6 +754,7 @@ addressed by indices."
    :home-package (find-package :eclector.reader)))
 
 (defun splice-unquote (location buffer)
+  "Turns the unquote around `location' into splicing, returning true if it did."
   (let ((id (location-id location)))
     (when (and (consp id) (eql (car (last id)) 1))
       (let* ((parent (make-location :node (location-node location) :id (parent-id id)))
@@ -739,8 +763,7 @@ addressed by indices."
                    (typep (first (elements form)) 'parse:reader-marker)
                    (eq (parse:resolve (first (elements form))) 'eclector.reader:unquote))
           (swap-node parent (ref-list (unquote-marker t) (second (elements form))) buffer)
-          (refocus buffer (append-id (location-id (focus buffer)) 1))
-          t)))))
+          (refocus buffer (append-id (location-id (focus buffer)) 1)))))))
 
 (defmethod handle-key :around ((node hole) view location buffer event)
   (let ((c (tui-sys:event-kind event)))
@@ -750,13 +773,11 @@ addressed by indices."
             (zerop (length (text node)))
             (plusp (quasiquote-depth (stack buffer))))
        (swap-node location (ref-list (unquote-marker nil) (hole)) buffer)
-       (refocus buffer (append-id (location-id (focus buffer)) 1))
-       t)
+       (refocus buffer (append-id (location-id (focus buffer)) 1)))
       ((and (is-regular-char-event event)
             (eql c #\@)
             (zerop (length (text node)))
-            (splice-unquote location buffer))
-       t)
+            (splice-unquote location buffer)))
       ((and (is-regular-char-event event)
             (eql c #\`)
             (member (locsort location) '(parse:eval-form parse:unevaluated)))
@@ -770,12 +791,10 @@ addressed by indices."
                     buffer)
          (if (typep (node-at (focus buffer)) 'parse:quasiquote-form)
              (descend buffer 'parse:thing)
-             (refocus buffer (append-id (location-id (focus buffer)) 1))))
-       t)
+             (refocus buffer (append-id (location-id (focus buffer)) 1)))))
       ((and (is-regular-char-event event)
             (member (locsort location) '(parse:eval-form parse:unevaluated string))
-            (start-literal node location buffer c))
-       t)
+            (start-literal node location buffer c)))
       (t (call-next-method)))))
 
 (defmethod handle-key ((node hole) view location buffer event)
@@ -943,8 +962,7 @@ addressed by indices."
                      :denominator-node (make-instance 'parse:integer-hole
                                         :radix (parse::radix node)))
                     buffer)
-         (descend buffer 'parse:denominator-node)
-         t)
+         (descend buffer 'parse:denominator-node))
         (t
          (when-let (new (literal-input node c))
            (when (and (eq (locsort location) 'parse:integer-literal)
@@ -956,8 +974,7 @@ addressed by indices."
                                (not (eq (locsort location) 'parse:integer-literal)))
                           (hole (text new))
                           (parse::copy-anchors node new))
-                      buffer)
-           t))))))
+                      buffer)))))))
 
 ;;; comment
 (defmethod handle-key ((node parse::comment) view location buffer event)
@@ -1009,6 +1026,11 @@ A package prefix on `node' restricts candidates to that package and visibility."
                   (collect symbol)))))))
     result))
 
+(defun lambda-list-parameter-location-p (location)
+  (and (typep (location-node location) 'parse:function-code)
+       (trivia:match (location-id location)
+         ((list (eql 'parse:lambda-list) (type integer)) t))))
+
 (defmethod handle-key ((node parse:symbol-ref) view location buffer event)
   (declare (ignore view))
   (when (is-regular-char-event event)
@@ -1017,7 +1039,10 @@ A package prefix on `node' restricts candidates to that package and visibility."
            (home (if prefix (parse:home-package node) (buffer-package buffer)))
            (c (tui-sys:event-kind event)))
       (labels ((replace-ref (name home prefix &optional (refilter t))
-                 (let ((new (make-instance 'parse:symbol-ref
+                 (let ((new (make-instance
+                              (if (lambda-list-parameter-location-p location)
+                                  'parse:binder
+                                  'parse:symbol-ref)
                              :name name
                              :home-package home
                              :input-prefix prefix)))
@@ -1047,10 +1072,11 @@ A package prefix on `node' restricts candidates to that package and visibility."
               (replace-ref "" home (strcat prefix ":"))))
            t)
           ((symbol-char-p c)
-           (cond ((parse:unary-reader-marker-p node) nil)
-                 ((string= ":" name) ; keyword
-                  (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":"))
-                 (t (replace-ref (strcat name (string (char-upcase c))) home prefix nil))))
+           (cond
+             ((parse:unary-reader-marker-p node) nil)
+             ((string= ":" name) ; keyword
+               (replace-ref (string (char-upcase c)) (find-package "KEYWORD") ":"))
+             (t (replace-ref (strcat name (string (char-upcase c))) home prefix nil))))
           ((char= c #\Rubout)
            (cond
              ((parse:unary-reader-marker-p node) nil)
@@ -1065,7 +1091,7 @@ A package prefix on `node' restricts candidates to that package and visibility."
                   (swap-node location (hole) buffer)
                   (progn
                     (replace-ref (subseq prefix 0 (1- (length prefix)))
-                                 (buffer-package buffer) nil)
+                     (buffer-package buffer) nil)
                     (setf (completion-state buffer) nil)))
               t))))))))
 
@@ -1079,8 +1105,7 @@ A package prefix on `node' restricts candidates to that package and visibility."
                     (make-instance 'parse:binder
                      :name (format nil "~a~a" s (string-upcase c))
                      :home-package (parse:home-package node))
-                    buffer)
-         t)
+                    buffer))
         ((char= c #\Rubout)
          (let ((s (string s)))
            (if (< 1 (length s))
@@ -1089,8 +1114,7 @@ A package prefix on `node' restricts candidates to that package and visibility."
                            :name (string-drop s 1)
                            :home-package (parse:home-package node))
                           buffer)
-               (swap-node location (hole) buffer)))
-         t)))))
+               (swap-node location (hole) buffer))))))))
 
 ;;; functions
 (defparameter *fun-key-handlers* (make-hash-table :test #'equal))
@@ -1200,7 +1224,7 @@ if none, surround current atom"
 
 (defun wrap-in-list (loc buffer stack)
   "Wraps the value at `loc' in a syntax list, adding a hole afterwards unless it is
-already and focuses the hole. Saves history and returns a true value."
+already and focuses the hole. Saves history and returns true."
   (save-history buffer)
   (let ((holep (typep (node-at loc) 'hole)))
     (edit-list loc
@@ -1227,8 +1251,7 @@ already and focuses the hole. Saves history and returns a true value."
                 ((eq id 'parse:op) (values 'parse:body 0))
                 ((handle-focus-p buffer loc) (values id 0))
                 (t (values (parent-id id) (1+ (lastcar id)))))
-            (insert-or-jump (make-location :node node :id list-id) index buffer stack))
-          t)))
+            (insert-or-jump (make-location :node node :id list-id) index buffer stack)))))
 
 (setf (gethash (tui-sys:make-event :kind #\rubout) *macro-call-key-handlers*)
       (lambda (stack buffer)
@@ -1244,8 +1267,7 @@ already and focuses the hole. Saves history and returns a true value."
                                  ;; focus a nested list
                                  (location-id parent))
                              buffer stack)
-                  (ast-delete parent (lastcar id) buffer stack))
-              t)))))
+                  (ast-delete parent (lastcar id) buffer stack)))))))
 
 ;;; arbitrary
 (defparameter *layout-key-handlers* (make-hash-table :test #'equal)
@@ -1256,7 +1278,23 @@ already and focuses the hole. Saves history and returns a true value."
   (when-let ((layout (gethash (type-of node) *layouts*))
              (handler (gethash event *layout-key-handlers*))
              (stack (member node (stack buffer) :key #'location-node)))
-    (funcall handler layout stack buffer)))
+    (when (or (eq stack (stack buffer))
+              (and (eq stack (cdr (stack buffer)))
+                   (eq (location-id (focus buffer)) :open)))
+      (funcall handler layout stack buffer))))
+
+(defun copy-with-slot (node slot &optional (value nil valuep))
+  "Copies `node' with `slot' bound to `value' (unbound if no value provided)."
+  (parse::copy-anchors node
+   (apply #'make-instance (type-of node)
+          :op (parse:op node)
+          (append (when valuep
+                    (list (make-keyword slot) value))
+                  (loop for (other) in (remove-duplicates
+                                         (parse:form-slot-kinds (type-of node))
+                                        :key #'car)
+                        when (and (not (eq other slot)) (slot-boundp node other))
+                        append (list (make-keyword other) (slot-value node other)))))))
 
 (defun layout-rubout (layout stack buffer)
   "Deletes the focused element of a list slot, or restores the slot to its template."
@@ -1266,13 +1304,25 @@ already and focuses the hole. Saves history and returns a true value."
          (slot (ensure-car id))
          (template (layout-template layout slot)))
     (cond
-      ;; special case for no initializer (NIL)
-      ((and (typep node '(or parse:let-form parse:let*-form))
-            (consp id) (eq slot 'parse:vars) (= (length id) 3)
-            (= (third id) 1) (typep (node-at loc) 'hole))
+      ((and (symbolp id)
+            (eq (slot-kind layout slot) '&optional)
+            (typep (node-at loc) 'hole)
+            (loop for (later .
+                             kind) in (cdr (member slot
+                                                   (parse:form-slot-kinds (type-of node))
+                                                   :key #'car))
+                  never (and (eq kind '&optional) (slot-boundp node later))))
+       (swap-node (second stack) (copy-with-slot node slot) buffer)
+       (descend buffer (move-back (node-at (focus buffer)) slot)))
+      ((and (consp id)
+            (= (length id) 3)
+            (typep (node-at loc) 'hole)
+            (when-let (pattern (parse:rest-element-pattern node slot (second id)))
+              (parse:pattern-allows-deletion-p pattern
+               (length (elements (node-at (make-location :node node :id (parent-id id)))))
+               (third id))))
        (save-history buffer)
-       (ast-delete (make-location :node node :id (parent-id id)) 1 buffer stack)
-       t)
+       (ast-delete (make-location :node node :id (parent-id id)) (third id) buffer stack))
       (template
        (let ((rest-loc (make-location :node node :id slot)))
          (flet ((reset ()
@@ -1315,13 +1365,20 @@ already and focuses the hole. Saves history and returns a true value."
       (next
        (let ((next-loc (make-location :node node :id next))
              (next-template (layout-template layout next)))
-         (if (and (member (cdr (assoc next (parse:form-slot-kinds (type-of node))))
-                          '(&rest &body parse::&tree parse::&declarations))
-                  (gen-list-p (node-at next-loc)))
-             (insert-or-jump next-loc
-              0 buffer stack
-              :item (if next-template (funcall next-template) (hole)))
-             (refocus buffer next))))
+         (cond
+           ((not (slot-boundp node next))
+            (swap-node (second stack)
+                       (copy-with-slot node
+                        next (if next-template (funcall next-template) (hole)))
+                       buffer)
+            (descend buffer next))
+           ((and (member (cdr (assoc next (parse:form-slot-kinds (type-of node))))
+                         '(&rest &body parse::&tree parse::&declarations))
+                 (gen-list-p (node-at next-loc)))
+            (insert-or-jump next-loc
+             0 buffer stack
+             :item (if next-template (funcall next-template) (hole))))
+           (t (refocus buffer next)))))
       ((and template (consp id))
        (let ((rest-loc (make-location :node node :id slot))
              (nested (typep (funcall template) 'ref-list)))
@@ -1334,9 +1391,14 @@ already and focuses the hole. Saves history and returns a true value."
                  :tail '(0))
                 (insert-or-jump rest-loc (1+ (second id)) buffer stack)))
            (3
-            (when nested
-              (insert-or-jump (make-location :node node :id (list slot (second id)))
-               (1+ (third id)) buffer stack)))
+            (or (positional-insert-hole
+                  (make-location :node node :id (list slot (second id)))
+                 (parse:rest-element-pattern node slot (second id)) (third id) buffer
+                 stack)
+                (insert-or-jump rest-loc
+                 (1+ (second id)) buffer stack
+                 :item (funcall template)
+                 :tail '(0))))
            (t (slog* (format nil "no space action for ~a" (length id)))))))
       ((and (member (slot-kind layout slot) '(parse::&tree parse::&declarations))
             (consp id))
@@ -1357,8 +1419,7 @@ already and focuses the hole. Saves history and returns a true value."
 (defun under-qq-reader-wrapper-p (node id)
   (and (not (symbolp id))
        (let ((ref (parse:get-location node (parent-id id))))
-         (and (gen-list-p ref)
-              (parse:unary-reader-marker-p (parse::gen-car ref))))))
+         (and (gen-list-p ref) (parse:unary-reader-marker-p (parse::gen-car ref))))))
 
 (defun outer-qq-reader-wrapper-id (node id)
   (if (under-qq-reader-wrapper-p node id)
@@ -1378,20 +1439,22 @@ already and focuses the hole. Saves history and returns a true value."
              (let ((id (outer-qq-reader-wrapper-id node id)))
                (when (consp id)
                  (insert-or-jump (make-location :node node :id (parent-id id))
-                                 (1+ (lastcar id)) buffer stack))))
+                  (1+ (lastcar id)) buffer stack))))
             (#\rubout
              (cond
                ((not (under-qq-reader-wrapper-p node id))
                 (if (eq (locsort loc) 'parse:eval-form)
-                    (progn (rubout-eval-form buffer) t)
+                    (progn
+                      (rubout-eval-form buffer)
+                      t)
                     (rubout-tree-slot loc stack buffer)))
                ((zerop (id-index id))
                 (let ((wrapper (make-location :node node :id (parent-id id))))
                   (swap-node wrapper (second (elements (node-at wrapper))) buffer)))
                ((typep (node-at loc) 'hole)
-                (rubout-tree-slot (make-location :node node
-                                                 :id (outer-qq-reader-wrapper-id node id))
-                                  stack buffer))))
+                (rubout-tree-slot
+                  (make-location :node node :id (outer-qq-reader-wrapper-id node id))
+                 stack buffer))))
             (#\(
              (unless (eq (locsort loc) 'parse:eval-form)
                (wrap-in-list loc buffer stack)))))))))
@@ -1414,11 +1477,18 @@ already and focuses the hole. Saves history and returns a true value."
       (lambda (stack buffer)
         (let* ((loc (car stack))
                (node (location-node loc)))
-          (flet ((insert-into (id index)
-                   (insert-or-jump (make-location :node node :id id) index buffer stack))
-                 (shorter-than (id limit)
-                   (< (length (elements (node-at (make-location :node node :id id))))
-                      limit)))
+          (labels ((insert-into (id index)
+                     (insert-or-jump (make-location :node node :id id) index buffer stack))
+                   (parameter-insert (path)
+                     (if (= 1 (length path))
+                         (insert-into 'parse:lambda-list (1+ (first path)))
+                         (or (positional-insert-hole
+                               (make-location
+                                :node node
+                                :id (cons 'parse:lambda-list (butlast path)))
+                              (parse:lambda-list-element-pattern node (butlast path))
+                              (lastcar path) buffer stack)
+                             (parameter-insert (butlast path))))))
             (trivia:cmatch (location-id loc)
               ((list* (eql 'parse:declarations) path)
                (insert-into (parent-id (location-id loc)) (1+ (lastcar path))))
@@ -1427,12 +1497,10 @@ already and focuses the hole. Saves history and returns a true value."
               ((eql 'parse:lambda-list) (insert-into 'parse:lambda-list 0))
               ((list (eql 'parse:lambda-list) (and (type integer) i)
                 (and (type integer) j))
-               (when (shorter-than `(parse:lambda-list ,i) 3)
-                 (insert-into `(parse:lambda-list ,i) (1+ j))))
+               (parameter-insert (list i j)))
               ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j)
                 (and (type integer) k))
-               (when (shorter-than `(parse:lambda-list ,i ,j) 2)
-                 (insert-into `(parse:lambda-list ,i ,j) (1+ k))))
+               (parameter-insert (list i j k)))
               ((eql 'parse:docstring) (insert-into 'parse:body 0))
               ((list (eql 'parse:body) (and (type integer) i))
                (insert-into 'parse:body (1+ i))))))))
@@ -1441,19 +1509,19 @@ already and focuses the hole. Saves history and returns a true value."
       (lambda (stack buffer)
         (let ((loc (car stack)))
           (trivia:match (location-id loc)
-            ((list* (eql 'parse:declarations) _)
-             (wrap-in-list loc buffer stack))
-            ((or (list (eql 'parse:lambda-list) (type integer))
-              (list (eql 'parse:lambda-list) (type integer) (type integer)))
+            ((list* (eql 'parse:declarations) _) (wrap-in-list loc buffer stack))
+            ((trivia:guard (list* (eql 'parse:lambda-list) path)
+              (and path (every #'integerp path)
+               (parse:lambda-list-wrap-p (location-node loc) path)))
              (save-history buffer)
              (edit-list loc
                         (lambda (param)
                           (ref-list param (hole)))
-                        (append-id (location-id loc) 1) buffer stack)
-             t)))))
+                        (append-id (location-id loc) 1) buffer stack))))))
 
 (defun rubout-tree-slot (loc stack buffer)
-  "Deletes at `loc', keeping focus valid when a declaration list becomes empty."
+  "Deletes at `loc', keeping focus valid when a declaration list becomes empty.
+Returns true."
   (save-history buffer)
   (let* ((id (location-id loc))
          (node (location-node loc)))
@@ -1477,8 +1545,7 @@ already and focuses the hole. Saves history and returns a true value."
           (trivia:match (location-id loc)
             ((list (eql 'parse:body) (type integer))
              (when (location= loc (focus buffer))
-               (if (and (= (length (parse:body node)) 1)
-                        (typep (node-at loc) 'hole))
+               (if (and (= (length (parse:body node)) 1) (typep (node-at loc) 'hole))
                    t
                    (rubout-eval-form buffer))))
             ((list* (eql 'parse:declarations) _) (rubout-tree-slot loc stack buffer))
@@ -1488,16 +1555,13 @@ already and focuses the hole. Saves history and returns a true value."
                  (swap-node ll-loc (ref-list) buffer)
                  (ast-delete ll-loc i buffer stack)))
             ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j))
-             (unless (zerop j)
-               (save-history buffer)
-               (ast-delete (make-location :node node :id `(parse:lambda-list ,i))
-                j buffer stack)))
+             (positional-delete-hole (make-location :node node :id `(parse:lambda-list ,i))
+              (parse:lambda-list-element-pattern node (list i)) j buffer stack))
             ((list (eql 'parse:lambda-list) (and (type integer) i) (and (type integer) j)
               (and (type integer) k))
-             (unless (zerop k)
-               (save-history buffer)
-               (ast-delete (make-location :node node :id `(parse:lambda-list ,i ,j))
-                k buffer stack)))
+             (positional-delete-hole
+               (make-location :node node :id `(parse:lambda-list ,i ,j))
+              (parse:lambda-list-element-pattern node (list i j)) k buffer stack))
             ((eql 'parse:lambda-list)
              (save-history buffer)
              (swap-node ll-loc (ref-list) buffer))))))

@@ -79,7 +79,7 @@
     t))
 
 (defun eval-list-position-p (location)
-  "Whether LOCATION can accept a list of evaluated forms."
+  "Can `location' can accept a list of evaluated forms?"
   (let ((id (location-id location)))
     (and (bodylike-id id)
          (or (eq 'parse:eval-form
@@ -89,7 +89,7 @@
                   (not (eq (location-id location) 'parse:op)))))))
 
 (defun zipper-target-p (location)
-  "Whether a zipper can top out at `location'."
+  "Can a zipper top out at `location'?"
   (or (eval-list-position-p location) (eq 'parse:eval-form (locsort location))))
 
 (defun expand-selection (buffer)
