@@ -36,7 +36,7 @@ In emacs, sly-connect to 4005 and
 * `Enter` expands the symbol/completion at point into a call
 * `Ctrl-n/p/b/f` (and arrow keys) move by atom and goal column
 * `Alt-n/p` move by parent stack
-* `Alt-P` move by parent until reaching a non-evaluated position
+* `Alt-P` move by parent until reaching a non-evaluated position. Tip: follow with ctrl+x to wrap
 * `Alt-op` for op in `+,-,*,/` wraps the current node in arithmetic
 
 * `Shift-left/right` starts a selection

@@ -63,6 +63,25 @@ column. Returns NIL if not found."
     res
     (view-below atom-array (1+ y) 1)))
 
+(defun string-index-at-column (node view buffer target-row)
+  "Returns the boundary on `target-row' nearest the staging-relative goal column."
+  (let ((column (- (goal-col buffer) (tui:rect-x (tui:rect view))))
+        (best nil)
+        (distance most-positive-fixnum))
+    (loop for index from 0 to (length (parse::string-contents node))
+          do (multiple-value-bind (row x)
+                 (string-cursor-position node index)
+               (when (> row target-row)
+                 (return))
+               (when (and (= row target-row) (< (abs (- x column)) distance))
+                 (setf best index distance (abs (- x column))))))
+    best))
+
+(defun enter-string-at-column (node view buffer from-below)
+  "Enters `node' on its last line if `from-below', otherwise its first."
+  (let ((row (if from-below (count #\Newline (parse::string-contents node)) 0)))
+    (descend buffer (string-index-at-column node view buffer row))))
+
 (defun atom-move (view-finder view buffer)
   (end-selection-mode buffer)
   (let* ((rows (scroll-state-rows (scroll-state buffer)))
@@ -74,7 +93,12 @@ column. Returns NIL if not found."
         (setf (stack buffer) (view-stack new-view))
         (when new-goal
           (slog* (format nil "goal col is ~d" new-goal))
-          (setf (goal-col buffer) new-goal))))))
+          (setf (goal-col buffer) new-goal))
+        (let ((node (node-at (focus buffer))))
+          (when (typep node 'parse:string-literal)
+            (enter-string-at-column node
+             new-view buffer
+             (>= (tui:rect-y this-rect) (tui:rect-y2 (tui:rect new-view))))))))))
 
 (defun move-down (view buffer)
   (atom-move (lambda (atom-array this-rect)
@@ -183,13 +207,15 @@ Plain list bodies are skipped since they are never focused."
         ;; this is really a do-while idiom
         (prog1 (move-parent buffer)
           (loop for last-stack = nil then stack
-                for stack = (slog (stack buffer))
+                for stack = (stack buffer)
                 for loc = (car stack)
                 for node = (node-at loc)
                 while (typep node 'parse:eval-form)
                 do (move-parent buffer)
-                finally (when (slog last-stack)
-                          (setf (stack buffer) last-stack))))))
+                finally (when last-stack
+                          (setf (stack buffer) last-stack)
+                          ;; we skipped the last movement
+                          (pop (goal-stacks buffer)))))))
 
 ;;; buffer
 (defun add-buffer
@@ -711,6 +737,8 @@ addressed by indices."
                        (parse:to-syntax new)
                        new)
                    buffer)
+        (when (typep new 'parse:string-literal)
+          (descend buffer 0))
         (when funquotep
           (if (typep (node-at (focus buffer)) 'parse:function-form)
               (descend buffer 'parse:fun-designator)
@@ -942,6 +970,53 @@ addressed by indices."
                    'parse:float-literal
                    'parse:integer-literal)
               :str new)))))))
+
+(defmethod handle-key ((node parse:string-literal) view location buffer event)
+  (let* ((focus (focus buffer))
+         (inside (eq (location-node focus) node))
+         (value (parse::string-contents node)))
+    (when inside
+      (let* ((index (when inside
+                      (location-id focus)))
+             (key (tui-sys:event-kind event)))
+        (cond
+          ((or (equal event (tui-sys:make-event :kind :left-arrow))
+               (equal event (tui-sys:make-event :kind #\b :controlp t))
+               (equal event (tui-sys:make-event :kind :right-arrow))
+               (equal event (tui-sys:make-event :kind #\f :controlp t)))
+           (let* ((delta (if (member key '(:left-arrow #\b)) -1 1))
+                  (next (+ index delta)))
+             (when (<= 0 next (length value))
+               (refocus buffer next)
+               (setf (goal-col buffer) (+ (tui:rect-x (tui:rect view)) delta))
+               t)))
+          ((or (equal event (tui-sys:make-event :kind :up-arrow))
+               (equal event (tui-sys:make-event :kind #\p :controlp t))
+               (equal event (tui-sys:make-event :kind :down-arrow))
+               (equal event (tui-sys:make-event :kind #\n :controlp t)))
+           (let* ((row (string-cursor-position node index))
+                  (target (+ row (if (member key '(:up-arrow #\p)) -1 1)))
+                  (next (string-index-at-column node
+                         (gethash node (node-views buffer)) buffer target)))
+             (when next
+               (refocus buffer next)
+               t)))
+          ((is-regular-char-event event)
+           (unless (and (char= key #\Rubout) (zerop index))
+             (let* ((deletep (char= key #\Rubout))
+                    (next (if deletep (1- index) (1+ index)))
+                    (new (concatenate 'string
+                          (subseq value 0 (if deletep (1- index) index))
+                          (if deletep "" (string key)) (subseq value index))))
+               (when inside
+                 (setf (stack buffer) (cdr (stack buffer))))
+               (swap-node location
+                          (parse::copy-anchors node
+                           (make-instance 'parse:string-literal
+                            :str (write-to-string new :escape t)))
+                          buffer)
+               (descend buffer next)))
+           t))))))
 
 (defmethod handle-key ((node parse:literal) view location buffer event)
   (declare (ignore view))
@@ -1690,8 +1765,9 @@ Returns true."
   (when-let (buffer (focused-buffer ui))
     (unless (buffer-source buffer)
       (error "The focused buffer has no source file"))
-    (weave-serialization:save-file-checked (ast buffer)
-     (buffer-source buffer) #'parse-source)))
+    (let ((path (weave-serialization:save-file-checked (ast buffer)
+                 (buffer-source buffer) #'parse-source)))
+      (slog* (list 'saved path)))))
 
 (setf (gethash (tui-sys:make-event :kind #\s :controlp t :altp t) *ui-key-handlers*)
       #'save-focused-buffer)

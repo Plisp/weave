@@ -511,7 +511,7 @@ Must NOT perform context side effects if `measuring'."))
           ;; save view for anchoring
           (setf (gethash node (node-views context)) view)
           (when (location= (car stack) (focus context))
-            (setf (gethash :focus-view (redisplay-cache context)) view))
+            (setf (gethash :focus-rect (redisplay-cache context)) (tui:rect view)))
           ;; save stack for event handling
           (when (typep view 'ast-view)
             (setf (view-stack view) stack)))
@@ -550,6 +550,7 @@ since these aren't a proper location."
   (assert (location= location (focus buffer)))
   ;; (slog (butlast (stack buffer))) ; suppress toplevel list
   (or (when-let (handler (gethash event *global-key-handlers*))
+        (slog 'global-handler)
         (funcall handler view buffer))
       ;; propagate
       (loop for thisnode = node then (location-node location)
@@ -741,7 +742,7 @@ unless specified in *reader-punctuation*."
     (tui:puts* text 1 1 rect)
     (setf (view-stack view) (cons loc stack))
     (when (and focused (not measuring))
-      (setf (gethash :focus-view (redisplay-cache context)) view))
+      (setf (gethash :focus-rect (redisplay-cache context)) (tui:rect view)))
     view))
 
 ;;; syntactic list
@@ -1031,7 +1032,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
             (when (location= handle (focus context))
               (setf (tui:key-handler open) (make-key-handler l handle)
                     (tui:focused open) t
-                    (gethash :focus-view (redisplay-cache context)) open))
+                    (gethash :focus-rect (redisplay-cache context)) (tui:rect open)))
             (make-instance 'ast-view
              :location (car stack)
              :key-handler (make-key-handler l location)
@@ -1153,6 +1154,39 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
 (defmethod render-node ((node parse:literal) stack context rect &key)
   (render-literal-text node (format nil "~a" (parse:str node)) stack context rect))
 
+(defun string-cursor-position (node index)
+  "Returns the row and column of `index' relative to the rendered string,
+including quotes."
+  (let* ((prefix (write-to-string (subseq (parse::string-contents node) 0 index)
+                  :escape t))
+         (prefix (subseq prefix 0 (1- (length prefix))))
+         (start (or (position #\Newline prefix :from-end t) -1)))
+    (values (count #\Newline prefix) (tui-sys:display-width (subseq prefix (1+ start))))))
+
+(defmethod render-node ((node parse:string-literal) stack context rect &key)
+  (let* ((focus (focus context))
+         (inside (eq node (location-node focus)))
+         (text-view (render-literal-text node (parse:str node) stack context rect)))
+    (when inside
+      (multiple-value-bind (row column)
+          (string-cursor-position node (location-id focus))
+        (let* ((cursor-rect (tui:clamp-rect
+                              (tui:copy-rect rect
+                                             :cols 1
+                                             :rows 1
+                                             :x (+ (tui:rect-x rect) column)
+                                             :y (+ (tui:rect-y rect) row))
+                             rect))
+               (cursor (make-instance 'ast-view
+                        :rect cursor-rect
+                        :location focus
+                        :focused t
+                        :view-stack (cons focus stack)
+                        :key-handler (make-key-handler (node-at focus) focus))))
+          (setf (tui:children text-view) (append (tui:children text-view) (list cursor))
+                (gethash :focus-rect (redisplay-cache context)) cursor-rect))))
+    text-view))
+
 (defmethod render-node ((node string) stack context rect &key)
   (render-literal-text node (format nil "~s" node) stack context rect))
 
@@ -1262,7 +1296,7 @@ rest indented by 1, keeping keywords in pairs."
        (unless measuring
          (setf (gethash (parse:name node) (node-views context)) line-view)
          (when (and (location= div-loc (focus context)))
-           (setf (gethash :focus-view (redisplay-cache context)) line-view)))
+           (setf (gethash :focus-rect (redisplay-cache context)) (tui:rect line-view))))
        (setf (view-stack line-view) (cons div-loc stack))
        (tui:puts* (make-string width :initial-element #\─) (1+ (tui:rect-rows arg1-rect)) 1
                   rect)
@@ -2031,6 +2065,10 @@ The returned view uses staging coordinates but all drawing is done to a local bu
                (when (< used capacity)
                  ;; slightly >1 to avoid thrashing on insertions
                  (setf (gethash form (stage-cache buffer)) (ceiling (* 1.2 used)))
+                 (when (= index (location-id (lastcar (stack buffer))))
+                   (when-let (focus (gethash :focus-rect (redisplay-cache buffer)))
+                     (setf (gethash :focus-rect (redisplay-cache buffer))
+                           (tui:copy-rect focus :y (+ start (tui:rect-y focus))))))
                  (tui:view-traverse view
                   (lambda (v)
                     (setf (tui:rect v)
@@ -2074,8 +2112,7 @@ The returned view uses staging coordinates but all drawing is done to a local bu
                      (+ start (min (scroll-position-row scroll) (segment-rows segment)))))
              ;; TODO horizontal scrolling? some kind of handling for offscreen focuses
              (when (= i focus-index)
-               (when-let* ((focus-view (gethash :focus-view (redisplay-cache buffer)))
-                           (focus-rect (tui:rect focus-view)))
+               (when-let* ((focus-rect (gethash :focus-rect (redisplay-cache buffer))))
                  (setf viewport
                        (if (< focus-index index)
                            (tui:rect-y focus-rect)
@@ -2142,9 +2179,7 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
                :segments segments
                :viewport viewport))
         ;; edit: split up setf
-        (setf (focus-rect buffer)
-              (with-lookup (focus-view (gethash :focus-view (redisplay-cache buffer)))
-                (tui:rect focus-view)))
+        (setf (focus-rect buffer) (gethash :focus-rect (redisplay-cache buffer)))
         (setf (gethash forms (node-views buffer)) root)
         root))))
 

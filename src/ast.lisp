@@ -34,6 +34,7 @@
            #:symbol-ref
            #:binder
            #:literal
+           #:char
            #:string-literal
            #:character-literal
            #:integer-literal
@@ -492,7 +493,7 @@ so a name test alone can't distinguish #:|.| from a dot."))
 ;; so no ast interface is provided. Use path-at for conversion where necessary.
 ;; The raw syntax return value is used by the method `update' ((node macro-call))
 (defgeneric location-sort (node id)
-  (:documentation "Sort lookups are total: an invalid id gives NIL.
+  (:documentation "Returns a node-specific sort or NIL for an invalid id.
 A method may return the ast at `id' as a second value, NIL when absent.
 Note: at macro calls, this returns raw syntax, similarly to get-location.")
   (:method (node id) (declare (ignore node id)) nil))
@@ -500,9 +501,24 @@ Note: at macro calls, this returns raw syntax, similarly to get-location.")
 (defun locsort (location)
   (location-sort (location-node location) (location-id location)))
 
+(defmethod location-sort ((node literal) id)
+  'char)
+
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'. Note: this is raw syntax
 from macro-calls. Use node-at instead."))
+
+(defmethod get-location ((node literal) id)
+  (char (text node) id))
+
+(defun string-contents (node)
+  (let ((*read-eval* nil))
+    (read-from-string (str node))))
+
+(defmethod get-location ((node string-literal) id)
+  (let ((value (string-contents node)))
+    (when (< id (length value))
+      (char value id))))
 
 (defmethod get-location ((node anchor) id)
   (error "Invalid location ~s in ~s" id node))
