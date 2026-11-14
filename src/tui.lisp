@@ -9,7 +9,6 @@
 ;; note: redisplays are automatically aborted upon return from the debugger, so the only
 ;;       obligation of render-state is not to leave invalid records in the caches.
 ;;       e.g. node-views must be overwritten with up-to-date entries
-;; note: debugger code must NOT error, catch any printing errors
 (defpackage #:weave-tui
   (:use :cl #:alexandria-2 #:weave-utils)
   (:import-from #:weave-parser
@@ -169,7 +168,7 @@ construction, do not modify."))
    (start :type (integer 0))
    (rows :type (integer 1))
    ;; local buffer containing only this segment for blitting
-   (buffer :type (array tui::cell (* *)))
+   (buffer :type (array tui:cell (* *)))
    ;; has staging coordinates
    (view :type tui:view))
   (:representation :struct))
@@ -607,7 +606,7 @@ since these aren't a proper location."
 
 (defun is-binop-call (node)
   (trivia:match node
-    ((class parse:function-call :name (and (class parse:symbol-ref) op))
+    ((parse:function-call :name (and (class parse:symbol-ref) op))
      (find (parse:resolve op) *arb-arity-binops*))))
 
 ;;; hole
@@ -690,7 +689,7 @@ since these aren't a proper location."
           (assoc-value *symbol-mappings* node :test #'parse:string-and-package=))
      (string (assoc-value *symbol-mappings* node :test #'parse:string-and-package=)))
     (t
-     (string-downcase
+     (string-downcase ; relies on concatenate nil behavior
        (concatenate 'string (symbol-ref-prefix node package) (parse:name node))))))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect &key)
@@ -804,9 +803,11 @@ convention."
                                               ((t) 1)
                                               ((nil) (length remaining))
                                               (otherwise n))
-                               for i from 0 below count
+                               for i from 0
                                with last-elt = nil
-                               while remaining
+                               while (and remaining
+                                          (or (< i count)
+                                              (typep last-elt 'parse::dot-marker)))
                                do (let ((element (funcall transform (pop remaining)))
                                         (loc (funcall locate index)))
                                     (incf index)
@@ -850,22 +851,22 @@ convention."
       (adjust-array cells (list rows cols))
       (loop for y below rows
             do (loop for x from (if (< y old-rows) old-cols 0) below cols
-                     do (setf (aref cells y x) (tui::make-cell)))))
+                     do (setf (aref cells y x) (tui:make-cell)))))
     cells))
 
 (defun measure-node (node stack context rect &rest keys)
   "Returns the rendered rectangle in the same coordinate space as `rect'.
 Uses shared scratch cells and clears the touched scratch area on exit."
-  (let* ((tui::*put-buffer* (ensure-measurement-scratch rect))
+  (let* ((tui:*put-buffer* (ensure-measurement-scratch rect))
          (touched rect))
     (unwind-protect (setf touched
                           (tui:rect (apply #'render-node node stack context rect
                                            (list* :measuring t keys))))
       (loop for y from (tui:rect-y touched) below (tui:rect-y2 touched)
             do (loop for x from (tui:rect-x touched) below (tui:rect-x2 touched)
-                     for cell = (aref tui::*put-buffer* y x)
-                     do (setf (tui::cell-string cell) " "
-                              (tui::cell-style cell) tui-sys:*default-style*))))))
+                     for cell = (aref tui:*put-buffer* y x)
+                     do (setf (tui:cell-string cell) " "
+                              (tui:cell-style cell) tui-sys:*default-style*))))))
 
 (defun compact-layout-p (elements rule locate stack context rect keys)
   "Do the complete header and single body form fit on one rendered row."
@@ -948,7 +949,8 @@ Uses shared scratch cells and clears the touched scratch area on exit."
         (push (cons 0 count) rows))
       (return-from ref-list-indentation (nreverse rows)))
     ;; all on one line unless multiline
-    (loop for original in elements
+    (loop for tail on elements
+          for original = (first tail)
           for index from 0
           for element = (funcall transform original)
           for measured = (apply #'measure-node element (cons (funcall locate index) stack)
@@ -963,7 +965,19 @@ Uses shared scratch cells and clears the touched scratch area on exit."
                                (and (listp rule) (eq (getf rule :style) :list)))))
                (return-from ref-list-indentation '((0 . t))))
              ;; line wrap
-             (when (and (plusp count) (> (+ used gap size) max-width))
+             (when (and (plusp count)
+                        (not (typep previous 'parse::dot-marker))
+                        (> (+ used gap size
+                              (if (and (typep element 'parse::dot-marker) (rest tail))
+                                  (1+ (tui:rect-cols (apply #'measure-node
+                                                            (funcall transform
+                                                                     (second tail))
+                                                            (cons (funcall locate
+                                                                           (1+ index))
+                                                                  stack)
+                                                            context bounds keys)))
+                                  0))
+                           max-width))
                (push (cons 0 count) rows)
                (setf count 0 used 0 gap 0))
              (incf count)
@@ -1783,36 +1797,34 @@ ASSUMES we never focus a plain list body."
   (1 parse:body))
 
 (deflayout parse:flet-form ()
-  ((parse:funs .
-               (ref-list (hole)
-                         (make-instance 'parse:function-code
-                          :lambda-list-kind :lambda
-                          :lambda-list (ref-list)
-                          :body (list (hole)))))
+  ((parse:funs . (ref-list (hole)
+                           (make-instance 'parse:function-code
+                            :lambda-list-kind :lambda
+                            :lambda-list (ref-list)
+                            :body (list (hole)))))
    (parse:body . (hole)))
   (parse:op parse:funs)
   (1 parse:decls)
   (1 parse:body))
 
 (deflayout parse:labels-form ()
-  ((parse:funs .
-               (ref-list (hole)
-                         (make-instance 'parse:function-code
-                          :lambda-list-kind :lambda
-                          :lambda-list (ref-list)
-                          :body (list (hole)))))
+  ((parse:funs . (ref-list (hole)
+                           (make-instance 'parse:function-code
+                            :lambda-list-kind :lambda
+                            :lambda-list (ref-list)
+                            :body (list (hole)))))
    (parse:body . (hole)))
   (parse:op parse:funs)
   (1 parse:decls)
   (1 parse:body))
 
 (deflayout parse:macrolet-form ()
-  ((parse:macro-defs .
-    (ref-list (hole)
-              (make-instance 'parse:function-code
-               :lambda-list-kind :macro-lambda
-               :lambda-list (ref-list)
-               :body (list (hole)))))
+  ((parse:macro-defs
+     . (ref-list (hole)
+                 (make-instance 'parse:function-code
+                  :lambda-list-kind :macro-lambda
+                  :lambda-list (ref-list)
+                  :body (list (hole)))))
    (parse:body . (hole)))
   (parse:op parse:macro-defs)
   (1 parse:decls)
@@ -2042,7 +2054,7 @@ ASSUMES we never focus a plain list body."
 (defun make-cell-buffer (rows cols)
   (let ((buffer (make-array (list rows cols))))
     (dotimes (i (array-total-size buffer) buffer)
-      (setf (row-major-aref buffer i) (tui::make-cell)))))
+      (setf (row-major-aref buffer i) (tui:make-cell)))))
 
 (defun render-one-toplevel (index start forms buffer screen-rows cols)
   "Renders the form at `index' into a segment placed at `start', relative to the staging
@@ -2055,7 +2067,7 @@ The returned view uses staging coordinates but all drawing is done to a local bu
         for capacity = (max 2 (gethash form (stage-cache buffer) screen-rows)) then (* 2
                                                                                        capacity)
         for cells = (make-cell-buffer capacity cols)
-        do (let* ((tui::*put-buffer* cells)
+        do (let* ((tui:*put-buffer* cells)
                   (rect (tui:make-rect :x 0 :y 0 :rows capacity :cols cols))
                   (location (make-location :node forms :id index)))
              (tui:fill-rect (tui-sys:make-style :bg #x0) rect)
@@ -2166,7 +2178,7 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
                    (loop for row from (max 0 start) below (min (segment-rows segment)
                                                                (+ rows start))
                          do (loop for col below cols
-                                  do (setf (aref tui::*put-buffer*
+                                  do (setf (aref tui:*put-buffer*
                                                  (- (+ row (tui:rect-y buffer-rect)) start)
                                                  (+ (tui:rect-x buffer-rect) col))
                                            (aref (segment-buffer segment) row col)))))))
@@ -2284,7 +2296,7 @@ as `viewport'."
                    :cols (max 0 (- (tui:cols ui) (buffer-x buffer))))))
 
 (defun buffer-rect (buffer &optional (col-bound most-positive-fixnum))
-  "Returns an absolute coordinate rect bounding the content viewport of `buffer'."
+  "Returns an absolute coordinate rect bounding the content of `buffer'."
   (let* ((rect (buffer-outer-rect buffer))
          (inset (if (floating buffer) 1 0)))
     (tui:copy-rect rect
@@ -2364,6 +2376,7 @@ as `viewport'."
 
 (defparameter *max-debugger-width* 80)
 
+;; note: debugger code must NOT error, catch any printing errors
 (defun debugger-text (printer)
   "Captures `printer' output without recursively debugging printing failures."
   (handler-case (let ((*print-circle* t)
@@ -2474,8 +2487,8 @@ as `viewport'."
                                   :scroll-state (scroll-state old))
                    :indent-cache (indent-cache buffer))))
     (draw-buffer working (buffer-state working))
-    ;; old version can be used recursively by debugging, skipping this write on return
-    ;; by throwing to next-redisplay
+    ;; old version can be used recursively by debugging. This write is skipped
+    ;; on return by uncursed throwing to tui::next-redisplay
     (setf (render-state buffer) (render-state working))))
 
 (defmethod tui:render :around ((ui ui))
@@ -2485,7 +2498,7 @@ as `viewport'."
     (call-next-method)))
 
 (defmethod tui:render ((ui ui))
-  (tui::clear-buffer tui::*put-buffer*)
+  (tui:clear-buffer tui:*put-buffer*)
   ;; (sb-sprof:with-profiling (:sample-interval 0.001
   ;;                           :reset t
   ;;                           :threads (list sb-thread:*current-thread*)

@@ -248,6 +248,14 @@ The anchor coordinates X, Y are absolute."
 ;; - a stack tracks locations from the focus outward to the indexed top-level form
 ;; - ast-delete/insert/replace are stack-respecting edit operations
 ;;
+(defun path-to-stack (path root)
+  "Converts a downwards path from the root into a stack."
+  (loop for id in path
+        for parent = root then (node-at fresh)
+        for fresh = (make-location :node parent :id id)
+        collect fresh into stack
+        finally (return (nreverse stack))))
+
 (defun rebuild-spine (loc updater stack)
   "Requires that (location-node `loc') = (location-node (car `stack'))
 Functionally rebuilds the path from `loc' out to the root, applying `updater' to
@@ -255,16 +263,9 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
   (assert (eq (location-node loc) (location-node (car stack))))
   (labels ((rebuild (stack newnode newstack)
              (if (null stack)
-                 ;; Macro reanalysis may have copied descendants. Resolve the saved
+                 ;; Macro reanalysis may have copied descendant nodes. Resolve the saved
                  ;; path ids through the new tree
-                 (values (loop for loc in newstack
-                               for parent = newnode then (node-at fresh)
-                               for fresh = (make-location
-                                            :node parent
-                                            :id (location-id loc))
-                               collect fresh into path
-                               finally (return (nreverse path)))
-                         newnode)
+                 (values (path-to-stack (mapcar #'location-id newstack) newnode) newnode)
                  (let* ((this (car stack))
                         (id (location-id this))
                         (new-parent (update (location-node this) id newnode)))
@@ -654,7 +655,7 @@ addressed by indices."
           (when (and (eq 'parse:eval-form (locsort (focus buffer)))
                      (or (typep ref 'parse:symbol-ref)
                          (trivia:match ref
-                           ((class hole :text (or (string (or #\+ #\-)))) t))))
+                           ((hole :text (or (string (or #\+ #\-)))) t))))
             (when (typep ref 'hole)
               (setf ref
                     (make-instance 'parse:symbol-ref
@@ -1005,9 +1006,8 @@ addressed by indices."
            (unless (and (char= key #\Rubout) (zerop index))
              (let* ((deletep (char= key #\Rubout))
                     (next (if deletep (1- index) (1+ index)))
-                    (new (concatenate 'string
-                          (subseq value 0 (if deletep (1- index) index))
-                          (if deletep "" (string key)) (subseq value index))))
+                    (new (strcat (subseq value 0 (if deletep (1- index) index))
+                                 (if deletep "" (string key)) (subseq value index))))
                (when inside
                  (setf (stack buffer) (cdr (stack buffer))))
                (swap-node location
@@ -1060,7 +1060,7 @@ addressed by indices."
            (new (cond
                   ((char= c #\Rubout) (subseq text 0 (max 2 (1- (length text)))))
                   ((or (char= c #\Newline) (char= c #\Tab)) text)
-                  (t (concatenate 'string text (string c))))))
+                  (t (strcat text (string c))))))
       (unless (string= text new)
         (swap-node location
                    (make-instance 'parse::comment :kind (parse::kind node) :str new)
@@ -1195,20 +1195,20 @@ A package prefix on `node' restricts candidates to that package and visibility."
 (defparameter *fun-key-handlers* (make-hash-table :test #'equal))
 
 (defmethod handle-key ((node parse:function-call) view location buffer event)
-  ;; I don't expect function calls to have any special binds percolated up the tree
-  (when-let ((handler (gethash event *fun-key-handlers*)))
-    (when (and (< 1 (length (stack buffer)))
-               (location= location (second (stack buffer)))) ; we need to be a direct child
-      (funcall handler buffer))))
+  (when-let ((handler (gethash event *fun-key-handlers*))
+             (stack (member node (stack buffer) :key #'location-node)))
+    (if (equal event (tui-sys:make-event :kind #\space))
+        (funcall handler buffer stack)
+        (when (eq stack (stack buffer))
+          (funcall handler buffer)))))
 
 (setf (gethash (tui-sys:make-event :kind #\space) *fun-key-handlers*)
-      (lambda (buffer)
-        (let* ((fun-loc (car (stack buffer)))
+      (lambda (buffer &optional (stack (stack buffer)))
+        (let* ((fun-loc (car stack))
                (fun-node (location-node fun-loc))
                (id (location-id fun-loc))
                (i (if (bodylike-id id) (1+ (id-index id)) 0)))
-          (insert-or-jump (make-location :node fun-node :id 'parse:body)
-           i buffer (stack buffer)))))
+          (insert-or-jump (make-location :node fun-node :id 'parse:body) i buffer stack))))
 
 (setf (gethash (tui-sys:make-event :kind #\rubout) *fun-key-handlers*) #'rubout-eval-form)
 
@@ -1236,7 +1236,7 @@ if none, surround current atom"
 (loop for sym across *arb-arity-binops*
       for s = (string sym)
       do (when (= 1 (length (string s)))
-           (setf (gethash (tui-sys:make-event :kind (schar s 0) :altp t)
+           (setf (gethash (tui-sys:make-event :kind (char s 0) :altp t)
                           *global-key-handlers*)
                  ;; oops bug if we don't compute from s prior to its mutation by loop
                  (let ((sym* sym))
@@ -1353,7 +1353,8 @@ already and focuses the hole. Saves history and returns true."
   (when-let ((layout (gethash (type-of node) *layouts*))
              (handler (gethash event *layout-key-handlers*))
              (stack (member node (stack buffer) :key #'location-node)))
-    (when (or (eq stack (stack buffer))
+    (when (or (equal event (tui-sys:make-event :kind #\space))
+              (eq stack (stack buffer))
               (and (eq stack (cdr (stack buffer)))
                    (eq (location-id (focus buffer)) :open)))
       (funcall handler layout stack buffer))))
@@ -1382,10 +1383,9 @@ already and focuses the hole. Saves history and returns true."
       ((and (symbolp id)
             (eq (slot-kind layout slot) '&optional)
             (typep (node-at loc) 'hole)
-            (loop for (later .
-                             kind) in (cdr (member slot
-                                                   (parse:form-slot-kinds (type-of node))
-                                                   :key #'car))
+            (loop for (later . kind) in (cdr (member slot
+                                                     (parse:form-slot-kinds (type-of node))
+                                                     :key #'car))
                   never (and (eq kind '&optional) (slot-boundp node later))))
        (swap-node (second stack) (copy-with-slot node slot) buffer)
        (descend buffer (move-back (node-at (focus buffer)) slot)))
@@ -1453,7 +1453,9 @@ already and focuses the hole. Saves history and returns true."
             (insert-or-jump next-loc
              0 buffer stack
              :item (if next-template (funcall next-template) (hole))))
-           (t (refocus buffer next)))))
+           (t
+            (setf (stack buffer) stack)
+            (refocus buffer next)))))
       ((and template (consp id))
        (let ((rest-loc (make-location :node node :id slot))
              (nested (typep (funcall template) 'ref-list)))

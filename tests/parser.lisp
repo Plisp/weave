@@ -1983,3 +1983,12 @@
       (is equal (string-upcase (remove #\: source)) (sx (parse:to-syntax form)))))
   (fail (parse "(lambda (a &rest ((:k v) 1 s)) v)"))
   (fail (parse "(defmethod m (((:k v) 1 s)) v)")))
+
+(define-test serialization-dotted-tail-stays-with-dot :parent parser
+  (let ((source "(loop for (later . kind) in entries collect later)"))
+    (dolist (width '(15 25 92))
+      (let ((text (with-output-to-string (stream)
+                    (weave-serialization:serialize
+                     (list (parse source)) stream :package *package* :column-limit width))))
+        (is eq t (not (null (search ". kind" text))))
+        (is equal (read-from-string source) (read-from-string text))))))

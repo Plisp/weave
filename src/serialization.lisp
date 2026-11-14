@@ -252,68 +252,71 @@
                                      (member (resolve element) lambda-list-keywords))
                for operand = (if listp index (1- index))
                for bodyp = (and body-start (>= index body-start))
-               for child-rule = (weave-indentation::child-rule rule index)
+               for child-rule = (unless (or (typep element 'dot-marker)
+                                            (typep previous 'dot-marker))
+                                  (weave-indentation::child-rule rule index))
                do (when (plusp index)
                     (unless *comment-ended-line*
                       (write-char #\Space stream))
-                    (when (and (= index 1)
-                               (not listp)
-                               (null header)
-                               (not loop-rows)
-                               (typep (first elements) 'symbol-ref))
-                      (when (and long-call-p
-                                 (not (eql keyword-start 0))
-                                 (not comment-break))
-                        (pprint-newline :fill stream))
-                      (unless long-call-p
-                        (pprint-indent :current 0 stream)))
-                    (when (and long-call-p (>= index 2))
-                      (pprint-indent :block (1- *long-call-indent*) stream))
-                    (when bodyp
-                      (pprint-indent :block
-                       (if (and (eql header 0) (getf spec :compact-body)) 0 1) stream))
-                    (when (eql index (getf spec :argument-break))
-                      (pprint-indent :block 3 stream))
-                    (when lambdap
-                      (cond
-                        (lambda-key (pprint-indent :block 0 stream))
-                        ((and (typep previous 'symbol-ref)
-                              (member (resolve previous) lambda-list-keywords))
-                         (pprint-indent :current 0 stream))))
-                    (when (and loop-rows (zerop row-left))
-                      (pop loop-rows)
-                      (setf row-left (cdar loop-rows))
-                      (pprint-indent :block (+ (caar loop-rows) loop-offset) stream)
-                      (unless (and (= index 1) (plusp loop-offset))
-                        (unless (or *comment-ended-line* comment-break)
-                          (pprint-newline :mandatory stream))))
-                    (unless (or *comment-ended-line*
-                                comment-break
-                                loop-rows
-                                (and keyword-start
-                                     (> operand keyword-start)
-                                     (oddp (- operand keyword-start))
-                                     (not (and (= index (1- (length elements)))
-                                               (typep (first elements) 'symbol-ref)
-                                               (eq (resolve (first elements)) 'apply))))
-                                (and lambdap
-                                     (typep previous 'symbol-ref)
-                                     (member (resolve previous) lambda-list-keywords))
-                                (and (not listp)
-                                     (not bodyp)
-                                     (= index 1)
-                                     (not (eql keyword-start 0))))
-                      (pprint-newline
+                    (unless (typep previous 'dot-marker)
+                      (when (and (= index 1)
+                                 (not listp)
+                                 (null header)
+                                 (not loop-rows)
+                                 (typep (first elements) 'symbol-ref))
+                        (when (and long-call-p
+                                   (not (eql keyword-start 0))
+                                   (not comment-break))
+                          (pprint-newline :fill stream))
+                        (unless long-call-p
+                          (pprint-indent :current 0 stream)))
+                      (when (and long-call-p (>= index 2))
+                        (pprint-indent :block (1- *long-call-indent*) stream))
+                      (when bodyp
+                        (pprint-indent :block
+                         (if (and (eql header 0) (getf spec :compact-body)) 0 1) stream))
+                      (when (eql index (getf spec :argument-break))
+                        (pprint-indent :block 3 stream))
+                      (when lambdap
                         (cond
-                          ((eql index (getf spec :argument-break)) :mandatory)
-                          ((and keyword-start (>= operand keyword-start)) :linear)
-                          ((and long-call-p (= index 2)) :linear)
-                          (lambda-key :linear)
-                          (bodyp body-break)
-                          ((and (getf spec :pairs) (> index 1) (oddp index)) :linear)
-                          ((getf spec :pairs) :fill)
-                          (t (or (getf spec :break) :fill)))
-                       stream)))
+                          (lambda-key (pprint-indent :block 0 stream))
+                          ((and (typep previous 'symbol-ref)
+                                (member (resolve previous) lambda-list-keywords))
+                           (pprint-indent :current 0 stream))))
+                      (when (and loop-rows (zerop row-left))
+                        (pop loop-rows)
+                        (setf row-left (cdar loop-rows))
+                        (pprint-indent :block (+ (caar loop-rows) loop-offset) stream)
+                        (unless (and (= index 1) (plusp loop-offset))
+                          (unless (or *comment-ended-line* comment-break)
+                            (pprint-newline :mandatory stream))))
+                      (unless (or *comment-ended-line*
+                                  comment-break
+                                  loop-rows
+                                  (and keyword-start
+                                       (> operand keyword-start)
+                                       (oddp (- operand keyword-start))
+                                       (not (and (= index (1- (length elements)))
+                                                 (typep (first elements) 'symbol-ref)
+                                                 (eq (resolve (first elements)) 'apply))))
+                                  (and lambdap
+                                       (typep previous 'symbol-ref)
+                                       (member (resolve previous) lambda-list-keywords))
+                                  (and (not listp)
+                                       (not bodyp)
+                                       (= index 1)
+                                       (not (eql keyword-start 0))))
+                        (pprint-newline
+                          (cond
+                            ((eql index (getf spec :argument-break)) :mandatory)
+                            ((and keyword-start (>= operand keyword-start)) :linear)
+                            ((and long-call-p (= index 2)) :linear)
+                            (lambda-key :linear)
+                            (bodyp body-break)
+                            ((and (getf spec :pairs) (> index 1) (oddp index)) :linear)
+                            ((getf spec :pairs) :fill)
+                            (t (or (getf spec :break) :fill)))
+                         stream))))
                   (serialize-with-rule element stream child-rule)
                   (when loop-rows
                     (decf row-left))
