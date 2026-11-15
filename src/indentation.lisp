@@ -93,7 +93,7 @@ its first are aligned with the first, and a loop without keywords has a line per
     (defun :header 2 :children (nil (:style :lambda))) (defmacro :like defun)
     (deftype :like defun) (defgeneric :like defun) (define-setf-expander :like defun)
     (lambda :header 1 :children ((:style :lambda))) (defmethod :method t)
-    (uncursed:place :header 1 :children ((:style :list)))
+    (:method :method 1) (uncursed:place :header 1 :children ((:style :list)))
     (let :header 1 :children ((:style :list :break :mandatory :rest (:header 1))))
     (if-let :header 1 :children ((:style :list))) (when-let :like if-let)
     (when-let* :like let)
@@ -151,7 +151,10 @@ its first are aligned with the first, and a loop without keywords has a line per
                                 (lambda (node)
                                   (typep node 'ref-list))
                                elements
-                               :start (min 2 (length elements)))))
+                               :start (min (if (integerp (getf rule :method))
+                                               (getf rule :method)
+                                               2)
+                                           (length elements)))))
                 (when position
                   (list :header position :children
                         (append (make-list (1- position)) (list '(:style :lambda))))))

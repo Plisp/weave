@@ -449,7 +449,8 @@ then descend to the original cursor position, or to the syntax at `focus-id' if 
   (:documentation "event is a uncursed key event. If this node is active then
 adjust cursor state in the context, specialized for the `cursor'.
 If this returns NIL, propagate up the cursor stack.")
-  (:method (node view location context event) nil))
+  (:method (node view location context event)
+    nil))
 
 (defun hole-path (node id)
   "The path from `node' to the first hole at `id' or below it, entering only lists
@@ -895,7 +896,8 @@ addressed by indices."
 
 ;;; literal
 (defgeneric literal-input (node character)
-  (:method ((node parse:literal) character) nil))
+  (:method ((node parse:literal) character)
+    nil))
 
 (defmethod literal-input ((node parse:string-literal) c)
   (let* ((*read-eval* nil)

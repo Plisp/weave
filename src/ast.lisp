@@ -311,89 +311,92 @@ so a name test alone can't distinguish #:|.| from a dot."))
 ;; - semantic uniqueness of binders, used for attaching information
 ;; - uniqueness of locations used for the user interface
 (defgeneric copy-node (node)
-  (:method ((o null)) o) ; optional slots
-  (:method ((o comment)) (make-instance 'comment :kind (kind o) :str (str o)))
-  (:method ((o literal)) (make-instance (class-of o) :str (str o)))
+  (:method ((o null))
+    o) ; optional slots
+  (:method ((o comment))
+    (make-instance 'comment :kind (kind o) :str (str o)))
+  (:method ((o literal))
+    (make-instance (class-of o) :str (str o)))
   (:method ((o integer-literal))
-           (make-instance 'integer-literal :str (str o) :radix (radix o)))
+    (make-instance 'integer-literal :str (str o) :radix (radix o)))
   (:method ((o ratio-literal))
-           (make-instance 'ratio-literal
-            :str (str o)
-            :numerator-node (copy-node (numerator-node o))
-            :denominator-node (copy-node (denominator-node o))))
+    (make-instance 'ratio-literal
+     :str (str o)
+     :numerator-node (copy-node (numerator-node o))
+     :denominator-node (copy-node (denominator-node o))))
   (:method ((o integer-hole))
-           (make-instance 'integer-hole :text (text o) :radix (radix o)))
-  (:method ((o hole)) (hole (text o)))
+    (make-instance 'integer-hole :text (text o) :radix (radix o)))
+  (:method ((o hole))
+    (hole (text o)))
   ;; note: class-of, so binders/reader markers don't decay
   (:method ((o symbol-ref))
-           (make-instance (class-of o)
-            :name (name o)
-            :home-package (home-package o)
-            :input-prefix (input-prefix o)))
+    (make-instance (class-of o)
+     :name (name o)
+     :home-package (home-package o)
+     :input-prefix (input-prefix o)))
   (:method ((o label-def))
-           (make-instance 'label-def :name (name o) :labeled (copy-node (labeled o))))
+    (make-instance 'label-def :name (name o) :labeled (copy-node (labeled o))))
   (:method ((o function-call))
-           (make-instance 'function-call
-            :name (copy-node (name o))
-            :body (mapcar #'copy-node (body o))))
+    (make-instance 'function-call
+     :name (copy-node (name o))
+     :body (mapcar #'copy-node (body o))))
   (:method ((o macro-call))
-           (let ((new-body (mapcar #'copy-node (body o)))
-                 (form-pairs (make-hash-table :test #'eq)))
-             (labels ((pair-nodes (old new)
-                        (setf (gethash old form-pairs) new)
-                        (when (and (ref-list-p old) (ref-list-p new))
-                          (loop for a in (elements old)
-                                for b in (elements new)
-                                do (pair-nodes a b)))))
-               (loop for old in (body o)
-                     for new in new-body
-                     do (pair-nodes old new))
-               (make-instance 'macro-call
-                :op (copy-node (op o))
-                :body new-body
-                :call-env (call-env o)
-                :expanded (expanded o)
-                :subform-envs (when (subform-envs o)
-                                (let ((table (make-hash-table :test #'eq)))
-                                  (maphash (lambda (source change)
-                                             (setf (gethash (gethash source form-pairs)
-                                                            table)
-                                                   (copy-scope-change change form-pairs)))
-                                           (subform-envs o))
-                                  table))
-                :subforms (let ((table (make-hash-table :test #'eq)))
-                            (maphash (lambda (form entry)
-                                       (let ((copy (gethash form form-pairs)))
-                                         (setf (gethash copy table)
-                                               ;; check if the parsed copy (car entry) differs
-                                               ;; otherwise key under the call copy
-                                               (cons (if (eq (car entry) form)
-                                                         copy
-                                                         (copy-node (car entry)))
-                                                     (when (cdr entry)
-                                                       (let ((binders (make-hash-table
-                                                                       :test #'eq)))
-                                                         (maphash (lambda (binder kinds)
-                                                                    (setf (gethash (gethash binder
-                                                                                            form-pairs)
-                                                                                   binders)
-                                                                          (copy-list kinds)))
-                                                                  (cdr entry))
-                                                         binders))))))
-                                     (subforms o))
-                            table)))))
+    (let ((new-body (mapcar #'copy-node (body o)))
+          (form-pairs (make-hash-table :test #'eq)))
+      (labels ((pair-nodes (old new)
+                 (setf (gethash old form-pairs) new)
+                 (when (and (ref-list-p old) (ref-list-p new))
+                   (loop for a in (elements old)
+                         for b in (elements new)
+                         do (pair-nodes a b)))))
+        (loop for old in (body o)
+              for new in new-body
+              do (pair-nodes old new))
+        (make-instance 'macro-call
+         :op (copy-node (op o))
+         :body new-body
+         :call-env (call-env o)
+         :expanded (expanded o)
+         :subform-envs (when (subform-envs o)
+                         (let ((table (make-hash-table :test #'eq)))
+                           (maphash (lambda (source change)
+                                      (setf (gethash (gethash source form-pairs) table)
+                                            (copy-scope-change change form-pairs)))
+                                    (subform-envs o))
+                           table))
+         :subforms (let ((table (make-hash-table :test #'eq)))
+                     (maphash (lambda (form entry)
+                                (let ((copy (gethash form form-pairs)))
+                                  (setf (gethash copy table)
+                                        ;; check if the parsed copy (car entry) differs
+                                        ;; otherwise key under the call copy
+                                        (cons (if (eq (car entry) form)
+                                                  copy
+                                                  (copy-node (car entry)))
+                                              (when (cdr entry)
+                                                (let ((binders (make-hash-table
+                                                                :test #'eq)))
+                                                  (maphash (lambda (binder kinds)
+                                                             (setf (gethash (gethash binder
+                                                                                     form-pairs)
+                                                                            binders)
+                                                                   (copy-list kinds)))
+                                                           (cdr entry))
+                                                  binders))))))
+                              (subforms o))
+                     table)))))
   (:method ((o ref-list))
-           (make-instance 'ref-list
-            :elements (mapcar #'copy-node (elements o))
-            :kind (kind o)
-            :rank (rank o)))
+    (make-instance 'ref-list
+     :elements (mapcar #'copy-node (elements o))
+     :kind (kind o)
+     :rank (rank o)))
   (:method ((o function-code))
-           (make-instance 'function-code
-            :lambda-list (copy-node (lambda-list o))
-            :lambda-list-kind (lambda-list-kind o)
-            :docstring (copy-node (docstring o))
-            :declarations (mapcar #'copy-node (declarations o))
-            :body (mapcar #'copy-node (body o)))))
+    (make-instance 'function-code
+     :lambda-list (copy-node (lambda-list o))
+     :lambda-list-kind (lambda-list-kind o)
+     :docstring (copy-node (docstring o))
+     :declarations (mapcar #'copy-node (declarations o))
+     :body (mapcar #'copy-node (body o)))))
 
 (defun copy-anchors (old new)
   (when (and (typep old 'anchor) (typep new 'anchor))
@@ -424,7 +427,8 @@ so a name test alone can't distinguish #:|.| from a dot."))
         (values-list results))))
 
 (defgeneric is-atom (node)
-  (:method (node) nil))
+  (:method (node)
+    nil))
 
 (defmethod is-atom ((node literal))
   t)
@@ -439,27 +443,31 @@ so a name test alone can't distinguish #:|.| from a dot."))
   t)
 
 (defgeneric get-body (node)
-  (:method (node) (values nil nil))
-  (:method ((node function-call)) (values (body node) t))
-  (:method ((node macro-call)) (values (body node) t))
-  (:method ((node function-code)) (values (body node) t)))
+  (:method (node)
+    (values nil nil))
+  (:method ((node function-call))
+    (values (body node) t))
+  (:method ((node macro-call))
+    (values (body node) t))
+  (:method ((node function-code))
+    (values (body node) t)))
 
 (defgeneric to-syntax (node)
   (:documentation "Converts `node' back to reader syntax.")
-  (:method (node) node)
-  (:method ((node cons)) (mapcar #'to-syntax node))
+  (:method (node)
+    node)
+  (:method ((node cons))
+    (mapcar #'to-syntax node))
   (:method ((node binder))
-           (copy-anchors node
-            (make-instance 'symbol-ref
-             :name (name node)
-             :home-package (home-package node))))
+    (copy-anchors node
+     (make-instance 'symbol-ref :name (name node) :home-package (home-package node))))
   (:method ((node ref-list))
-           (with-elements node
-            (loop for elt in (elements node)
-                  ;; function code needs to be spliced in place
-                  append (if (typep elt 'function-code)
-                             (funcode-syntax elt)
-                             (list (to-syntax elt)))))))
+    (with-elements node
+     (loop for elt in (elements node)
+           ;; function code needs to be spliced in place
+           append (if (typep elt 'function-code)
+                      (funcode-syntax elt)
+                      (list (to-syntax elt)))))))
 
 ;;; location
 (defrecord location ()
@@ -496,20 +504,22 @@ so a name test alone can't distinguish #:|.| from a dot."))
   (:documentation "Returns a node-specific sort or NIL for an invalid id.
 A method may return the ast at `id' as a second value, NIL when absent.
 Note: at macro calls, this returns raw syntax, similarly to get-location.")
-  (:method (node id) (declare (ignore node id)) nil))
+  (:method (node id)
+    (declare (ignore node id))
+    nil))
 
 (defun locsort (location)
   (location-sort (location-node location) (location-id location)))
 
-(defmethod location-sort ((node literal) id)
+(defmethod location-sort ((node string-literal) id)
   'char)
+
+(defgeneric map-node (node f)
+  (:documentation "Maps f taking (child, id, sort) over the ordered locations of node."))
 
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'. Note: this is raw syntax
 from macro-calls. Use node-at instead."))
-
-(defmethod get-location ((node literal) id)
-  (char (text node) id))
 
 (defun string-contents (node)
   (let ((*read-eval* nil))
@@ -551,7 +561,9 @@ from macro-calls. Use node-at instead."))
 (defgeneric location-env (node id outer-env)
   (:documentation "Transform `outer-env' into the environment at `id' in `node'.
 `id' must name an evaluated or function-code location. The input is not mutated.")
-  (:method (node id outer-env) (check-evaluated node id) outer-env))
+  (:method (node id outer-env)
+    (check-evaluated node id)
+    outer-env))
 
 (defgeneric update (node id new-value)
   (:documentation "Functionally updates the location corresponding to `id',
@@ -1736,7 +1748,9 @@ Generally the tag name indexes the whole slot and (tag integer*) index tree stru
   (:documentation "Translates the syntax list indices `suffix' (going downwards) into the
 path of ids leading down from `node'. Stops early where no id addresses the position
 more precisely.")
-  (:method (node suffix) (declare (ignore node suffix)) nil))
+  (:method (node suffix)
+    (declare (ignore node suffix))
+    nil))
 
 (defun suffix-step (node id rest)
   (cons id
@@ -2053,7 +2067,7 @@ These are parsed as an alist: (slot . pattern)."
   (gethash classname *form-rest-patterns*))
 
 (defun rest-element-pattern (node slot index)
-  "Returns the list pattern matched by the element at `index' of the &rest `slot' of `node'."
+  "Returns the list pattern matched by the element at `index' of the &rest `slot' of `node'"
   (when-let (pattern (cdr (assoc slot (form-rest-patterns (type-of node)))))
     (matching-pattern pattern (gen-nth index (funcall slot node)))))
 
@@ -3419,7 +3433,7 @@ Return binding captures, reference captures, and whether analysis completed.
 - Variable reference captures are symbols.
 - Function/block captures are (:FUNCTION name)/(:BLOCK name).
 note: doesn't walk tag references
-note: CL function names are exempt; portable code may not lexically rebind them.
+note: CL function names are exempt since portable code may not lexically rebind them.
 CALL-NEXT-METHOD and NEXT-METHOD-P are exceptions implicitly rebound by DEFMETHOD.
 note: function references from packages named SB-* are exempt implementation-internals.
 note: nested expansion performed internally by macro expanders is not observed, this is

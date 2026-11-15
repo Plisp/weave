@@ -287,9 +287,10 @@
                         (pop loop-rows)
                         (setf row-left (cdar loop-rows))
                         (pprint-indent :block (+ (caar loop-rows) loop-offset) stream)
-                        (unless (and (= index 1) (plusp loop-offset))
-                          (unless (or *comment-ended-line* comment-break)
-                            (pprint-newline :mandatory stream))))
+                        (unless (or *comment-ended-line*
+                                    comment-break
+                                    (and (= index 1) (plusp loop-offset)))
+                          (pprint-newline :mandatory stream)))
                       (unless (or *comment-ended-line*
                                   comment-break
                                   loop-rows

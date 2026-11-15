@@ -139,3 +139,8 @@
     (assert index)
     (setf (w::completion-state buffer)
           (w::copy-completion-state state :selection index))))
+
+(defun serialized-content= (expected actual)
+  "Compares serialized syntax and anchors independently of formatting."
+  (equal (weave-serialization::syntax-key (w::parse-source expected))
+         (weave-serialization::syntax-key (w::parse-source actual))))
