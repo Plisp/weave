@@ -99,6 +99,7 @@
   (flet ((make-call (&rest initargs)
            (apply #'make-instance 'parse:macro-call
                   :op (sym "WHEN") :body nil
+                  :binders (make-hash-table :test #'eq)
                   :subforms (make-hash-table :test #'eq)
                   :subform-envs (make-hash-table :test #'eq)
                   initargs)))
@@ -197,17 +198,14 @@
 (define-test unparseable-macro-argument-is-left-raw :parent parser
   (let ((ast (parse "(loop for x in (1 2) collect x)")))
     (is equal 'parse:macro-call (type-of ast))
-    (is equal nil (nth-value 1 (gethash (parse:gen-tree-ref (parse:body ast) '(3))
-                                        (parse:subforms ast))))
-    (is equal nil (nth-value 1 (gethash nil (parse:subforms ast))))
+    (is equal nil (subform ast 3))
     (is equal nil (parse:location-sort ast '(parse:body 9))))
   (fail (parse "(print (1 2))")))
 
 (define-test subforms-hold-parsed-forms-and-binders :parent parser
-  (let* ((ast (parse "(loop for x in xs do (print x))"))
-         (entry (gethash (parse:gen-tree-ref (parse:body ast) '(5)) (parse:subforms ast))))
-    (is equal 'parse:function-call (type-of (car entry)))
-    (is equal '("X") (binder-names entry))))
+  (let ((ast (parse "(loop for x in xs do (print x))")))
+    (is equal 'parse:function-call (type-of (subform ast 5)))
+    (is equal '("X") (scope-names ast 5))))
 
 (defmacro copied-body (name &body body)
   `(let ((,name nil)) ,@(copy-tree body)))
@@ -596,7 +594,7 @@
         (loop for i below (length (parse:body ast))
               collect (parse:location-sort ast (list 'parse:body i))))
     (is eq t (every #'eq labels (subseq (parse:body ast) 1 6)))
-    (is eq 'parse:binder (type-of (second (parse:body ast))))
+    (is eq 'parse:symbol-ref (type-of (second (parse:body ast))))
     (is equal (reverse labels)
         (parse::tags (parse:location-env ast '(parse:body 0) (parse:make-env))))
     (is eq nil (parse:location-sort ast '(parse:body -1)))
@@ -782,7 +780,7 @@
   (let* ((ast (parse "(weave-tests::hygiene-call-function weave-tests::hygiene-helper)"))
          (name (first (parse:body ast))))
     (is eq t (parse:expanded ast))
-    (is eq nil (gethash name (parse:subforms ast)))
+    (is eq nil (subform ast 0))
     (is eq 'parse:unevaluated (parse:location-sort ast '(parse:body 0)))))
 
 (defmacro hygiene-environment-specialness (&environment env)
@@ -893,7 +891,7 @@
   (let* ((ast (parse "(weave-tests::hygiene-return-name weave-tests::hygiene-outer)"))
          (name (first (parse:body ast))))
     (is eq t (parse:expanded ast))
-    (is eq nil (gethash name (parse:subforms ast)))
+    (is eq nil (subform ast 0))
     (is eq 'parse:unevaluated (parse:location-sort ast '(parse:body 0)))))
 
 (define-test constant-reference-names-are-not-probed :parent parser
@@ -1051,34 +1049,28 @@
   (let* ((ast (parse "(weave-tests::duplicated-evaluated x (print x) x)"))
          (binder (first (parse:body ast))))
     (is eq t (parse:expanded ast))
-    (is = 2 (hash-table-count (parse:subforms ast)))
-    (dolist (source (rest (parse:body ast)))
-      (let ((entry (gethash source (parse:subforms ast))))
-        (is eq t (hash-table-p (cdr entry)))
-        (is equal '("X") (binder-names entry))
-        (is equal '(:variable) (gethash binder (cdr entry)))))))
+    (is = 2 (subform-count ast))
+    (dolist (i '(1 2))
+      (is equal '("X") (scope-names ast i))
+      (is eq t (binds-at-p ast binder i)))))
 
 (define-test rejected-compound-probes-restore-descendants :parent parser
   (let* ((ast (parse "(weave-tests::reconstructed-call (list x) (print y))"))
-         (source (first (parse:body ast)))
-         (reference (parse:gen-tree-ref source '(1)))
-         (after (second (parse:body ast))))
+         (reference (parse:gen-tree-ref (first (parse:body ast)) '(1))))
     (is eq t (parse:expanded ast))
-    (is eq nil (gethash source (parse:subforms ast)))
-    (is eq reference (car (gethash reference (parse:subforms ast))))
-    (is eq 'parse:function-call (type-of (car (gethash after (parse:subforms ast)))))
-    (is = 2 (hash-table-count (parse:subforms ast)))))
+    (is eq nil (subform ast 0))
+    (is eq reference (subform ast 0 1))
+    (is eq 'parse:function-call (type-of (subform ast 1)))
+    (is = 2 (subform-count ast))))
 
 (define-test reconstructed-compound-forms :parent parser
-  (let* ((ast (parse "(weave-tests::copied-body x (print (list x)))"))
-         (form (second (parse:body ast)))
-         (entry (gethash form (parse:subforms ast))))
+  (let ((ast (parse "(weave-tests::copied-body x (print (list x)))")))
     (is eq t (parse:expanded ast))
     (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 1)))
-    (is eq 'parse:function-call (type-of (car entry)))
-    (is equal '("X") (binder-names entry))
-    (is equal "(PRINT (LIST X))" (sx (car entry)))
-    (is equal 1 (hash-table-count (parse:subforms ast)))))
+    (is eq 'parse:function-call (type-of (subform ast 1)))
+    (is equal '("X") (scope-names ast 1))
+    (is equal "(PRINT (LIST X))" (sx (subform ast 1)))
+    (is equal 1 (subform-count ast))))
 
 (define-test structural-matches-need-evaluated-probes :parent parser
   (dolist (source '("(weave-tests::copied-evaluated-and-quoted (print x) (print x))"
@@ -1087,29 +1079,28 @@
       (is eq t (parse:expanded ast))
       (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 0)))
       (is eq 'parse:unevaluated (parse:location-sort ast '(parse:body 1)))
-      (is equal 1 (hash-table-count (parse:subforms ast))))))
+      (is equal 1 (subform-count ast)))))
 
 (define-test equal-compounds-retain-separate-scopes :parent parser
   (let* ((ast (parse "(weave-tests::copied-separate-scopes x (print x) x (print x))"))
-         (first-entry (gethash (second (parse:body ast)) (parse:subforms ast)))
-         (second-entry (gethash (fourth (parse:body ast)) (parse:subforms ast))))
+         (first-binder (first (parse:body ast)))
+         (second-binder (third (parse:body ast))))
     (is eq t (parse:expanded ast))
-    (is equal '("X") (binder-names first-entry))
-    (is equal '("X") (binder-names second-entry))
-    (is equal '(:variable) (gethash (first (parse:body ast)) (cdr first-entry)))
-    (is equal '(:variable) (gethash (third (parse:body ast)) (cdr second-entry)))
-    (is eq nil (gethash (third (parse:body ast)) (cdr first-entry)))
-    (is eq nil (gethash (first (parse:body ast)) (cdr second-entry)))))
+    (is equal '("X") (scope-names ast 1))
+    (is equal '("X") (scope-names ast 3))
+    (is eq t (binds-at-p ast first-binder 1))
+    (is eq t (binds-at-p ast second-binder 3))
+    (is eq nil (binds-at-p ast second-binder 1))
+    (is eq nil (binds-at-p ast first-binder 3))))
 
 (define-test reconstructed-forms-keep-local-macro-environments :parent parser
   (let* ((ast (parse "(macrolet ((m (arg) (list 'print arg)))
                        (weave-tests::copied-body x (m x)))"))
-         (call (first (parse:body ast)))
-         (entry (gethash (second (parse:body call)) (parse:subforms call))))
+         (call (first (parse:body ast))))
     (is eq t (parse:expanded call))
-    (is eq 'parse:macro-call (type-of (car entry)))
-    (is eq t (parse:expanded (car entry)))
-    (is equal '("X") (binder-names entry))))
+    (is eq 'parse:macro-call (type-of (subform call 1)))
+    (is eq t (parse:expanded (subform call 1)))
+    (is equal '("X") (scope-names call 1))))
 
 (defsetf walker-setq-accessor walker-setq-writer)
 (define-symbol-macro walker-setq-alias (walker-setq-accessor walker-setq-object))
@@ -1186,28 +1177,9 @@
   (let* ((ast (parse "(weave-tests::hygiene-setq-target weave-tests::hygiene-free)"))
          (target (first (parse:body ast))))
     (is eq t (parse:expanded ast))
-    (is eq target (car (gethash target (parse:subforms ast))))))
+    (is eq target (subform ast 0))))
 
-(defvar *walker-binder-object*)
-(defmacro walker-returns-binder () *walker-binder-object*)
-
-(define-test walker-rejects-binder-objects-before-on-form :parent parser
-  (let ((*walker-binder-object* (make-instance 'parse:binder :name "BINDER" :home-package *package*)))
-    (dolist (form (list *walker-binder-object* '(walker-returns-binder)))
-      (let ((binder-seen nil))
-        (is eq :caught
-            (handler-case
-                (parse::with-suppressed-parse-errors
-                  (parse::walk-form
-                   form (parse::make-env)
-                   (lambda (form env)
-                     (declare (ignore env))
-                     (when (typep form 'parse:binder) (setf binder-seen t))
-                     t)
-                   (constantly nil) (constantly nil)))
-              (parse::analysis-invariant-error () :caught)))
-        (is eq nil binder-seen))))
-  ;; A symbol used at both a binding and a reference occurrence remains valid.
+(define-test walker-binding-and-reference-share-symbol :parent parser
   (is eq t (not (null (member 'same (setq-walk-observations '(let ((same nil)) same)))))))
 
 (define-symbol-macro walker-global-alias (global-payload global-value))
@@ -1250,49 +1222,43 @@
        (symbol-macrolet ((,alias ,form)) ,alias))))
 
 (define-test symbol-macro-expansions-keep-binding-environments :parent parser
-  (let* ((ast (parse "(weave-tests::symbol-macro-body x (print x))"))
-         (entry (gethash (second (parse:body ast)) (parse:subforms ast))))
+  (let ((ast (parse "(weave-tests::symbol-macro-body x (print x))")))
     (is eq t (parse:expanded ast))
     (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 1)))
-    (is eq 'parse:function-call (type-of (car entry)))
-    (is equal '("X") (binder-names entry))
-    (is equal '(:variable) (gethash (first (parse:body ast)) (cdr entry)))))
+    (is eq 'parse:function-call (type-of (subform ast 1)))
+    (is equal '("X") (scope-names ast 1))
+    (is eq t (binds-at-p ast (first (parse:body ast)) 1))))
 
 (define-test trivia-matched-inputs-are-evaluated :parent parser
   (dolist (source '("(trivia:match (source value) ((list x) x) (_ nil))"
                     "(trivia:ematch (source value) ((list x) x))"
                     "(trivia:cmatch (source value) ((list x) x))"))
-    (let* ((ast (parse source))
-           (entry (gethash (first (parse:body ast)) (parse:subforms ast))))
+    (let ((ast (parse source)))
       (is eq t (parse:expanded ast))
       (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 0)))
-      (is eq 'parse:function-call (type-of (car entry)))
-      (is equal "(SOURCE VALUE)" (sx (car entry)))))
-  (let* ((ast (parse "(trivia:match* ((source value) other) (((list x) _) x))"))
-         (entry (gethash (parse:gen-tree-ref (parse:body ast) '(0 0)) (parse:subforms ast))))
+      (is eq 'parse:function-call (type-of (subform ast 0)))
+      (is equal "(SOURCE VALUE)" (sx (subform ast 0)))))
+  (let ((ast (parse "(trivia:match* ((source value) other) (((list x) _) x))")))
     (is eq t (parse:expanded ast))
     (is eq 'parse:eval-form (parse:location-sort ast '(parse:body 0 0)))
-    (is eq 'parse:function-call (type-of (car entry)))
-    (is equal "(SOURCE VALUE)" (sx (car entry)))))
+    (is eq 'parse:function-call (type-of (subform ast 0 0)))
+    (is equal "(SOURCE VALUE)" (sx (subform ast 0 0)))))
 
 (define-test hole-argument-keeps-analysis :parent parser
   (let* ((ast (parse "(loop for x in (xs a) do (print x))"))
          (edited (parse:update ast '(parse:body 3 1) (parse:hole))))
-    (is equal (hash-table-count (parse:subforms ast))
-              (hash-table-count (parse:subforms edited)))))
+    (is equal (subform-count ast) (subform-count edited))))
 
 (define-test hole-binder-is-skipped :parent parser
   (let ((edited (parse:update (parse "(loop for x in xs for y in ys do (print y))")
                               '(parse:body 1) (parse:hole))))
-    (is equal '("Y")
-              (binder-names (gethash (parse:gen-tree-ref (parse:body edited) '(9))
-                                     (parse:subforms edited))))))
+    (is equal '("Y") (scope-names edited 9))))
 
 (define-test macro-argument-edits-survive-copying :parent parser
   (let* ((call (parse "(when xs wr)"))
          (edited (parse:update call '(parse:body 1) (sym "WRI")))
          (copy (parse:copy-node edited)))
-    (is equal "WRI" (parse:name (car (gethash (nth 1 (parse:body copy)) (parse:subforms copy)))))))
+    (is equal "WRI" (parse:name (subform copy 1)))))
 
 (define-test generated-forms-sort-op :parent parser
   (dolist (source '("(let ((a 1)) a)" "(quote x)" "(if a b c)" "(progn a)" "(function car)"
@@ -1331,7 +1297,7 @@
 
 (define-test value-at-path-reads-presented-forms :parent parser
   (let* ((call (parse "(dolist (x (f xs)) (print x))"))
-         (inner (car (gethash (parse:gen-tree-ref (parse:body call) '(0 1)) (parse:subforms call))))
+         (inner (subform call 0 1))
          (edited (parse:update call '(parse:body 0 1) (parse:update inner 'parse:name (sym "G"))))
          (list (w::make-location :node edited :id '(parse:body 0))))
     (is equal "(G XS)" (sx (parse:value-at-path list '(1))))
@@ -1358,8 +1324,7 @@
   (let* ((ast (parse "(macrolet ((m (x) x)) (m (print y)))"))
          (call (first (parse:body ast))))
     (is equal 'parse:macro-call (type-of call))
-    (is equal 'parse:function-call
-              (type-of (car (gethash (first (parse:body call)) (parse:subforms call)))))))
+    (is equal 'parse:function-call (type-of (subform call 0)))))
 
 (defun call-with-unresolved-function-source (source check)
   (let* ((package (make-package (symbol-name (gensym "FUNCTION-SOURCE-")) :use '(:cl)))
@@ -1385,8 +1350,8 @@
        (is eq 'parse:macro-call (type-of n))
        (is eq t (parse:expanded m))
        (is eq t (parse:expanded n))
-       (is = 1 (hash-table-count (parse:subforms m)))
-       (is = 0 (hash-table-count (parse:subforms n)))
+       (is = 1 (subform-count m))
+       (is = 0 (subform-count n))
        (is eq 'parse:function-call (type-of other))))))
 
 (define-test unresolved-local-functions-shadow-only-their-own-name :parent parser
@@ -1407,7 +1372,7 @@
            (is eq 'parse:function-call (type-of m))
            (is eq 'parse:macro-call (type-of n))
            (is eq t (parse:expanded n))
-           (is = 1 (hash-table-count (parse:subforms n)))
+           (is = 1 (subform-count n))
            (is eq 'parse:function-call (type-of other))
            (let* ((env (parse::call-env marker))
                   (entry (parse::env-function-info (parse:name m) env)))
@@ -1465,10 +1430,8 @@
               (lambda (form env)
                 (declare (ignore env))
                 form)))))
-      (is = 3 (length results))
-      (is eq t (hash-table-p (first results)))
-      (is eq t (hash-table-p (second results)))
-      (is eq nil (third results)))))
+      (is = 4 (length results))
+      (is eq nil (fourth results)))))
 
 (define-test invariants-escape-error-handlers :parent parser
   (fail (parse::invariant nil) 'parse::analysis-invariant-error)
@@ -1483,27 +1446,26 @@
          (binder (parse:env-lookup (parse:gen-tree-ref (parse:body copy) '(0 0)) :variable
                                   (parse:location-env copy '(parse:body 1) (parse:make-env)))))
     (is eq (parse:gen-tree-ref (parse:body copy) '(0 0)) binder)
-    (is eq nil (eq binder (parse:gen-tree-ref (parse:body call) '(0 0))))))
+    (is eq nil (eq binder (parse:gen-tree-ref (parse:body call) '(0 0))))
+    (is eq t (not (null (member binder (located copy 'parse:binder)))))
+    (is eq nil (member binder (located call 'parse:binder)))
+    (is eq 'parse:binder (parse:location-sort copy '(parse:body 0 0)))))
 
 (define-test hole-binder-binds-nothing :parent parser
   (let ((edited (parse:update (parse "(dolist (x xs) (print x))") '(parse:body 0 0) (parse:hole))))
-    (is equal nil (binder-names (gethash (nth 1 (parse:body edited))
-                                         (parse:subforms edited))))))
+    (is equal nil (scope-names edited 1))))
 
 (define-test unparseable-calls-drop-binders :parent parser
-  (let* ((call (parse:update (parse "(dolist (x xs) (print x))") 'parse:op (parse:hole)))
-         (entry (gethash (nth 1 (parse:body call)) (parse:subforms call))))
-    (is equal 'parse:function-call (type-of (car entry)))
-    (is equal nil (cdr entry))
+  (let ((call (parse:update (parse "(dolist (x xs) (print x))") 'parse:op (parse:hole))))
+    (is equal 'parse:function-call (type-of (subform call 1)))
+    (is equal nil (scope-names call 1))
     (is equal nil (parse::variable-bindings
                    (parse:location-env call '(parse:body 1) (parse:make-env))))))
 
 (define-test unparseable-calls-keep-parsed-arguments :parent parser
   (let* ((call (parse:update (parse "(dolist (x (f xs)) (print x))") 'parse:op (parse:hole)))
          (renamed (parse:update call '(parse:body 0 0) (sym "Y"))))
-    (is equal 'parse:function-call
-              (type-of (car (gethash (parse:gen-tree-ref (parse:body renamed) '(0 1))
-                                     (parse:subforms renamed)))))
+    (is equal 'parse:function-call (type-of (subform renamed 0 1)))
     (is equal "(_ (Y (F XS)) (PRINT X))" (sx renamed))))
 
 (define-test failed-expansions-keep-parsed-arguments :parent parser
@@ -1512,12 +1474,11 @@
          (print-form (nth 7 body))
          (deleted (parse:update call 'parse:body (append (subseq body 0 6) (subseq body 7)))))
     (is eq print-form (nth 6 (parse:body deleted)))
-    (is equal 'parse:function-call (type-of (car (gethash print-form (parse:subforms deleted)))))
+    (is equal 'parse:function-call (type-of (subform deleted 6)))
     (is equal nil (parse::expanded deleted))
     (let ((restored (parse:update deleted 'parse:body body)))
       (is equal t (parse::expanded restored))
-      (is equal '("I") (binder-names (gethash (nth 7 (parse:body restored))
-                                              (parse:subforms restored))))))
+      (is equal '("I") (scope-names restored 7))))
   (is equal nil (parse::expanded (parse "(loop for i from 1 to 10 (print i))"))))
 
 (define-test function-call-renames-stay-calls :parent parser
@@ -1527,7 +1488,7 @@
 (define-test lambda-expressions-are-walked :parent parser
   (flet ((binders (source)
            (let ((ast (parse source)))
-             (binder-names (gethash (car (last (parse:body ast))) (parse:subforms ast))))))
+             (scope-names ast (1- (length (parse:body ast)))))))
     (is equal '("P" "Q") (binders "(multiple-value-bind (p q) (f x) (list p q))"))
     (is equal '("A" "B" "BP")
               (binders "(destructuring-bind (a &optional (b 1 bp)) l (list a b bp))")))
@@ -1544,7 +1505,7 @@
 (define-test dotted-tails-map-to-paths :parent parser
   (flet ((binders (source)
            (let ((ast (parse source)))
-             (binder-names (gethash (car (last (parse:body ast))) (parse:subforms ast))))))
+             (scope-names ast (1- (length (parse:body ast)))))))
     (is equal '("A" "B" "C") (binders "(destructuring-bind (a . (b c)) l (list a b c))"))
     (is equal '("A" "B") (binders "(destructuring-bind (a . b) l (list a b))"))
     (is equal '("A" "B") (binders "(loop for (a . b) in xs collect a)"))))
@@ -1552,7 +1513,7 @@
 (define-test binding-kinds :parent parser
   (flet ((kinds (source)
            (let ((ast (parse source)))
-             (binder-kinds (gethash (car (last (parse:body ast))) (parse:subforms ast))))))
+             (scope-kinds ast (1- (length (parse:body ast)))))))
     (is equal '(("X" :variable)) (kinds "(dolist (x xs) (print x))"))
     (is equal '(("NEXT" :function)) (kinds "(with-hash-table-iterator (next h) (next))"))
     (is equal '(("IT" :function)) (kinds "(with-package-iterator (it p :internal) (it))"))
@@ -1562,11 +1523,9 @@
               (kinds "(multiple-value-bind (p q) (f) (list p q))"))
     (is equal '(("F" :function :variable)) (kinds "(var-and-fn f (f))"))
     (is equal '(("X" :variable)) (kinds "(shadowing-vars x x (print x))")))
-  ;; the first visible binder of a name is saved
-  (let* ((ast (parse "(shadowing-vars x x (print x))"))
-         (binders (cdr (gethash (car (last (parse:body ast))) (parse:subforms ast)))))
-    (is equal nil (gethash (parse:gen-tree-ref (parse:body ast) '(0)) binders))
-    (is equal '(:variable) (gethash (parse:gen-tree-ref (parse:body ast) '(1)) binders))))
+  (let ((ast (parse "(shadowing-vars x x (print x))")))
+    (is eq nil (binds-at-p ast (first (parse:body ast)) 2))
+    (is eq t (binds-at-p ast (second (parse:body ast)) 2))))
 
 (parse::defform (alternative-slot-test parse::&or ((left right)) (fallback)))
 

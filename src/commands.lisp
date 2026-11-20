@@ -834,7 +834,7 @@ addressed by indices."
         ((eql 'parse:binder)
          (when (and (symbol-char-p c) (not (digit-char-p c)))
            (swap-node location
-                      (make-instance 'parse:binder
+                      (make-instance 'parse:symbol-ref
                        :name (string-upcase c)
                        :home-package (buffer-package buffer))
                       buffer)))
@@ -1116,10 +1116,7 @@ A package prefix on `node' restricts candidates to that package and visibility."
            (home (if prefix (parse:home-package node) (buffer-package buffer)))
            (c (tui-sys:event-kind event)))
       (labels ((replace-ref (name home prefix &optional (refilter t))
-                 (let ((new (make-instance
-                              (if (lambda-list-parameter-location-p location)
-                                  'parse:binder
-                                  'parse:symbol-ref)
+                 (let ((new (make-instance 'parse:symbol-ref
                              :name name
                              :home-package home
                              :input-prefix prefix)))
@@ -1134,6 +1131,23 @@ A package prefix on `node' restricts candidates to that package and visibility."
                               :candidates (completion-candidates buffer new))))
                    t)))
         (cond
+          ((eq 'parse:binder (locsort location))
+           (cond
+             ((and (symbol-char-p c) (not (char= c #\:)))
+              (swap-node location
+                         (make-instance 'parse:symbol-ref
+                          :name (format nil "~a~a" name (string-upcase c))
+                          :home-package (parse:home-package node))
+                         buffer))
+             ((char= c #\Rubout)
+              (let ((name (string name)))
+                (if (< 1 (length name))
+                    (swap-node location
+                               (make-instance 'parse:symbol-ref
+                                :name (string-drop name 1)
+                                :home-package (parse:home-package node))
+                               buffer)
+                    (swap-node location (hole) buffer))))))
           ((char= c #\:)
            (cond
              ((null prefix)
@@ -1171,27 +1185,6 @@ A package prefix on `node' restricts candidates to that package and visibility."
                      (buffer-package buffer) nil)
                     (setf (completion-state buffer) nil)))
               t))))))))
-
-(defmethod handle-key ((node parse:binder) view location buffer event)
-  (when (is-regular-char-event event)
-    (let ((s (parse:name node))
-          (c (tui-sys:event-kind event)))
-      (cond
-        ((and (symbol-char-p c) (not (char= c #\:)))
-         (swap-node location
-                    (make-instance 'parse:binder
-                     :name (format nil "~a~a" s (string-upcase c))
-                     :home-package (parse:home-package node))
-                    buffer))
-        ((char= c #\Rubout)
-         (let ((s (string s)))
-           (if (< 1 (length s))
-               (swap-node location
-                          (make-instance 'parse:binder
-                           :name (string-drop s 1)
-                           :home-package (parse:home-package node))
-                          buffer)
-               (swap-node location (hole) buffer))))))))
 
 ;;; functions
 (defparameter *fun-key-handlers* (make-hash-table :test #'equal))

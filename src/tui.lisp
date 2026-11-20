@@ -384,7 +384,7 @@ Must NOT perform context side effects if `measuring'."))
         (when definitions
           (dolist (definition (elements definitions))
             (let ((parts (elements definition)))
-              (when (and (typep (first parts) 'parse:binder)
+              (when (and (typep (first parts) 'parse:symbol-ref)
                          (typep (second parts) 'parse:function-code))
                 (setf (gethash (first parts) table) (second parts))))))))
     table))
@@ -421,7 +421,8 @@ Must NOT perform context side effects if `measuring'."))
         (multiple-value-bind (entry kind)
             (parse:env-lookup node kind env)
           (let ((binder (ensure-car entry)))
-            (when (and (eq kind :lexical) (typep binder 'parse:binder))
+            (when (eq kind :lexical)
+              (assert (typep binder 'parse:symbol-ref))
               binder)))))))
 
 (defun focus-binder (buffer)
@@ -696,21 +697,9 @@ since these aren't a proper location."
   (let* ((location (car stack))
          (str (symbol-ref-text node (buffer-package context) t))
          (focused (location= location (focus context))))
-    (tui:puts* str 1 1 rect)
-    (make-instance 'ast-view
-     :rect (tui:clamp-rect (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width str))
-            rect)
-     :location location
-     :hoverable t
-     :key-handler (when focused
-                    (make-key-handler node location))
-     :focused focused)))
-
-(defmethod render-node ((node parse:binder) stack context rect &key)
-  (let* ((location (car stack))
-         (str (symbol-ref-text node (buffer-package context)))
-         (focused (location= location (focus context))))
-    (tui:puts* str 1 1 rect (tui-sys:make-style :italicp t))
+    (tui:puts* str 1 1 rect
+               (when (eq 'parse:binder (locsort (car stack)))
+                 (tui-sys:make-style :italicp t)))
     (make-instance 'ast-view
      :rect (tui:clamp-rect (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width str))
             rect)
@@ -1474,7 +1463,7 @@ rest indented by 1, keeping keywords in pairs."
                                 :cols (max 0 (- available indent))))
          (rows nil))
     (labels ((width (form index)
-               (let* ((parsed (or (car (gethash form (parse:subforms node))) form))
+               (let* ((parsed (or (gethash form (parse:subforms node)) form))
                       (measured (measure-node parsed
                                  (cons (make-location
                                         :node node
@@ -1482,7 +1471,7 @@ rest indented by 1, keeping keywords in pairs."
                                        stack)
                                  context bounds :delimited t :transform
                                  (lambda (elt)
-                                   (or (car (gethash elt (parse:subforms node))) elt)))))
+                                   (or (gethash elt (parse:subforms node)) elt)))))
                  (tui:rect-cols measured))))
       (loop for tail on (parse:body node) by #'cddr
             for index from 0 by 2
@@ -1508,7 +1497,7 @@ rest indented by 1, keeping keywords in pairs."
                     :id (if (zerop index) 'parse:op (list 'parse:body (1- index))))))
          (keys `(:delimited t :transform
                             ,(lambda (elt)
-                               (or (car (gethash elt (parse:subforms node))) elt))))
+                               (or (gethash elt (parse:subforms node)) elt))))
          (rule (indent:indent-rule elements))
          (spec (cond
                  ((and (typep (parse:op node) 'parse:symbol-ref)
@@ -1774,7 +1763,8 @@ pairs building new elements of &rest and &body slots."))
           (lambda ()
             (default-node layout)))))
 
-(defmacro deflayout (type () templates &rest rows)
+(defmacro deflayout (type (&rest options) templates &rest rows)
+  (declare (ignore options))
   "Lays out forms of class `type' in `rows' of slots, where `templates' are forms building
 new elements for its &rest and &body slots.
 ASSUMES that &rest slots accept (slot i j) even if the list is optional like let.
@@ -1854,9 +1844,10 @@ ASSUMES we never focus a plain list body."
 (deflayout parse:return-from-form () ((parse:value . (hole)))
   (parse:op parse:name 1 parse:value))
 
-(deflayout parse:if-form () ((parse:then-else . (hole)))
+(deflayout parse:if-form () ()
   (parse:op parse:test)
-  (3 parse:then-else))
+  (3 parse:then)
+  (3 parse:else))
 
 (deflayout parse:setq-form () ((parse:forms . (hole)))
   (parse:op (parse:forms ((0 . 2)))))
