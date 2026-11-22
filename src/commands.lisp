@@ -495,9 +495,9 @@ addressed by indices."
                (dolist (id path)
                  (descend buffer id))
                (return))
-          finally (cond
-                    ((typep node 'parse:function-call) (descend buffer 'parse:name))
-                    ((typep node 'parse:macro-call) (descend buffer 'parse:op))))))
+          finally (when (or (typep node 'parse:function-call)
+                            (typep node 'parse:macro-call))
+                    (descend buffer 'parse:op)))))
 
 (setf (gethash (tui-sys:make-event :kind #\space) *global-key-handlers*)
       (lambda (view buffer)
@@ -598,7 +598,7 @@ addressed by indices."
      (let ((focus (focus buffer)))
        ;; replace the whole parent function node if editing the name
        (swap-node (if (and (typep (location-node focus) 'parse:function-call)
-                           (eq (location-id focus) 'parse:name))
+                           (eq (location-id focus) 'parse:op))
                       (second (stack buffer))
                       focus)
                   (funcall (gethash s *default-expansions*)) buffer))
@@ -713,7 +713,7 @@ addressed by indices."
                    (#\* (make-instance 'parse:bitvector-literal :str "#*"))
                    (#\'
                     (make-instance 'parse:function-form
-                     :op 'parse:read-function
+                     :op (parse:symbol-reify 'function t)
                      :fun-designator (hole)))
                    ((#\b #\o #\x)
                     (make-instance 'parse:integer-literal
@@ -773,7 +773,7 @@ addressed by indices."
                               (typep value 'ref-list)
                               (typep (first (elements value)) 'parse:reader-marker))
                      (case (parse:resolve (first (elements value)))
-                       ((parse:read-quasiquote eclector.reader:quasiquote) (incf depth))
+                       ((eclector.reader:quasiquote) (incf depth))
                        ((eclector.reader:unquote eclector.reader:unquote-splicing)
                         (decf depth))))
                    (setf prefix (append-id prefix index))))))))
@@ -812,7 +812,7 @@ addressed by indices."
             (eql c #\`)
             (member (locsort location) '(parse:eval-form parse:unevaluated)))
        (let ((quoted (make-instance 'parse:quasiquote-form
-                      :op 'parse:read-quasiquote
+                      :op (parse:symbol-reify 'eclector.reader:quasiquote t)
                       :thing (hole))))
          (swap-node location
                     (if (eq (locsort location) 'parse:unevaluated)
@@ -849,7 +849,7 @@ addressed by indices."
               (swap-node location newnode buffer)))
            ((char= c #\')
             (let ((newnode (make-instance 'parse:quote-form
-                            :op 'parse:read-quote
+                            :op (parse:symbol-reify 'quote t)
                             :thing (hole))))
               (swap-node location newnode buffer)
               (focus-first-hole buffer)
@@ -1215,7 +1215,7 @@ if none, surround current atom"
           for loc in (stack buffer)
           for node = (location-node loc)
           while (and (is-binop-call node)
-                     (> (binop-precedence (parse:name node)) (binop-precedence op)))
+                     (> (binop-precedence (parse:op node)) (binop-precedence op)))
           finally (let ((sym (make-instance 'parse:symbol-ref
                               :name (symbol-name op)
                               :home-package (symbol-package op)))
@@ -1646,7 +1646,7 @@ Returns true."
      (parse:reader-literal object (write-to-string object :escape t)))
     (list
      (make-instance 'parse:quote-form
-      :op 'parse:read-quote
+      :op (parse:symbol-reify 'quote t)
       :thing (apply #'ref-list (mapcar #'reify object))))
     (boolean
      (make-instance 'parse:symbol-ref
@@ -1692,10 +1692,10 @@ Returns true."
                        ((list (eql 'parse:body) (eql 1)) t)))
             (swap-node (caddr stack)
                        (make-instance 'parse:function-call
-                        :name (parse:name up)
+                        :op (parse:op up)
                         :body (list (first (parse:body up))
                                     (make-instance 'parse:function-call
-                                     :name (parse:name upup)
+                                     :op (parse:op upup)
                                      :body (list (second (parse:body up))
                                                  (second (parse:body upup))))))
                        buffer)
@@ -1718,9 +1718,9 @@ Returns true."
                        ((list (eql 'parse:body) (eql 0)) t)))
             (swap-node (caddr stack)
                        (make-instance 'parse:function-call
-                        :name (parse:name up)
+                        :op (parse:op up)
                         :body (list (make-instance 'parse:function-call
-                                     :name (parse:name upup)
+                                     :op (parse:op upup)
                                      :body (list (first (parse:body upup))
                                                  (first (parse:body up))))
                                     (second (parse:body up))))

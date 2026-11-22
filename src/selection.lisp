@@ -1,5 +1,25 @@
 (in-package #:weave-tui)
 
+;;; search
+;; map-slots: slots: binds body
+;; walker spec val f - over eval forms only
+;; traverse spec val f - over all forms: for unevaluated matching, string search
+;;
+;; search: (foo x)
+;; (let ((x (foo x))) (foo x))
+;; match across slots:
+;; op: symbol-ref
+;; binds: (&rest (&or binder (binder &optional eval-form)))
+;; body: &body eval-form
+;; match: (binds 0 1), (body 0)
+;;
+;; substitute (bar y) at (binds 0 1),(body 0)
+;; traverse eval-forms, function-code
+;;
+;; in macros: recurse only into eval-forms
+;; arbitrary substitution for: macros, unevaluated matching
+;; unevaluated: every &tree head is a candidate for list matching
+;; but not syntax?
 (defun end-selection-mode (buffer)
   (when-let (selection (selection buffer))
     (setf (selection buffer) (copy-selection selection :activep nil))))

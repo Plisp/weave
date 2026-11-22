@@ -155,18 +155,9 @@
 (defun serialization-prefix (node)
   (when (typep node 'reader-marker)
     (cond
-      ((some (lambda (s)
-               (string-and-package= node s))
-             '(quote read-quote))
-       "'")
-      ((some (lambda (s)
-               (string-and-package= node s))
-             '(function read-function))
-       "#'")
-      ((some (lambda (s)
-               (string-and-package= node s))
-             '(eclector.reader:quasiquote read-quasiquote))
-       "`")
+      ((string-and-package= node 'quote) "'")
+      ((string-and-package= node 'function) "#'")
+      ((string-and-package= node 'eclector.reader:quasiquote) "`")
       ((string-and-package= node 'eclector.reader:unquote) ",")
       ((string-and-package= node 'eclector.reader:unquote-splicing) ",@")
       ((string-and-package= node 'read-eval) "#."))))
@@ -333,7 +324,7 @@
   (setf *comment-ended-line* nil))
 
 (defmethod serialize-node ((node function-call) stream)
-  (serialize-node (apply #'ref-list (name node) (body node)) stream))
+  (serialize-node (apply #'ref-list (op node) (body node)) stream))
 
 (defmethod serialize-node ((node irregular-form) stream)
   ;; the original node's anchors are handled by the around method

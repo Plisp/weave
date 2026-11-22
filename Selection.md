@@ -59,10 +59,12 @@ c
 1. Decouple binders from node classes, these should be sorts determined by an owning node
    * ~~remove usages of change-class~~
    * ~~macro-calls store a set of binders~~
-2. Generate `map-node node f(child,spec,id)` for mapping over locations.
-3. Introduce update records for provenance tracking later, add a parameter `keep-identity` that works for single substitutions
+2. Introduce `map-node node f(child,spec,id)` for mapping over locations.
+   * ~~manual cases~~
+   * ~~generated bindings~~
+3. Implement sequence search using a basic non-backtracking approach
+4. Introduce update records for provenance tracking later, add a parameter `keep-identity` that works for single substitutions
    * for slots (replace :id id :node newnode)
    * for list positions (splice :id id :index i insert :insert (list nodes) :delete int)
    * change signature to `update node update-records`
-4. Implement search using a basic non-backtracking search on each node
 5. Implement replacement planning: from input selection specs <-> update records, and replacement target spec, compute update records for the replacement. This must return both a final new node and a translated focus (last replacement?) for code sharing with search/replace.

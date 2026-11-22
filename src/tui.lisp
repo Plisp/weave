@@ -112,7 +112,7 @@ construction, do not modify."))
 (defun copy-selection
   (selection
    &key (point (selection-point selection)) (activep (selection-activep selection))
-        (stack (when (typep selection 'zipper)
+        (stack (when (zipper-p selection)
                  (zipper-stack selection))))
   "Returns a selection with updated fields. A nonempty `stack' makes it into a zipper."
   (apply (if stack #'make-zipper #'make-selection)
@@ -352,9 +352,10 @@ Must NOT perform context side effects if `measuring'."))
                              (remove-duplicates
                                (append (mapcar #'car
                                                (parse:form-slot-kinds (type-of value)))
-                                       (typecase value
-                                         (parse:function-call '(parse:name))
-                                         (parse:macro-call '(parse:op))))))
+                                       (when (typep value
+                                                    '(or parse:function-call
+                                                      parse:macro-call))
+                                         '(parse:op)))))
                       (when (slot-boundp value slot)
                         (visit (make-location :node value :id slot) env))))))))
       (visit location (parse:make-env)))))
@@ -450,14 +451,6 @@ Must NOT perform context side effects if `measuring'."))
                       (fboundp symbol)
                       (boundp symbol)))))))
 
-(defun anchored-comment-locations (node &optional (slots '(parse::leading)))
-  (when (typep node 'parse::anchor)
-    (loop for slot in slots
-          append (loop for comment in (slot-value node slot)
-                       for index from 0
-                       when (typep comment 'parse::comment)
-                       collect (make-location :node node :id (list :comment slot index))))))
-
 (defun render-trailing-comments (view comments stack context rect &rest keys)
   (if (null comments)
       view
@@ -488,8 +481,8 @@ Must NOT perform context side effects if `measuring'."))
 (defmethod render-node :around (node stack context rect &rest keys &key measuring)
   (unless (typep node '(or ref-list list))
     (setf keys (remove-from-plist keys :layout-rule)))
-  (let ((comments (anchored-comment-locations node))
-        (trailing (anchored-comment-locations node '(parse::trailing)))
+  (let ((comments (parse:anchored-comment-locations node))
+        (trailing (parse:anchored-comment-locations node '(parse::trailing)))
         (vals nil))
     (flet ((render-form (bounds)
              (setf vals
@@ -594,7 +587,7 @@ since these aren't a proper location."
     (global-key-handler view event buffer node location)))
 
 (defun fname (node)
-  (parse:name (parse:name node)))
+  (parse:name (parse:op node)))
 
 ;; note: assumes length 1 symbol mapping for <= and >=
 (defparameter *arb-arity-binops* #(/ * + - < > <= >= = /=))
@@ -607,7 +600,7 @@ since these aren't a proper location."
 
 (defun is-binop-call (node)
   (trivia:match node
-    ((parse:function-call :name (and (class parse:symbol-ref) op))
+    ((parse:function-call :op (and (class parse:symbol-ref) op))
      (find (parse:resolve op) *arb-arity-binops*))))
 
 ;;; hole
@@ -642,17 +635,9 @@ since these aren't a proper location."
 (defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (/= . #\≠) (lambda . "λ")))
 
 (defparameter *reader-punctuation*
-  '((parse:read-quote . "'") (parse:read-function . "#'") (parse:read-quasiquote . "`")
-    (unquote . ",") (unquote-splicing . ",@") (parse:read-eval . "#.")))
-
-(defun to-read-syntax (name)
-  (case name
-    (quote 'parse:read-quote)
-    (function 'parse:read-function)
-    (eclector.reader:quasiquote 'parse:read-quasiquote)
-    (eclector.reader:unquote 'unquote)
-    (eclector.reader:unquote-splicing 'unquote-splicing)
-    (t name)))
+  '((quote . "'") (function . "#'") (eclector.reader:quasiquote . "`")
+    (eclector.reader:unquote . ",") (eclector.reader:unquote-splicing . ",@")
+    (parse:read-eval . "#.")))
 
 (defun symbol-ref-prefix (node package)
   "The package prefix displayed for `node' in `package' or NIL when unqualified."
@@ -683,7 +668,7 @@ since these aren't a proper location."
 (defun symbol-ref-text (node package &optional use-mappings)
   (cond
     ((typep node 'parse:reader-marker)
-     (or (assoc-value *reader-punctuation* (to-read-syntax (parse:resolve node)))
+     (or (assoc-value *reader-punctuation* (parse:resolve node))
          (string (parse:name node))))
     ((and use-mappings
           (null (parse::input-prefix node))
@@ -709,10 +694,10 @@ since these aren't a proper location."
                     (make-key-handler node location))
      :focused focused)))
 
-(defun render-symbol-space (op loc stack context rect measuring)
+(defun render-symbol-space (op loc stack context rect measuring &optional reader-marker?)
   "Renders the string designator `op' under `loc', with a space after it
 unless specified in *reader-punctuation*."
-  (let* ((text (if-let (exp (assoc-value *reader-punctuation* op))
+  (let* ((text (if-let (exp (and reader-marker? (assoc-value *reader-punctuation* op)))
                  (string exp)
                  (if-let (exp (assoc-value *symbol-mappings* op))
                    (format nil "~(~a~) " exp)
@@ -1011,7 +996,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                                (list-locator contents-location) contents-stack context rect
                                keys))))
                (if (parse::inside l)
-                   (let ((comments (anchored-comment-locations l '(parse::inside))))
+                   (let ((comments (parse:anchored-comment-locations l '(parse::inside))))
                      (render-elements (mapcar #'node-at comments)
                       *horizontal*
                       (lambda (index)
@@ -1199,9 +1184,9 @@ including quotes."
 ;;   - higher arity duplicated op views break invariant: always a single focused view
 (defun function-keyword-start (node stack buffer)
   "Returns the positional argument count before &key, or NIL if not present."
-  (let ((name (parse:name node)))
-    (when (typep name 'parse:symbol-ref)
-      (lambda-list-section-start (function-signature name stack buffer) '(&key)))))
+  (let ((op (parse:op node)))
+    (when (typep op 'parse:symbol-ref)
+      (lambda-list-section-start (function-signature op stack buffer) '(&key)))))
 
 (defun function-call-indentation (node stack context rect)
   (ensure-gethash (cons node rect)
@@ -1210,8 +1195,8 @@ including quotes."
 (defun function-call-indentation-uncached (node stack context rect)
   "All on same line if possible, otherwise one argument on first line and
 rest indented by 1, keeping keywords in pairs."
-  (let* ((name-rect (measure-node (parse:name node)
-                     (cons (make-location :node node :id 'parse:name) stack) context rect))
+  (let* ((name-rect (measure-node (parse:op node)
+                     (cons (make-location :node node :id 'parse:op) stack) context rect))
          (rect-limit (max 1
                           (min (- *column-limit* (tui:rect-x rect)) (tui:rect-cols rect))))
          (arguments (parse:body node))
@@ -1285,7 +1270,7 @@ rest indented by 1, keeping keywords in pairs."
                         :measuring measuring))
             (arg2-rect (tui:rect arg2-view))
             (width (1+ (max (tui:rect-cols arg1-rect) (tui:rect-cols arg2-rect))))
-            (div-loc (make-location :node node :id 'parse:name))
+            (div-loc (make-location :node node :id 'parse:op))
             (line-view (make-instance 'ast-view
                         :location div-loc
                         :hoverable t
@@ -1295,10 +1280,10 @@ rest indented by 1, keeping keywords in pairs."
                                                :cols width
                                                :y (tui:rect-y2 arg1-rect))
                                rect)
-                        :key-handler (make-key-handler (parse:name node) div-loc)
+                        :key-handler (make-key-handler (parse:op node) div-loc)
                         :focused (location= div-loc (focus context)))))
        (unless measuring
-         (setf (gethash (parse:name node) (node-views context)) line-view)
+         (setf (gethash (parse:op node) (node-views context)) line-view)
          (when (and (location= div-loc (focus context)))
            (setf (gethash :focus-rect (redisplay-cache context)) (tui:rect line-view))))
        (setf (view-stack line-view) (cons div-loc stack))
@@ -1338,8 +1323,8 @@ rest indented by 1, keeping keywords in pairs."
                               context rect
                               :measuring measuring)))
               (arg1-rect (tui:rect arg1-view))
-              (op-view (render-node (parse:name node)
-                        (cons (make-location :node node :id 'parse:name) stack) context
+              (op-view (render-node (parse:op node)
+                        (cons (make-location :node node :id 'parse:op) stack) context
                         (tui:clamp-rect
                           (tui:copy-rect rect :x (1+ (tui:rect-x2 arg1-rect)))
                          rect)
@@ -1408,11 +1393,11 @@ rest indented by 1, keeping keywords in pairs."
           :focused (location= location (focus context))))))
     (_
      (let* ((location (car stack))
-            (render (render-elements (cons (parse:name node) (parse:body node))
+            (render (render-elements (cons (parse:op node) (parse:body node))
                      (function-call-indentation node stack context rect)
                      (lambda (index)
                        (if (zerop index)
-                           (make-location :node node :id 'parse:name)
+                           (make-location :node node :id 'parse:op)
                            (make-location :node node :id (list 'parse:body (1- index)))))
                      stack context rect (list :measuring measuring)))
             (real-rect (tui:rect render)))
@@ -1500,8 +1485,7 @@ rest indented by 1, keeping keywords in pairs."
                                (or (gethash elt (parse:subforms node)) elt))))
          (rule (indent:indent-rule elements))
          (spec (cond
-                 ((and (typep (parse:op node) 'parse:symbol-ref)
-                       (eq (parse:resolve (parse:op node)) 'setf))
+                 ((eq (parse:resolve (parse:op node)) 'setf)
                   (setf-indentation node stack context rect))
                  ((compact-layout-p elements rule locate stack context rect keys)
                   *horizontal*)
@@ -1527,8 +1511,9 @@ rest indented by 1, keeping keywords in pairs."
 ;;; quasiquote
 (defmethod render-node ((node parse:quasiquote-form) stack context rect &key measuring)
   (let* ((location (car stack))
-         (op-view (render-symbol-space 'parse:read-quasiquote
-                   (make-location :node node :id 'parse:op) stack context rect measuring))
+         (op-view (render-symbol-space 'eclector.reader:quasiquote
+                   (make-location :node node :id 'parse:op) stack context rect measuring
+                   t))
          (op-rect (tui:rect op-view))
          (view (render-node (parse:thing node)
                 (cons (make-location :node node :id 'parse:thing) stack) context
@@ -1592,7 +1577,7 @@ pairs building new elements of &rest and &body slots."))
   (:method ((node parse:ratio-literal))
     '(parse:numerator-node parse:denominator-node))
   (:method ((node parse:function-call))
-    '(parse:name parse:body))
+    '(parse:op parse:body))
   (:method ((node parse:macro-call))
     '(parse:op parse:body))
   (:method ((node parse:function-code))
@@ -1661,12 +1646,7 @@ pairs building new elements of &rest and &body slots."))
   (when (and (typep node '(or parse:let-form parse:let*-form)) (eq slot 'parse:vars))
     (return-from slot-render-keys
      (list :indent *vertical* :delimited :shallow :layout-rule
-           (indent::child-rule
-             (indent:indent-rule
-               (list (make-instance 'parse:symbol-ref
-                      :name (symbol-name (parse:op node))
-                      :home-package (symbol-package (parse:op node)))))
-            1))))
+           (indent::child-rule (indent:indent-rule (list (parse:op node))) 1))))
   (case (cdr (assoc slot (parse:form-slot-kinds (type-of node))))
     (parse::&tree '(:delimited t))
     (parse::&declarations (list :indent *vertical* :delimited t))
@@ -1677,7 +1657,7 @@ pairs building new elements of &rest and &body slots."))
   (tui:with-horizontal (rect)
     (tui:place (rect)
       (render-literal-line "(" stack context rect))
-    (dolist (slot '(parse:setf-op parse:name))
+    (dolist (slot '(parse:setf-op parse:op))
       (unless (eq slot 'parse:setf-op)
         (tui:pad 1))
       (tui:place (rect)
@@ -1698,9 +1678,10 @@ pairs building new elements of &rest and &body slots."))
               :indent spec
               (slot-render-keys node slot))))
     ((eq item 'parse:op)
-     (render-symbol-space (parse:op node)
-      (make-location :node node :id 'parse:op) stack context rect measuring))
-    ((and (eq item 'parse:name)
+     (render-symbol-space (parse:resolve (parse:op node))
+      (make-location :node node :id 'parse:op) stack context rect measuring
+      (parse:reader-marker-p (parse:op node))))
+    ((and (eq item 'parse:op)
           (typep node '(or parse:defun-form parse:defmethod-form))
           (slot-boundp node 'parse:setf-op))
      (render-setf-function-name node stack context rect measuring))
@@ -1764,11 +1745,11 @@ pairs building new elements of &rest and &body slots."))
             (default-node layout)))))
 
 (defmacro deflayout (type (&rest options) templates &rest rows)
-  (declare (ignore options))
   "Lays out forms of class `type' in `rows' of slots, where `templates' are forms building
 new elements for its &rest and &body slots.
 ASSUMES that &rest slots accept (slot i j) even if the list is optional like let.
 ASSUMES we never focus a plain list body."
+  (declare (ignore options))
   `(register-layout
      (make-layout
       :op ',type
@@ -2520,12 +2501,13 @@ as `viewport'."
       (old-redisplay-method nil)
       (fnames '(render-toplevel-window render-buffer draw-buffer-border debugger-text
                 restart-depth enter-debugger-loop function-call-indentation
-                anchored-comment-locations render-trailing-comments ref-list-indentation
-                symbol-ref-prefix symbol-ref-text render-literal-text render-literal-line
-                render-delimiter render-symbol-space render-elements render-layout-slot
-                slot-render-keys render-setf-function-name macro-call-indentation
-                setf-indentation loop-indentation draw-semantic-backgrounds draw-highlights
-                render-completion-window render-completion))
+                parse:anchored-comment-locations render-trailing-comments
+                ref-list-indentation symbol-ref-prefix symbol-ref-text render-literal-text
+                render-literal-line render-delimiter render-symbol-space render-elements
+                render-layout-slot slot-render-keys render-setf-function-name
+                macro-call-indentation setf-indentation loop-indentation
+                draw-semantic-backgrounds draw-highlights render-completion-window
+                render-completion))
       (funs (make-hash-table :test 'eq)))
   (defun save-ui ()
     (setf draw-buffer-methods (copy-list (sb-mop:generic-function-methods #'draw-buffer)))

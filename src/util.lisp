@@ -12,6 +12,7 @@
            #:tree-update
            #:with-lookup
            #:or-f
+           #:and-f
            #:+fail+
            #:string-drop
            #:split-string
@@ -21,7 +22,9 @@
            #:shallow-copy-record
            #:with-timing
            #:strcat
-           #:lambda-list-section-start))
+           #:vconc
+           #:lambda-list-section-start
+           #:tree-subst))
 
 (in-package #:weave-utils)
 
@@ -98,6 +101,8 @@ cons/array structure such as quoted data. An empty `path' returns `tree' itself.
        ,otherwise)))
 
 (define-modify-macro or-f (&rest forms) or)
+
+(define-modify-macro and-f (&rest forms) and)
 
 (define-constant +fail+ (list t) :test 'equal)
 
@@ -228,6 +233,14 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
              (incf i (length str)))
     out))
 
+(defun vconc (a b)
+  "Destructively appends simple-arrays."
+  (declare (optimize speed) (type simple-array a b))
+  (let* ((alen (length a))
+         (out (adjust-array a (+ (length a) (length b)))))
+    (replace out b :start1 alen)
+    out))
+
 (defun lambda-list-section-start (arglist keywords)
   "Counts positional parameters before a member of `keywords' in `arglist'.
 Returns the preceding parameters as a second value."
@@ -248,3 +261,10 @@ Returns the preceding parameters as a second value."
                 (push parameter parameters)
                 (incf count)))
           finally (return (values nil (nreverse parameters))))))
+
+(defun tree-subst (tree updater)
+  (if (atom tree)
+      (multiple-value-bind (new-val replace?)
+          (funcall updater tree)
+        (if replace? new-val tree))
+      (cons (tree-subst (car tree) updater) (tree-subst (cdr tree) updater))))

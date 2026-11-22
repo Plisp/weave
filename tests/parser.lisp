@@ -1270,6 +1270,38 @@
   (is equal 'parse:eval-form
             (parse:location-sort (parse "(function (lambda (x) x))") 'parse:fun-designator)))
 
+(define-test return-from-sorts :parent parser
+  (let ((form (parse "(return-from b 1)")))
+    (is eq 'parse:symbol-ref (parse:location-sort form 'parse:op))
+    (is eq 'parse:symbol-ref (parse:location-sort form 'parse:name))
+    (is eq 'parse:eval-form (parse:location-sort form 'parse:value))))
+
+(defun mapped-slots (node)
+  (let ((slots nil))
+    (parse::map-node node (lambda (child id spec)
+                            (declare (ignore child))
+                            (push (list id spec) slots)))
+    (nreverse slots)))
+
+(define-test return-from-maps-slots :parent parser
+  (is equal '((parse:name parse:symbol-ref) (parse:value parse:eval-form))
+      (mapped-slots (parse "(return-from b 1)")))
+  (is equal '((parse:name parse:symbol-ref)) (mapped-slots (parse "(return-from b)"))))
+
+(defun search-paths (source query)
+  (let ((paths nil))
+    (parse::node-search (parse source) query nil #'parse::node-match
+                        (lambda (stack) (push (reverse stack) paths))
+                        '(parse:eval-form parse:symbol-ref parse:fun-designator parse:function-code))
+    (nreverse paths)))
+
+(define-test node-search-reaches-return-from-names :parent parser
+  (is equal '((parse:name) (parse:value))
+      (search-paths "(return-from b b)" (sym "B" "WEAVE-TESTS")))
+  (is equal '((parse:name)) (search-paths "(return-from b)" (sym "B" "WEAVE-TESTS")))
+  (is equal '((parse:name)) (search-paths "(return-from b 1)" (sym "B" "WEAVE-TESTS")))
+  (is equal nil (search-paths "(return-from b 1)" (sym "C" "WEAVE-TESTS"))))
+
 ;;; suffix path reachability
 
 (defun syntax-paths (tree &optional prefix)
@@ -1298,7 +1330,7 @@
 (define-test value-at-path-reads-presented-forms :parent parser
   (let* ((call (parse "(dolist (x (f xs)) (print x))"))
          (inner (subform call 0 1))
-         (edited (parse:update call '(parse:body 0 1) (parse:update inner 'parse:name (sym "G"))))
+         (edited (parse:update call '(parse:body 0 1) (parse:update inner 'parse:op (sym "G"))))
          (list (w::make-location :node edited :id '(parse:body 0))))
     (is equal "(G XS)" (sx (parse:value-at-path list '(1))))
     (is equal "G" (sx (parse:value-at-path list '(1 0))))
@@ -1375,10 +1407,10 @@
            (is = 1 (subform-count n))
            (is eq 'parse:function-call (type-of other))
            (let* ((env (parse::call-env marker))
-                  (entry (parse::env-function-info (parse:name m) env)))
+                  (entry (parse::env-function-info (parse:op m) env)))
              (is eq t (typep entry 'parse:symbol-ref))
              (is string= "M" (parse:name entry))
-             (is eq nil (parse::env-function-info (parse:name other) env)))))))))
+             (is eq nil (parse::env-function-info (parse:op other) env)))))))))
 
 (define-test implicit-function-blocks-exclude-lambda-list-initializers :parent parser
   (dolist (operator '(defun defmacro defmethod))
@@ -1483,7 +1515,7 @@
 
 (define-test function-call-renames-stay-calls :parent parser
   (is equal 'parse:function-call
-            (type-of (parse:update (parse "(dolis (x xs) (print x))") 'parse:name (sym "DOLIST")))))
+            (type-of (parse:update (parse "(dolis (x xs) (print x))") 'parse:op (sym "DOLIST")))))
 
 (define-test lambda-expressions-are-walked :parent parser
   (flet ((binders (source)
