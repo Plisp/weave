@@ -14,7 +14,7 @@ Searching for a particular binding context, especially multiline is unscalable a
 (let (...
       (x (foo)))
 ```
-We want to type an actual expression like `(let ((x (foo))) _)` or `defmethod foo :around (_) _` or `loop _ finally _` and have our holes match against syntax according to context. `&rest/body` and macros support fuzzy sequence matching by default, positional parameters are matched one-to-one, with holes matching anything. Typed symbols and literals indicate an exact textual match (subject to change).
+We want to type an actual expression like `(let ((x (foo))) _)` or `defmethod foo :around (_) _` and have our holes match against syntax according to context. `&rest/body` and macros support fuzzy sequence matching by default, positional parameters are matched one-to-one, with holes matching anything. Typed symbols and literals indicate an exact textual match (subject to change).
 
 This form of search only works over a specified syntactic context. For example, should a typed `(list _)` match against the binding representation of a `let` and the call `(list _)` even though you're probably looking for one (and visually neither is rendered with parens)?
 
@@ -63,6 +63,7 @@ c
    * ~~manual cases~~
    * ~~generated bindings~~
 3. Implement sequence search using a basic non-backtracking approach
+   * ~~spec-match~~
 4. Introduce update records for provenance tracking later, add a parameter `keep-identity` that works for single substitutions
    * for slots (replace :id id :node newnode)
    * for list positions (splice :id id :index i insert :insert (list nodes) :delete int)

@@ -110,10 +110,15 @@
 
 (defun located (call &optional sort)
   (let ((nodes (list)))
-    (parse::map-node call (lambda (child id child-sort)
-                            (declare (ignore id))
-                            (when (or (null sort) (eq sort child-sort))
-                              (push child nodes))))
+    (parse::map-node
+     call
+     (lambda (child id spec)
+       (parse::spec-traverse
+        call child spec id
+        (lambda (sub child-sort id)
+          (declare (ignore id))
+          (when (or (null sort) (eq sort child-sort))
+            (push sub nodes))))))
     (nreverse nodes)))
 
 (defun subform (call &rest path)

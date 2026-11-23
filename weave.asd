@@ -34,6 +34,7 @@
   :components ((:file "package")
                (:file "util" :depends-on ("package"))
                (:file "parser" :depends-on ("util"))
-               (:file "editing" :depends-on ("util")))
+               (:file "editing" :depends-on ("util"))
+               (:file "matching" :depends-on ("util")))
   :perform (asdf:test-op (o c)
              (uiop:symbol-call '#:parachute '#:test '#:weave-tests)))

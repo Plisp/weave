@@ -1267,7 +1267,7 @@
 
 (define-test function-designators-sort :parent parser
   (is equal 'parse:fun-designator (parse:location-sort (parse "(function car)") 'parse:fun-designator))
-  (is equal 'parse:eval-form
+  (is equal 'parse:fun-designator
             (parse:location-sort (parse "(function (lambda (x) x))") 'parse:fun-designator)))
 
 (define-test return-from-sorts :parent parser
@@ -1291,8 +1291,7 @@
 (defun search-paths (source query)
   (let ((paths nil))
     (parse::node-search (parse source) query nil #'parse::node-match
-                        (lambda (stack) (push (reverse stack) paths))
-                        '(parse:eval-form parse:symbol-ref parse:fun-designator parse:function-code))
+                        (lambda (stack) (push (reverse stack) paths)))
     (nreverse paths)))
 
 (define-test node-search-reaches-return-from-names :parent parser
