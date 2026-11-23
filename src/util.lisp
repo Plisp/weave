@@ -24,6 +24,7 @@
            #:strcat
            #:vconc
            #:lambda-list-section-start
+           #:search-tree
            #:tree-subst))
 
 (in-package #:weave-utils)
@@ -261,6 +262,15 @@ Returns the preceding parameters as a second value."
                 (push parameter parameters)
                 (incf count)))
           finally (return (values nil (nreverse parameters))))))
+
+(defun search-tree (o tree)
+  (declare (optimize speed))
+  (if (atom tree)
+      (eq o tree)
+      (or (search-tree o (car tree))
+          (some (lambda (m)
+                  (search-tree o m))
+                (cdr tree)))))
 
 (defun tree-subst (tree updater)
   (if (atom tree)

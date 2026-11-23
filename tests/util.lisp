@@ -118,7 +118,8 @@
         (lambda (sub child-sort id)
           (declare (ignore id))
           (when (or (null sort) (eq sort child-sort))
-            (push sub nodes))))))
+            (push sub nodes))
+          nil))))
     (nreverse nodes)))
 
 (defun subform (call &rest path)

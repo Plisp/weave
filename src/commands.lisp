@@ -210,7 +210,7 @@ Plain list bodies are skipped since they are never focused."
                 for stack = (stack buffer)
                 for loc = (car stack)
                 for node = (node-at loc)
-                while (typep node 'parse:eval-form)
+                while (parse:form-p node)
                 do (move-parent buffer)
                 finally (when last-stack
                           (setf (stack buffer) last-stack)
@@ -673,10 +673,7 @@ addressed by indices."
   (let* ((location (focus buffer))
          (focused (node-at location)))
     (cond
-      ((or (typep focused 'parse:eval-form)
-           (and (typep focused 'ref-list)
-                (null (elements focused))
-                (eq 'parse:eval-form (locsort location))))
+      ((parse:form-p focused)
        (swap-node location (hole) buffer))
       ((and (typep focused 'hole) (eq 'parse:eval-form (locsort location)))
        (let ((id (location-id location))

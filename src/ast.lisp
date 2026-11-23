@@ -30,9 +30,10 @@
            #:rest-element-pattern
            #:lambda-list-element-pattern
            #:lambda-list-wrap-p
-           #:eval-form
+           #:form-p
            #:symbol-ref
            #:symbol-reify
+           #:eval-form
            #:binder
            #:literal
            #:char
@@ -119,11 +120,7 @@
    (inside :init nil :mutable t :type list))
   (:documentation "represents comments and reader-conditionals"))
 
-(defrecord eval-form (anchor)
-  ((typ :init nil :mutable t))
-  (:documentation "Form in an evaluation context, perhaps quoted."))
-
-(defrecord literal (eval-form)
+(defrecord literal (anchor)
   ((str :type string))
   (:documentation "Atomic literal"))
 
@@ -146,7 +143,7 @@
   ((numerator-node)
    (denominator-node)))
 
-(defrecord symbol-ref (eval-form)
+(defrecord symbol-ref (anchor)
   ((name :type string)
    ;; note: this assumes the referenced package already exists in the image
    (home-package :type (or null package))
@@ -189,12 +186,12 @@
 (deftype gen-list ()
   '(or list ref-list))
 
-(defrecord function-call (eval-form)
+(defrecord function-call (anchor)
   ((op)
    (body :type list))
   (:documentation "body is a list of eval-forms"))
 
-(defrecord irregular-form (eval-form)
+(defrecord irregular-form (anchor)
   ()
   (:documentation "macro invocation or special operator"))
 
@@ -257,7 +254,7 @@ so a name test alone can't distinguish #:|.| from a dot."))
   ()
   (:documentation "#n#, distinguished from the uninterned #:|n|"))
 
-(defrecord label-def (eval-form)
+(defrecord label-def (anchor)
   ((name :type string)
    (labeled))
   (:documentation "#n=form"))
@@ -417,6 +414,24 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defmethod is-atom ((node hole))
   t)
 
+(defmethod is-atom ((node label-def))
+  t)
+
+(defun form-p (node)
+  (typecase node
+    ((or function-call irregular-form label-ref label-def
+                    symbol-ref literal) t)
+    (ref-list (if (eq (kind node) :list)
+                  (null (elements node))
+                  t))))
+
+(defun syntax-p (node)
+  "Unevaluated reader item."
+  (or (is-atom node)
+      (typep node 'literal) ; ratio
+      (typep node 'ref-list)
+      (typep node 'hole)))
+
 (defgeneric to-syntax (node)
   (:documentation "Converts `node' back to reader syntax.")
   (:method (node)
@@ -458,6 +473,10 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defun id-slot (id)
   (if (consp id) (car id) id))
 
+(defgeneric location-slots (node)
+  (:method ((node anchor))
+    (mapcar #'sb-mop:slot-definition-name (sb-mop:class-direct-slots (class-of node)))))
+
 ;; Don't error so that a user may probe locations prior to there being something there.
 ;; Unlike get-location, there's no good reason to compute in absolute syntax indices,
 ;; so no ast interface is provided. Use path-at for conversion where necessary.
@@ -465,7 +484,8 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defgeneric location-sort (node id)
   (:documentation "Returns a node-specific sort or NIL for an invalid id.
 A method may return the ast at `id' as a second value, NIL when absent.
-Note: at macro calls, this returns raw syntax, similarly to get-location.")
+Note: at macro calls, this returns raw syntax, similarly to get-location.
+Second value = (get-location node id) when present.")
   (:method (node id)
     (declare (ignore node id))
     nil))
@@ -477,7 +497,8 @@ Note: at macro calls, this returns raw syntax, similarly to get-location.")
   'char)
 
 (defgeneric map-node (node f)
-  (:documentation "Maps f taking (child, id, spec) over the ordered slots of node."))
+  (:documentation "Maps f taking (child, id, spec) over bound slots of node in order.
+Does nothing on atomic anchors."))
 
 (defgeneric get-location (node id)
   (:documentation "Returns the current value at `id'. Note: this is raw syntax
@@ -506,6 +527,13 @@ from macro-calls. Use node-at instead."))
                  for i from 0
                  do (when (typep comment 'comment)
                       (funcall f comment (list :comment slot i) 'comment)))))
+
+(defmethod map-node ((node anchor) f)
+  ;; XXX assumes ordering, but this should be reasonable
+  (unless (is-atom node)
+    (dolist (id (location-slots node))
+      (when (slot-boundp node id)
+        (funcall f (get-location node id) id (location-sort node id))))))
 
 (defmethod location-sort :around ((node anchor) id)
   (if (comment-location-p id) 'comment (call-next-method)))
@@ -1237,11 +1265,6 @@ XXX type specializers currently sort as evaluated forms."
     (numerator-node (numerator-node node))
     (denominator-node (denominator-node node))))
 
-(defmethod map-node ((node ratio-literal) f)
-  (funcall f (numerator-node node) 'numerator-node 'integer-literal)
-  (funcall f (denominator-node node) 'denominator-node 'integer-literal)
-  (values))
-
 (defmethod location-sort ((node ratio-literal) id)
   (case id
     (numerator-node (values 'integer-literal (numerator-node node)))
@@ -1286,18 +1309,14 @@ XXX type specializers currently sort as evaluated forms."
     ((eql 'body) (body node))
     ((list (eql 'body) (and (type integer) i)) (nth i (body node)))))
 
-(defmethod map-node ((node function-code) f)
-  (funcall f (lambda-list node) 'lambda-list (location-sort node 'lambda-list))
-  (funcall f (docstring node) 'docstring 'string-literal)
-  (funcall f (declarations node) 'declarations '&tree)
-  (funcall f (body node) 'body '&body)
-  (values))
+(defmethod location-slots ((node function-code))
+  (list 'lambda-list 'docstring 'declarations 'body))
 
 (defmethod location-sort ((node function-code) id)
   (trivia:match id
     ((eql 'docstring) (values 'string-literal (docstring node)))
     ((or (eql 'declarations) (list* (eql 'declarations) _))
-     (values 'unevaluated (declarations node)))
+     (values '(&rest unevaluated) (declarations node)))
     ((eql 'body) '&body)
     ((list (eql 'body) (and (type integer) i)) (values 'eval-form (nth i (body node))))
     ((eql 'lambda-list) (lambda-list-sorts node))
@@ -1402,14 +1421,6 @@ last position is a return value rather than documentation."
         (t ; lone patterns must be symbols
           (assert (symbolp (car spec)))
          (cons (list (car spec)) (spec-kinds (cdr spec)))))))
-  (defun search-tree (o tree)
-    (declare (optimize speed))
-    (if (atom tree)
-        (eq o tree)
-        (or (search-tree o (car tree))
-            (some (lambda (m)
-                    (search-tree o m))
-                  (cdr tree)))))
   (defrecord function-info ()
     ((arglist :type gen-list)
      ;; note: the string as written, which in our representation is a LITERAL node
@@ -1503,12 +1514,12 @@ last position is a return value rather than documentation."
     (loop for (nil . entries) in binds
           thereis (loop for (nil bind-tag) on entries by #'cddr
                         thereis (eq tag (bind-tag-name bind-tag)))))
-  (defun tag-sort (tag binds &optional specp)
+  (defun tag-sort (tag binds)
     "The location-sort of a spec tag."
     (cond
       ((eval-ctx-p tag binds) 'eval-form)
       ((binder-tag-p tag binds) 'binder)
-      (t (if specp '&tree 'unevaluated))))
+      (t 'unevaluated)))
   (defun rest-pattern-tags (pattern)
     (trivia:ematch pattern
       ((list (eql '&or) (type symbol) inner) (rest-pattern-tags inner))
@@ -1517,40 +1528,41 @@ last position is a return value rather than documentation."
   (defun atom-alternative-p (pattern)
     "Can the rest pattern `pattern' match an atom, e.g. a lone let binder?"
     (and (eq (first pattern) '&or) (some #'symbolp (rest pattern))))
-  (defun emit-map-node (classname spec-kinds rest-patterns binds)
-    (let ((slots (remove-duplicates (mapcar #'car spec-kinds)))
-          (clauses (list)))
-      ;; accessors
-      (push `(op 'symbol-ref) clauses)
-      (loop for part in slots
-            for kind = (cdr (assoc part spec-kinds))
-            do (case kind
-                 (&body (push `(,part '&body) clauses))
-                 (&rest-qualifiers (push `(,part '&tree) clauses))
-                 ((&tree &declarations) (push `(,part '&tree) clauses))
-                 (&rest
-                  (when-let* ((pattern (cdr (assoc part rest-patterns))))
-                    (multiple-value-bind (binder-tag value-tag value-kind)
-                        (rest-pattern-tags pattern)
-                      (declare (ignore value-tag))
-                      (if (member value-kind '(&lambda &macro-lambda &method-lambda))
-                          (push `(,part
-                                  '(&rest (,(tag-sort binder-tag binds t) function-code)))
-                                clauses)
-                          (push `(,part
-                                  '(&rest
-                                    ,(tree-subst pattern
-                                      (lambda (s)
-                                        (unless (or (null s) (member s *parser-keywords*))
-                                          (values (tag-sort s binds t) t))))))
-                                clauses)))))
-                 ((&lambda &macro-lambda &method-lambda)
-                  (push `(,part 'function-code) clauses))
-                 ((nil &optional) (push `(,part ',(tag-sort part binds t)) clauses))))
-      `(defmethod map-node ((node ,classname) f)
-         ,@(loop for (slot spec) in (nreverse clauses)
-                 collect `(when (slot-boundp node ',slot)
-                            (funcall f (,slot node) ',slot ,spec))))))
+  ;; (defun emit-map-node (classname spec-kinds rest-patterns binds)
+  ;;   (let ((slots (remove-duplicates (mapcar #'car spec-kinds)))
+  ;;         (clauses (list)))
+  ;;     ;; accessors
+  ;;     (push `(op 'symbol-ref) clauses)
+  ;;     (loop for part in slots
+  ;;           for kind = (cdr (assoc part spec-kinds))
+  ;;           do (case kind
+  ;;                (&body (push `(,part '&body) clauses))
+  ;;                (&rest-qualifiers (push `(,part 'unevaluated) clauses))
+  ;;                (&tree (push `(,part 'unevaluated) clauses))
+  ;;                (&declarations (push `(,part '(&rest unevaluated)) clauses))
+  ;;                (&rest
+  ;;                 (when-let* ((pattern (cdr (assoc part rest-patterns))))
+  ;;                   (multiple-value-bind (binder-tag value-tag value-kind)
+  ;;                       (rest-pattern-tags pattern)
+  ;;                     (declare (ignore value-tag))
+  ;;                     (if (member value-kind '(&lambda &macro-lambda &method-lambda))
+  ;;                         (push `(,part
+  ;;                                 '(&rest (,(tag-sort binder-tag binds) function-code)))
+  ;;                               clauses)
+  ;;                         (push `(,part
+  ;;                                 '(&rest
+  ;;                                   ,(tree-subst pattern
+  ;;                                     (lambda (s)
+  ;;                                       (unless (or (null s) (member s *parser-keywords*))
+  ;;                                         (values (tag-sort s binds) t))))))
+  ;;                               clauses)))))
+  ;;                ((&lambda &macro-lambda &method-lambda)
+  ;;                 (push `(,part 'function-code) clauses))
+  ;;                ((nil &optional) (push `(,part ',(tag-sort part binds)) clauses))))
+  ;;     `(defmethod map-node ((node ,classname) f)
+  ;;        ,@(loop for (slot spec) in (nreverse clauses)
+  ;;                collect `(when (slot-boundp node ',slot)
+  ;;                           (funcall f (,slot node) ',slot ,spec))))))
   (defun location-methods (classname spec-kinds rest-patterns binds)
     "Emits the get-location/update/location-sort methods for a defform class.
 Generally the tag name refers to a slot-value and (tag integer*) index tree structure."
@@ -1643,24 +1655,36 @@ Generally the tag name refers to a slot-value and (tag integer*) index tree stru
                              (push `((list (eql ',part) (type integer)) 'eval-form)
                                    sort-clauses))
                             (&rest-qualifiers
-                             (push `((eql ',part) 'unevaluated) sort-clauses)
+                             (push `((eql ',part) '(&rest unevaluated)) sort-clauses)
                              (push `((list (eql ',part) (type integer)) 'unevaluated)
                                    sort-clauses))
-                            ;; note: nothing inside quoted data is ever a binder or eval-form
-                            ((&tree &declarations)
+                            (&declarations
+                             (push `((eql ',part) '(&rest unevaluated)) sort-clauses)
+                             (push `((list* (eql ',part) (type list)) 'unevaluated)
+                                   sort-clauses))
+                            (&tree
                              (push `((eql ',part) 'unevaluated) sort-clauses)
                              (push `((list* (eql ',part) (type list)) 'unevaluated)
                                    sort-clauses))
                             (&rest
                              (when-let (pattern (cdr (assoc part rest-patterns)))
-                               (push `((eql ',part)
-                                       `(&rest ,',(tree-subst pattern
-                                                   (lambda (s)
-                                                     (unless (or (null s)
-                                                                 (member s
-                                                                         *parser-keywords*))
-                                                       (values (tag-sort s binds t) t))))))
-                                     sort-clauses)
+                               (multiple-value-bind (binder-tag value-tag value-kind)
+                                   (rest-pattern-tags pattern)
+                                 (declare (ignore value-tag))
+                                 (push `((eql ',part)
+                                         '(&rest
+                                           ,(if (member value-kind
+                                                        '(&lambda &macro-lambda
+                                                          &method-lambda))
+                                                `(,(tag-sort binder-tag binds)
+                                                  function-code)
+                                                (tree-subst pattern
+                                                 (lambda (s)
+                                                   (unless (or (null s)
+                                                               (member s
+                                                                       *parser-keywords*))
+                                                     (values (tag-sort s binds) t)))))))
+                                       sort-clauses))
                                (when (atom-alternative-p pattern)
                                  (push `((list (eql ',part) (and (type integer) i))
                                          (unless (gen-list-p (gen-nth i (,part node)))
@@ -1670,22 +1694,24 @@ Generally the tag name refers to a slot-value and (tag integer*) index tree stru
                                (multiple-value-bind (binder-tag value-tag value-kind)
                                    (rest-pattern-tags pattern)
                                  ;; this has to be checked first
-                                 (push `((list (eql ',part) (type integer) (eql 0))
-                                         ',(tag-sort binder-tag binds))
+                                 (push `((list (eql ',part) (and (type integer) i) (eql 0))
+                                         (when (ref-list-p (nth i (elements (,part node))))
+                                           ',(tag-sort binder-tag binds)))
                                        sort-clauses)
                                  ;; logic for body, singular value (NIL), or a function-code
                                  (when (member value-kind
                                                '(nil &body &optional &lambda &macro-lambda
                                                  &method-lambda))
-                                   (push `((list (eql ',part) (type integer)
+                                   (push `((list (eql ',part) (and (type integer) i)
                                                  ,(if (eq value-kind '&body)
                                                       '(type integer)
                                                       '(eql 1)))
-                                           ',(if (member value-kind
-                                                         '(&lambda &macro-lambda
-                                                           &method-lambda))
-                                                 'function-code
-                                                 (tag-sort value-tag binds)))
+                                           (when (ref-list-p (nth i (elements (,part node))))
+                                             ',(if (member value-kind
+                                                          '(&lambda &macro-lambda
+                                                            &method-lambda))
+                                                  'function-code
+                                                  (tag-sort value-tag binds))))
                                          sort-clauses)))))
                             ((&lambda &macro-lambda &method-lambda)
                              (push `((eql ',part) 'function-code) sort-clauses))
@@ -1699,9 +1725,11 @@ Generally the tag name refers to a slot-value and (tag integer*) index tree stru
           (trivia:cmatch id
             ,@(nreverse update-clauses)))
         (defmethod location-sort ((node ,classname) id)
-          (trivia:match id
-            ((eql 'op) 'symbol-ref)
-            ,@(nreverse sort-clauses))))))
+          (let ((sort (trivia:match id
+                        ((eql 'op) 'symbol-ref)
+                        ,@(nreverse sort-clauses))))
+            (when sort
+              (values sort (get-location node id))))))))
   ;;; syntax methods
   (defun pattern-tags (pattern)
     (remove-duplicates (mapcar #'car (spec-kinds pattern))))
@@ -1772,7 +1800,7 @@ Generally the tag name refers to a slot-value and (tag integer*) index tree stru
       (t
        (cons `(list (to-syntax (,(car spec) ,node)))
              (spec-syntax (cdr spec) node rest-patterns)))))
-  (defun syntax-methods (name classname spec rest-patterns)
+  (defun syntax-methods (classname spec rest-patterns)
     "Emits the to-syntax method for a defform class."
     `((defmethod to-syntax ((node ,classname))
         (copy-anchors node
@@ -2169,9 +2197,9 @@ Any binding forces a symbol match.
                                                                 &rest-qualifiers))
                                                       `(mapcar #'copy-node (,slot old))
                                                       `(copy-node (,slot old)))))))))
-       ,(emit-map-node classname (spec-kinds spec) rest-patterns binds)
+       ;; ,(emit-map-node classname (spec-kinds spec) rest-patterns binds)
        ,@(location-methods classname (spec-kinds spec) rest-patterns binds)
-       ,@(syntax-methods name classname spec rest-patterns)
+       ,@(syntax-methods classname spec rest-patterns)
        (defmethod suffix-path ((node ,classname) suffix)
          (when suffix
            (if (zerop (first suffix))
@@ -2655,25 +2683,21 @@ Any binding forces a symbol match.
   (plain-tree
     (map-quasiquote (thing node) (constantly 'eval-form) (constantly 'unevaluated))))
 
-(defmethod map-node ((node quasiquote-form) f)
-  "Every unevaluated position is a candidate head."
-  (funcall f (thing node) 'thing (quasiquote-sorts node))
-  (values))
-
 (defmethod location-sort ((node quasiquote-form) id)
-  (trivia:match id
-    ((eql 'thing) (values 'unevaluated (thing node)))
-    ((list* (eql 'thing) path)
-     (values (if (eq 'eval-form (gen-tree-ref (quasiquote-sorts node) path))
-                 'eval-form
-                 'unevaluated)
-             (gen-tree-ref (thing node) path)))))
+  (flet ((collapse-unevaluated (tree)
+           (if (search-tree 'eval-form tree) tree 'unevaluated)))
+    (trivia:match id
+      ((eql 'op) (values 'symbol-ref (op node)))
+      ((eql 'thing) (values (collapse-unevaluated (quasiquote-sorts node)) (thing node)))
+      ((list* (eql 'thing) path)
+       (values (collapse-unevaluated (gen-tree-ref (quasiquote-sorts node) path))
+               (gen-tree-ref (thing node) path))))))
 
 (setf (gethash 'eclector.reader:quasiquote *special-walkers*) #'walk-quasiquote)
 
 (setf (gethash 'eclector.reader:quasiquote *special-parsers*) #'parse-quasiquote)
 
-;;; TAGBODY interleaves unevaluated labels and executable forms.
+;;; tagbody - interleaves unevaluated symbol/integer tags and expressions
 (defform (tagbody &body body) :binds ((body)))
 
 (defun tagbody-tag-p (form)
@@ -2707,6 +2731,7 @@ Any binding forces a symbol match.
 
 ;; XXX note: intentional discrepancy for fuzzy matching
 (defmethod map-node ((node tagbody-form) f)
+  (funcall f (op node) 'op 'symbol-ref)
   (funcall f (body node) 'body '&body)
   (values))
 
@@ -2924,10 +2949,6 @@ Any binding forces a symbol match.
     ((eql 'fun-designator) (fun-designator node))
     ((list* (eql 'fun-designator) path) (gen-tree-ref (fun-designator node) path))))
 
-(defmethod map-node ((node function-form) f)
-  (funcall f (fun-designator node) 'fun-designator (location-sort node 'fun-designator))
-  (values))
-
 (defmethod location-sort ((node function-form) id)
   (trivia:match id
     ((eql 'op) (values 'symbol-ref (op node)))
@@ -3003,11 +3024,6 @@ Any binding forces a symbol match.
              (when (slot-boundp node 'value)
                (value node))))
     (name (values 'symbol-ref (name node)))))
-
-(defmethod map-node ((node return-from-form) f)
-  (funcall f (name node) 'name 'symbol-ref)
-  (when (slot-boundp node 'value)
-    (funcall f (value node) 'value 'eval-form)))
 
 (defun walk-return-from (form env walker on-binder)
   (funcall walker (second form) env :block)
@@ -3732,28 +3748,37 @@ The third value is a boolean indicating if the call expansion succeeded."
     ((eql 'body) (body node))
     ((list* (eql 'body) indices) (gen-tree-ref (body node) indices))))
 
-(defmethod map-node ((node macro-call) f)
-  (funcall f (op node) 'op 'symbol-ref)
-  ;; we don't know a spec, so iterate everything
-  (labels ((rec (form)
-             (if-let (parsed (gethash form (subforms node)))
-               'eval-form
-               (if (gen-atom-p form)
-                   (if (gethash form (binders node)) 'binder 'unevaluated)
-                   (mapcar #'rec (elements form))))))
-    (funcall f (body node) 'body (rec (body node))))
-  (values))
+(defmethod location-slots ((node macro-call))
+  (list 'op 'body))
 
 (defmethod location-sort ((node macro-call) id)
   (trivia:match id
     ((eql 'op) (values 'symbol-ref (op node)))
-    ((eql 'body) (values 'unevaluated (body node)))
+    ((eql 'body)
+     (values (loop for b in (body node)
+                   for i from 0
+                   collect (location-sort node `(body ,i)))
+             (body node)))
     ((list* (eql 'body) indices)
-     (labels ((macro-tree-ref (tree path)
+     (labels ((sort-tree (form)
+                ;; We cannot know a sort tree of an arbitrary macro call until specified,
+                ;; so return a static tree. This is enough for traversals
+                (if-let (parsed (gethash form (subforms node)))
+                  'eval-form
+                  (if (gen-atom-p form)
+                      (if (gethash form (binders node)) 'binder 'unevaluated)
+                      (let ((res (mapcar #'sort-tree (elements form))))
+                        (if (every (lambda (e)
+                                     (eq e 'unevaluated))
+                                   res)
+                            'unevaluated
+                            res)))))
+              (macro-tree-ref (tree path)
                 "gen-tree-ref but accounting for tabled forms"
                 (cond
                   ((null path)
-                   (values (if (gethash tree (binders node)) 'binder 'unevaluated) tree))
+                   (values (if (gethash tree (binders node)) 'binder (sort-tree tree))
+                           tree))
                   ((gen-list-p tree)
                    (let ((next (gen-nth (car path) tree)))
                      (if (gethash next (subforms node))
@@ -3834,7 +3859,7 @@ Returns NIL when the call is unparseable or fails to expand."
       ((list* (eql 'body) indices)
        (multiple-value-bind (sort old)
            (location-sort node id)
-         (if (and (eq sort 'eval-form) (typep new-value 'eval-form))
+         (if (and (eq sort 'eval-form) (form-p new-value))
              (make-instance 'macro-call
               :op (op node)
               :body (body node)
@@ -3967,11 +3992,6 @@ Returns NIL when the call is unparseable or fails to expand."
     ((eql 'op) (op node))
     ((eql 'body) (body node))
     ((list (eql 'body) (and (type integer) i)) (nth i (body node)))))
-
-(defmethod map-node ((node function-call) f)
-  (funcall f (op node) 'op 'fun-designator)
-  (funcall f (body node) 'body '&body)
-  (values))
 
 (defmethod location-sort ((node function-call) id)
   (trivia:match id
@@ -4408,37 +4428,45 @@ Anchor single-semicolon comments to `previous' when supplied."
          (not (expanded node)))))
 
 ;;; search helpers
-(defun spec-match (node subnode query spec)
+(defun spec-match (subnode query spec)
+  (when (hole-p query)
+    (return-from spec-match t))
+  ;; not a hole
   (labels ((fuzz-match-body (query body spec)
              ;; ignores holes as we want a single hole to match empty bodies
-             (cond ((null (car query)) t)
-                   ((hole-p (car query)) (fuzz-match-body (cdr query) body spec))
-                   (t (when-let (next (member-if (lambda (body-node)
-                                                   (node-match body-node (car query) spec))
-                                                 body))
-                        (fuzz-match-body (cdr query) (cdr next) spec)))))
+             (cond
+               ((null (car query)) t)
+               ((hole-p (car query)) (fuzz-match-body (cdr query) body spec))
+               (t
+                (when-let (next
+                           (member-if (lambda (body-node)
+                                        (node-match body-node (car query) spec))
+                                      body))
+                  (fuzz-match-body (cdr query) (cdr next) spec)))))
            (fuzz-match-spec (query rest spec)
              "requires query and rest to be gen-lists"
-             (cond ((null (gen-car query)) t)
-                   ((hole-p (gen-car query)) (fuzz-match-spec (gen-cdr query) rest spec))
-                   (t (when-let (nexti (position-if
-                                        (lambda (rest-node)
-                                          (spec-match node rest-node (gen-car query) spec))
-                                        (elements rest)))
-                        (fuzz-match-spec (gen-cdr query) (gen-nthcdr (1+ nexti) rest) spec)))))
+             (cond
+               ((null (gen-car query)) t)
+               ((hole-p (gen-car query)) (fuzz-match-spec (gen-cdr query) rest spec))
+               (t
+                (when-let (nexti
+                           (position-if
+                             (lambda (rest-node)
+                               (spec-match rest-node (gen-car query) spec))
+                            (elements rest)))
+                  (fuzz-match-spec (gen-cdr query) (gen-nthcdr (1+ nexti) rest) spec)))))
            (tree-match (subnode query)
-             (cond ((hole-p query) t)
-                   ((listp subnode)
-                    (and (listp query) (fuzz-match-spec query subnode '&tree)))
-                   ((gen-atom-p subnode)
-                    (and (gen-atom-p query)
-                         (node-match subnode query 'unevaluated)))
-                   ((ref-list-p subnode)
-                    (and (ref-list-p query)
-                         (eq (kind subnode) (kind query))
-                         (fuzz-match-spec query subnode '&tree))))))
+             (cond
+               ((listp subnode)
+                (and (listp query) (fuzz-match-spec query subnode 'unevaluated)))
+               ((gen-atom-p subnode)
+                (and (gen-atom-p query) (node-match subnode query 'unevaluated)))
+               ((ref-list-p subnode)
+                (and (ref-list-p query)
+                     (eq (kind subnode) (kind query))
+                     (fuzz-match-spec query subnode 'unevaluated))))))
     (if (symbolp spec)
-        (case spec
+        (case spec ; we aren't sure of a match at this point
           (eval-form (node-match subnode query 'eval-form))
           (symbol-ref (node-match subnode query 'symbol-ref))
           (binder (node-match subnode query 'binder))
@@ -4449,23 +4477,22 @@ Anchor single-semicolon comments to `previous' when supplied."
              (lambda-form (node-match subnode query 'eval-form))
              (t (tree-match subnode query))))
           (&body (fuzz-match-body query subnode 'eval-form))
-          ((unevaluated &tree) (tree-match subnode query))
+          (unevaluated (tree-match subnode query))
           ((string-literal integer-literal) (node-match subnode query 'literal))
           (comment t)
-          (t
-           (cerror "continue" "~a" spec)))
+          (t (cerror "continue" "~a" spec)))
         (case (car spec)
-          (&rest
-           (fuzz-match-spec query subnode (second spec)))
+          (&rest (fuzz-match-spec query subnode (second spec)))
           (&or
-           (or (spec-match node subnode query (second spec))
-               (spec-match node subnode query (third spec))))
+           (or (spec-match subnode query (second spec))
+               (spec-match subnode query (third spec))))
           (t
-           (when (and (gen-list-p subnode)
-                      (gen-list-p query))
+           (when (and (gen-list-p subnode) (gen-list-p query))
              ;; note: initially would be evaluated after loop initforms, bad for condition
-             (loop with required = (or (position-if (lambda (s) (find s *parser-keywords*))
-                                                    spec)
+             (loop with required = (or (position-if
+                                         (lambda (s)
+                                           (find s *parser-keywords*))
+                                        spec)
                                        (length spec))
                    ;; allows shorter prefix matches
                    initially (unless (>= (length (elements subnode)) required)
@@ -4480,18 +4507,26 @@ Anchor single-semicolon comments to `previous' when supplied."
                    always (case subspec
                             (&rest
                              (assert (= (length spec-rest) 2))
-                             (return
-                               (loop for e in elts
-                                     for q in qelts
-                                     always (spec-match node e q (second spec-rest)))))
+                             (return (loop for e in elts
+                                           for q in qelts
+                                           always (spec-match e q (second spec-rest)))))
                             (&optional
-                             (prog1 (spec-match node e q (second spec-rest))
+                             (prog1 (spec-match e q (second spec-rest))
                                (pop spec-rest)))
                             ((&rest-qualifiers &declarations &or)
                              (assert nil nil "unimplemented keywords"))
-                            (t (spec-match node e q subspec))))))))))
+                            (t (spec-match e q subspec))))))))))
+
+(defun syntax-match (node query sort)
+  (cond ((and (or (eq sort 'unevaluated) (listp sort)))
+         (spec-match node query 'unevaluated))
+        ((macro-call-p node)
+         (spec-match (body node) query 'unevaluated))
+        ((form-p node)
+         (spec-match (to-syntax node) query 'unevaluated))))
 
 (defun node-match (node query sort)
+  "An exact match between evaluated nodes."
   (declare (ignore sort))
   (unless (or (eq (type-of node) (type-of query))
               ;; integer hole?
@@ -4507,81 +4542,84 @@ Anchor single-semicolon comments to `previous' when supplied."
           (string= (str (denominator-node node)) (str (denominator-node query)))))
     (literal (string= (str node) (str query)))
     (ref-list (and (null (elements node)) (null (elements query))))
-    (macro-call (and (symbol-ref= (op node) (op query))
-                     (spec-match node (body node) (body query) '&tree)))
+    (macro-call
+     (and (symbol-ref= (op node) (op query))
+          (spec-match (body node) (body query) 'unevaluated)))
     (t ; recursive cases
       (let ((success t))
         (map-node query
                   (lambda (subquery id spec)
                     (and-f success
-                           (when (or (listp id) (slot-boundp query id))
-                             (and (or (slot-boundp node id) (hole-p subquery))
-                                  (spec-match node (get-location node id) subquery spec))))))
+                      (when (or (listp id) (slot-boundp query id))
+                        (and (or (slot-boundp node id) (hole-p subquery))
+                             (spec-match (get-location node id) subquery spec))))))
         success))))
 
 ;; specs strictly are of form spine+optional, requiring no parsing unlike slots
 ;; (e.g. function-code docstring, declarations, qualifiers)
 (defun spec-traverse (node subnode spec id f)
+  "Traverses `subnode' of `node'. `f' takes (subnode sort id) and returns true to stop."
   (labels ((child (i)
              (append-id id i))
            (tree-rec (form id)
-             (funcall f form 'unevaluated id)
-             (unless (gen-atom-p form)
-               (loop for i from 0
-                     for e in (elements form)
-                     do (spec-traverse node e '&tree (child i) f)))))
-    (if (symbolp spec)
-        (case spec
-          (fun-designator
-           (typecase subnode
-             ((or symbol-ref hole) (funcall f subnode 'fun-designator id))
-             ((or lambda-form named-lambda-form) (funcall f subnode 'eval-form id))
-             (t (tree-rec subnode id))))
-          (&body
-           (loop for e in subnode
-                 for i from 0
-                 do (funcall f e 'eval-form (child i))))
-          (&tree (tree-rec subnode id))
-          ;; necessary for macro calls
-          (t
-           (if-let (parsed (and (macro-call-p node) (gethash subnode (subforms node))))
-             (funcall f parsed spec id)
-             (funcall f subnode spec id))))
-        (if (eq (first spec) '&or)
-            (progn
-              (assert (= (length spec) 3))
-              (if (pattern-matches-p (second spec) subnode)
-                  (spec-traverse node subnode (second spec) id f)
-                  (spec-traverse node subnode (third spec) id f)))
-            (progn
-              (assert (listp spec))
-              (loop for spec-rest on spec
-                    for subspec = (car spec-rest)
-                    for elts on (elements subnode)
-                    for e = (car elts)
+             (assert (syntax-p form))
+             (unless (funcall f form 'unevaluated id)
+               (unless (gen-atom-p form)
+                 (loop for i from 0
+                       for e in (elements form)
+                       do (spec-traverse node e 'unevaluated (child i) f))))))
+    (cond ((symbolp spec)
+           (case spec
+             (fun-designator
+              (typecase subnode
+                ((or symbol-ref hole) (funcall f subnode 'fun-designator id))
+                ((or lambda-form named-lambda-form) (funcall f subnode 'eval-form id))
+                (t (assert (syntax-p subnode)) (tree-rec subnode id))))
+             (&body
+              (loop for e in subnode
                     for i from 0
-                    do
-                    ;;(disp `(,spec-rest ,e))
-                    (case subspec
-                      (&rest
-                       (assert (= (length spec-rest) 2))
-                       (loop for e in elts
-                             do (spec-traverse node e (second spec-rest) (child i) f)
-                                (incf i))
-                       ;; oops! should've consumed all elts. this bug could've been avoided
-                       (return))
-                      (&optional
-                       (spec-traverse node e (second spec-rest) (child i) f)
-                       (pop spec-rest))
-                      ((&rest-qualifiers &declarations &or)
-                       (assert nil nil "unimplemented keywords"))
-                      (t (spec-traverse node e subspec (child i) f)))))))))
+                    do (assert (form-p e))
+                       (funcall f e 'eval-form (child i))))
+             (unevaluated
+              (tree-rec subnode id))
+             ;; necessary for macro calls
+             (t
+              (if-let (parsed (and (macro-call-p node) (gethash subnode (subforms node))))
+                (funcall f parsed spec id)
+                (funcall f subnode spec id)))))
+          ((eq (first spec) '&or)
+           (progn
+             (assert (= (length spec) 3))
+             (if (pattern-matches-p (second spec) subnode)
+                 (spec-traverse node subnode (second spec) id f)
+                 (spec-traverse node subnode (third spec) id f))))
+          (t
+           (assert (and (listp spec) (gen-list-p subnode)))
+           (unless (funcall f subnode spec id)
+             (loop for spec-rest on spec
+                   for subspec = (car spec-rest)
+                   for elts on (elements subnode)
+                   for e = (car elts)
+                   for i from 0
+                   do (case subspec
+                        (&rest
+                         (assert (= (length spec-rest) 2))
+                         (loop for e in elts
+                               do (spec-traverse node e (second spec-rest) (child i) f)
+                                  (incf i))
+                         (return))
+                        (&optional
+                         (spec-traverse node e (second spec-rest) (child i) f)
+                         (pop spec-rest))
+                        ((&rest-qualifiers &declarations &or)
+                         (assert nil nil "unimplemented keywords"))
+                        (t (spec-traverse node e subspec (child i) f)))))))))
 
 (defun node-search (node query stack head-matcher collector)
   "Traverses `node' calling `collector' on matches when `head-matcher' returns true."
   (labels ((rec (node query sort stack)
              (if-let (result (funcall head-matcher node query sort))
-               (funcall collector stack)
+               (progn (funcall collector stack) t)
                (unless (or (is-atom node) (gen-list-p node))
                  (map-node node
                            (lambda (subnode id spec)
@@ -4607,6 +4645,7 @@ Anchor single-semicolon comments to `previous' when supplied."
     (cond
       ((equal from to) t)
       ((and (consp from) (consp to))
-       (and (= (length from) (length to)) (every #'keep-node-p (elements node) from to)))
+       (and (= (length from) (length to))
+            (every #'keep-pasted-node? (elements node) from to)))
       ((is-atom node) (and (member from *atom-sorts*) (member to *atom-sorts*) t))
       (t (eq (representation from) (representation to))))))

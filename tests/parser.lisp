@@ -1276,17 +1276,22 @@
     (is eq 'parse:symbol-ref (parse:location-sort form 'parse:name))
     (is eq 'parse:eval-form (parse:location-sort form 'parse:value))))
 
-(defun mapped-slots (node)
-  (let ((slots nil))
-    (parse::map-node node (lambda (child id spec)
-                            (declare (ignore child))
-                            (push (list id spec) slots)))
-    (nreverse slots)))
+(define-test location-slots-follow-written-order :parent parser
+  (is equal '(parse:op parse:setf-op parse:name parse:fun-code)
+      (parse::location-slots (parse "(defun f (x) x)")))
+  (is equal '(parse:op parse:setf-op parse:name parse:qualifiers parse:fun-code)
+      (parse::location-slots (parse "(defmethod m :around (x) x)")))
+  (is equal '(parse:op parse:vars parse:decls parse:body)
+      (parse::location-slots (parse "(let ((a 1)) a)")))
+  (is equal '(parse:op parse:test parse:then parse:else)
+      (parse::location-slots (parse "(if a b c)")))
+  (is equal '(parse:op parse:name parse:value)
+      (parse::location-slots (parse "(return-from b 1)"))))
 
-(define-test return-from-maps-slots :parent parser
-  (is equal '((parse:name parse:symbol-ref) (parse:value parse:eval-form))
-      (mapped-slots (parse "(return-from b 1)")))
-  (is equal '((parse:name parse:symbol-ref)) (mapped-slots (parse "(return-from b)"))))
+(define-test location-slot-exceptions :parent parser
+  (is equal '(parse:op parse:body) (parse::location-slots (parse "(when a b)")))
+  (is equal '(parse:lambda-list parse:docstring parse:declarations parse:body)
+      (parse::location-slots (parse:fun-code (parse "(defun f (x) x)")))))
 
 (defun search-paths (source query)
   (let ((paths nil))
@@ -1300,6 +1305,12 @@
   (is equal '((parse:name)) (search-paths "(return-from b)" (sym "B" "WEAVE-TESTS")))
   (is equal '((parse:name)) (search-paths "(return-from b 1)" (sym "B" "WEAVE-TESTS")))
   (is equal nil (search-paths "(return-from b 1)" (sym "C" "WEAVE-TESTS"))))
+
+(define-test node-search-reaches-setf-function-names :parent parser
+  (is equal '(((parse:fun-designator 1))) (search-paths "#'(setf foo)" (sym "FOO" "WEAVE-TESTS")))
+  (is equal '(((parse:fun-designator 0))) (search-paths "#'(setf foo)" (sym "SETF" "COMMON-LISP")))
+  (is equal '(((parse:body 0) (parse:fun-designator 1)))
+      (search-paths "(funcall #'(setf foo) v x)" (sym "FOO" "WEAVE-TESTS"))))
 
 ;;; suffix path reachability
 
@@ -1323,6 +1334,66 @@
       (dolist (path (syntax-paths syntax))
         (is equal (list source path (sx (parse:gen-tree-ref syntax path)))
                   (list source path (sx (follow ast (parse::suffix-path ast path)))))))))
+
+(defun traversal-positions (root)
+  "Every (path . occupant) the search traversal reports under `root', comments excluded."
+  (let ((positions nil))
+    (labels ((comment-id-p (id)
+               (and (consp id) (keywordp (car id))))
+             (walk (node stack)
+               (unless (or (parse:is-atom node) (parse:gen-list-p node))
+                 (parse::map-node
+                  node
+                  (lambda (subnode id spec)
+                    (parse::spec-traverse
+                     node subnode spec id
+                     (lambda (occupant sort id)
+                       (declare (ignore sort))
+                       (unless (comment-id-p id)
+                         (push (cons (reverse (cons id stack)) occupant) positions)
+                         (walk occupant (cons id stack)))
+                       nil)))))))
+      (walk root nil))
+    (nreverse positions)))
+
+(defun syntax-at (tree path)
+  (reduce (lambda (syntax index) (nth index (parse:elements syntax))) path :initial-value tree))
+
+(defun exact-written-paths (node)
+  "Id paths of the written syntax positions of `node' that `suffix-path' addresses exactly."
+  (let ((syntax (parse:to-syntax node)))
+    (loop for path in (syntax-paths syntax)
+          for ids = (parse::suffix-path node path)
+          when (equal (sx (follow node ids)) (sx (syntax-at syntax path)))
+            collect ids)))
+
+(defparameter *traversal-sources*
+  '("`(a ,b ,@c)" "(tagbody a (go a) 1)" "(defmethod m :around ((x string) y) x)"
+    "(defmethod (setf m) (v (x t)) v)" "(let ((a 1) b) (declare (ignore b)) a)"
+    "(let* ((a 1) (b a)) b)" "(flet ((f (x) x)) (f 1))" "(labels ((f (x) (f x))) (f 1))"
+    "(macrolet ((m (x) x)) (m 1))" "(symbol-macrolet ((s 1)) s)" "(block b 1 2)"
+    "(defun f (x &optional (y 1) &key ((:k z) 2)) \"doc\" (declare (ignore z)) x y)"
+    "(defun (setf f) (v x) v x)" "(lambda (x) x)" "(defmacro m ((a b) &body c) a b c)"
+    "(function car)" "#'(lambda (x) x)" "#'(setf f)" "'(a (b c))" "(setq a 1 b 2)"
+    "(return-from b 1)" "(return-from b)" "(if a b c)" "(if a b)" "(catch 'x 1)"
+    "(load-time-value 1 t)" "(eval-when (:execute) 1)" "(locally (declare (special x)) x)"
+    "(the (or fixnum null) 1)" "(go a)" "(unwind-protect a b c)"
+    "(multiple-value-call #'f 1 2)" "(progn a b)" "(progv '(a) '(1) a)" "(f a 1)"
+    "((lambda (x) x) 1)" "(when a b)" "(dolist (x xs) (print x))"
+    "(cond ((null x) 1) (t 2))" "(loop for x in xs collect (f x))"
+    "(with-slots (a (b c)) obj a)" "(f #(a b) \"s\" #\\c)"))
+
+(define-test traversal-visits-written-positions-exactly-once :parent parser
+  (dolist (source *traversal-sources*)
+    (let ((node (parse source)))
+      (parachute:finish (traversal-positions node) "~a traverses without error" source)
+      (when-let (reported (ignore-errors (mapcar #'car (traversal-positions node))))
+        (is equal nil (loop for (path . rest) on reported
+                            when (member path rest :test #'equal)
+                              collect path)
+            "~a reports a position twice" source)
+        (is equal nil (set-difference (exact-written-paths node) reported :test #'equal)
+            "~a leaves written positions unreported" source)))))
 
 ;;; helpers
 

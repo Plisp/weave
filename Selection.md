@@ -18,7 +18,7 @@ We want to type an actual expression like `(let ((x (foo))) _)` or `defmethod fo
 
 This form of search only works over a specified syntactic context. For example, should a typed `(list _)` match against the binding representation of a `let` and the call `(list _)` even though you're probably looking for one (and visually neither is rendered with parens)?
 
-TODO By adding an unquoted search mode, lookups within quoted code `&tree`s is still possible.
+By adding an unquoted search mode, lookups within quoted code is possible using the same mechanism.
 
 ## Zipper selection
 [Zipper selection](https://arxiv.org/pdf/2411.16571) is a mechanism for structured editing of *contexts*. Read the paper and try it in the editor to see how it elegantly solves various editing problems without unbalancing parens. It also efficiently subsumes paredit operations like raise
@@ -63,7 +63,8 @@ c
    * ~~manual cases~~
    * ~~generated bindings~~
 3. Implement sequence search using a basic non-backtracking approach
-   * ~~spec-match~~
+   * ~~node-matching~~
+   * ~~unevaluated matching~~
 4. Introduce update records for provenance tracking later, add a parameter `keep-identity` that works for single substitutions
    * for slots (replace :id id :node newnode)
    * for list positions (splice :id id :index i insert :insert (list nodes) :delete int)

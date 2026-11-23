@@ -63,3 +63,73 @@
 (define-test lambda-list-queries-match-prefixes :parent matching
   (is eq t (matches "(defun f (x y) x)" "(defun f (x) x)"))
   (is eq nil (matches "(defun f (x) x)" "(defun f (x y) x)")))
+
+(define-test syntax-matching :parent matching)
+
+(defun read-syntax (text)
+  (eclector.parse-result:read-from-string (parse:make-client text) text))
+
+(defun syntax-query (text)
+  "Reads `text' as syntax, turning every symbol named _ into a hole."
+  (labels ((holes (form)
+             (cond
+               ((and (typep form 'parse:symbol-ref) (string= (parse:name form) "_"))
+                (parse:hole))
+               ((typep form 'parse:ref-list)
+                (let ((copy (apply #'parse:ref-list (mapcar #'holes (parse:elements form)))))
+                  (setf (parse::kind copy) (parse::kind form))
+                  copy))
+               (t form))))
+    (holes (read-syntax text))))
+
+(defun syntax-search (source query)
+  (let ((paths nil))
+    (parse::node-search (parse source) (syntax-query query) nil #'parse::syntax-match
+                        (lambda (stack) (push (reverse stack) paths) t))
+    (nreverse paths)))
+
+(define-test syntax-queries-find-macro-clauses :parent syntax-matching
+  (is equal '((parse:fun-code (parse:body 0) (parse:body 0)))
+      (syntax-search "(defun f (x) (cond ((null x) 1) (t 2)))" "((null x) _)")))
+
+(define-test syntax-queries-find-bindings :parent syntax-matching
+  (is equal '(((parse:vars 1))) (syntax-search "(let ((x 1) (y 2)) x)" "(y 2)")))
+
+(define-test syntax-queries-find-quoted-lists :parent syntax-matching
+  (is equal '(((parse:thing 1))) (syntax-search "'(a (b c) d)" "(b c)"))
+  (is equal '((parse:thing)) (syntax-search "'(a b)" "(a b)"))
+  (is equal nil (syntax-search "'(a b)" "(a b c)"))
+  (is equal nil (syntax-search "'#(a b)" "(a b)")))
+
+(define-test syntax-queries-find-mixed-quasiquote-lists :parent syntax-matching
+  (is equal '(((parse:thing 1))) (syntax-search "`(a (c ,d))" "(c _)")))
+
+(define-test syntax-queries-find-parsed-forms :parent syntax-matching
+  (is equal '(((parse:forms 1))) (syntax-search "(progn (print x) (list y))" "(list _)"))
+  (is equal '(((parse:body 0)) ((parse:body 1))) (syntax-search "(f (g 1) (g 2))" "(g _)")))
+
+(define-test syntax-queries-find-atoms :parent syntax-matching
+  (is equal '(((parse:body 0) parse:thing) ((parse:body 1))) (syntax-search "(list 'x x)" "x")))
+
+(define-test syntax-query-holes-are-zero-width :parent syntax-matching
+  (is equal '((parse:thing)) (syntax-search "'(a c)" "(a _ c)"))
+  (is equal '((parse:thing)) (syntax-search "'(a b c)" "(a _ c)"))
+  (is equal '((parse:thing)) (syntax-search "'(a)" "(a _)")))
+
+(define-test syntax-queries-match-ordered-subsequences :parent syntax-matching
+  (is equal '((parse:thing)) (syntax-search "'(b a c)" "(a c)"))
+  (is equal '(((parse:thing 1))) (syntax-search "'(x (b a c))" "(a c)"))
+  (is equal nil (syntax-search "'(c a)" "(a c)")))
+
+(define-test syntax-search-stops-at-outermost-match :parent syntax-matching
+  (is equal '((parse:thing)) (syntax-search "'(a (a b) b)" "(a b)"))
+  (is equal '(nil) (syntax-search "(g (g 1))" "(g _)")))
+
+(define-test macro-arguments-are-not-a-written-list :parent syntax-matching
+  (is equal nil (syntax-search "(when a b)" "(a b)")))
+
+(define-test syntax-queries-find-vectors :parent syntax-matching
+  (is equal '(((parse:body 0))) (syntax-search "(svref #() 0)" "#()"))
+  (is equal '(((parse:body 0))) (syntax-search "(svref #(a b) 0)" "#(a b)"))
+  (is equal '(((parse:body 0))) (syntax-search "(svref #(a b) 0)" "#(b)"))
+  (is equal '(((parse:body 0) (parse:thing 1))) (syntax-search "(list '#(a (b c)))" "(b c)")))
