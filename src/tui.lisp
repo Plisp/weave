@@ -350,12 +350,12 @@ Must NOT perform context side effects if `measuring'."))
                    (t
                     (dolist (slot
                              (remove-duplicates
-                               (append (mapcar #'car
-                                               (parse:form-slot-kinds (type-of value)))
-                                       (when (typep value
-                                                    '(or parse:function-call
-                                                      parse:macro-call))
-                                         '(parse:op)))))
+                              (append (mapcar #'car
+                                              (parse:form-slot-kinds (type-of value)))
+                                      (when (typep value
+                                                   '(or parse:function-call
+                                                     parse:macro-call))
+                                        '(parse:op)))))
                       (when (slot-boundp value slot)
                         (visit (make-location :node value :id slot) env))))))))
       (visit location (parse:make-env)))))
@@ -469,13 +469,13 @@ Must NOT perform context side effects if `measuring'."))
           (make-instance 'tui:view
            :children (list view trailing)
            :rect (tui:clamp-rect
-                   (tui:copy-rect rect
-                                  :cols (- (max (tui:rect-x2 (tui:rect view))
-                                                (tui:rect-x2 end))
-                                           (tui:rect-x rect))
-                                  :rows (- (max (tui:rect-y2 (tui:rect view))
-                                                (tui:rect-y2 end))
-                                           (tui:rect-y rect)))
+                  (tui:copy-rect rect
+                                 :cols (- (max (tui:rect-x2 (tui:rect view))
+                                               (tui:rect-x2 end))
+                                          (tui:rect-x rect))
+                                 :rows (- (max (tui:rect-y2 (tui:rect view))
+                                               (tui:rect-y2 end))
+                                          (tui:rect-y rect)))
                   rect))))))
 
 (defmethod render-node :around (node stack context rect &rest keys &key measuring)
@@ -487,7 +487,7 @@ Must NOT perform context side effects if `measuring'."))
     (flet ((render-form (bounds)
              (setf vals
                    (multiple-value-list
-                     (apply #'call-next-method node stack context bounds keys)))
+                    (apply #'call-next-method node stack context bounds keys)))
              (apply #'render-trailing-comments (first vals) trailing stack context bounds
                     keys)))
       (let* ((combined (if comments
@@ -561,8 +561,8 @@ since these aren't a proper location."
           (when (eq (node-at (focus buffer)) (anchor completion))
             (let* ((name (parse:name (anchor completion)))
                    (valid (delete-if-not
-                            (lambda (s)
-                              (completion-match-p name s))
+                           (lambda (s)
+                             (completion-match-p name s))
                            (copy-seq (candidates completion)))))
               (copy-completion-state completion
                :selection (min (selection completion) (max 0 (1- (length valid))))
@@ -617,7 +617,7 @@ since these aren't a proper location."
                      (tui-sys:make-style :fg (tui-sys:color 30 200 0) :underlinep t)))
       (make-instance 'ast-view
        :rect (tui:clamp-rect
-               (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width text))
+              (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width text))
               rect)
        :location location
        :hoverable t
@@ -676,7 +676,7 @@ since these aren't a proper location."
      (string (assoc-value *symbol-mappings* node :test #'parse:string-and-package=)))
     (t
      (string-downcase ; relies on concatenate nil behavior
-       (concatenate 'string (symbol-ref-prefix node package) (parse:name node))))))
+      (concatenate 'string (symbol-ref-prefix node package) (parse:name node))))))
 
 (defmethod render-node ((node parse:symbol-ref) stack context rect &key)
   (let* ((location (car stack))
@@ -705,7 +705,7 @@ unless specified in *reader-punctuation*."
          (focused (location= loc (focus context)))
          (view (make-instance 'ast-view
                 :rect (tui:clamp-rect
-                        (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width text))
+                       (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width text))
                        rect)
                 :location loc
                 :hoverable t
@@ -735,7 +735,7 @@ unless specified in *reader-punctuation*."
 (defun render-delimiter (text loc stack rect &key hoverable)
   (let ((view (make-instance 'ast-view
                :rect (tui:clamp-rect
-                       (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width text))
+                      (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width text))
                       rect)
                :location loc
                :hoverable hoverable)))
@@ -788,14 +788,14 @@ convention."
                                     (unless (or (zerop i)
                                                 (and (= index 2)
                                                      (parse:unary-reader-marker-p
-                                                       last-elt)))
+                                                      last-elt)))
                                       (tui:pad 1))
                                     (tui:place (rect)
                                       (apply render element (cons loc stack) context rect
                                              (if (eq render #'render-node)
                                                  (list* :layout-rule
                                                         (indent::child-rule
-                                                          (getf keys :layout-rule)
+                                                         (getf keys :layout-rule)
                                                          (1- index))
                                                         keys)
                                                  (remove-from-plist keys :layout-rule))))
@@ -973,7 +973,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
          (contents-stack (if rootp stack (cdr stack)))
          (focused (location= location (focus context)))
          (head (first (elements l)))
-         (kind (parse::kind l))
+         (kind (parse:kind l))
          (open-text (case kind
                       (:vector "#(")
                       (:array (format nil "#~dA" (parse::rank l)))
@@ -1011,7 +1011,7 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                         handle (cons handle stack) rect
                         :hoverable t))
                  (inner (contents (tui:clamp-rect
-                                    (tui:copy-rect rect :x (tui:rect-x2 (tui:rect open)))
+                                   (tui:copy-rect rect :x (tui:rect-x2 (tui:rect open)))
                                    rect)))
                  (close (multiple-value-bind (end-x end-y)
                             (view-end inner)
@@ -1027,11 +1027,11 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
              :key-handler (make-key-handler l location)
              :focused focused
              :rect (tui:clamp-rect
-                     (tui:copy-rect rect
-                                    :rows (max 1 (tui:rect-rows (tui:rect inner)))
-                                    :cols (- (max (tui:rect-x2 (tui:rect inner))
-                                                  (tui:rect-x2 (tui:rect close)))
-                                             (tui:rect-x rect)))
+                    (tui:copy-rect rect
+                                   :rows (max 1 (tui:rect-rows (tui:rect inner)))
+                                   :cols (- (max (tui:rect-x2 (tui:rect inner))
+                                                 (tui:rect-x2 (tui:rect close)))
+                                            (tui:rect-x rect)))
                     rect)
              :children (list open inner close)))
           (let* ((content (contents rect))
@@ -1041,16 +1041,16 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
                             :key-handler (make-key-handler l location)
                             :focused focused
                             :rect (tui:clamp-rect
-                                    (tui:copy-rect rect
-                                                   :rows (max 1
-                                                              (tui:rect-rows (tui:rect content)))
-                                                   :cols (- (tui:rect-x2 (tui:rect content))
-                                                            (tui:rect-x rect)))
+                                   (tui:copy-rect rect
+                                                  :rows (max 1
+                                                             (tui:rect-rows (tui:rect content)))
+                                                  :cols (- (tui:rect-x2 (tui:rect content))
+                                                           (tui:rect-x rect)))
                                    rect)
                             :children (list content))
                            (render-delimiter
-                             (format nil "~a~a" (car *list-delimiters*)
-                                     (cdr *list-delimiters*))
+                            (format nil "~a~a" (car *list-delimiters*)
+                                    (cdr *list-delimiters*))
                             location stack rect
                             :hoverable t))))
             (setf (tui:key-handler view) (make-key-handler l location)
@@ -1160,11 +1160,11 @@ including quotes."
       (multiple-value-bind (row column)
           (string-cursor-position node (location-id focus))
         (let* ((cursor-rect (tui:clamp-rect
-                              (tui:copy-rect rect
-                                             :cols 1
-                                             :rows 1
-                                             :x (+ (tui:rect-x rect) column)
-                                             :y (+ (tui:rect-y rect) row))
+                             (tui:copy-rect rect
+                                            :cols 1
+                                            :rows 1
+                                            :x (+ (tui:rect-x rect) column)
+                                            :y (+ (tui:rect-y rect) row))
                              rect))
                (cursor (make-instance 'ast-view
                         :rect cursor-rect
@@ -1265,7 +1265,7 @@ rest indented by 1, keeping keywords in pairs."
             (arg2-view (render-node (second (parse:body node))
                         (cons (make-location :node node :id '(parse:body 1)) stack) context
                         (tui:clamp-rect
-                          (tui:copy-rect rect :y (1+ (tui:rect-y2 arg1-rect)))
+                         (tui:copy-rect rect :y (1+ (tui:rect-y2 arg1-rect)))
                          rect)
                         :measuring measuring))
             (arg2-rect (tui:rect arg2-view))
@@ -1275,10 +1275,10 @@ rest indented by 1, keeping keywords in pairs."
                         :location div-loc
                         :hoverable t
                         :rect (tui:clamp-rect
-                                (tui:copy-rect rect
-                                               :rows 1
-                                               :cols width
-                                               :y (tui:rect-y2 arg1-rect))
+                               (tui:copy-rect rect
+                                              :rows 1
+                                              :cols width
+                                              :y (tui:rect-y2 arg1-rect))
                                rect)
                         :key-handler (make-key-handler (parse:op node) div-loc)
                         :focused (location= div-loc (focus context)))))
@@ -1293,10 +1293,10 @@ rest indented by 1, keeping keywords in pairs."
        (make-instance 'ast-view
         :location location
         :rect (tui:clamp-rect
-                (tui:copy-rect rect
-                               :cols width
-                               :rows (+ (tui:rect-rows arg1-rect) 1
-                                        (tui:rect-rows arg2-rect)))
+               (tui:copy-rect rect
+                              :cols width
+                              :rows (+ (tui:rect-rows arg1-rect) 1
+                                       (tui:rect-rows arg2-rect)))
                rect)
         :children (list arg1-view line-view arg2-view)
         :key-handler (make-key-handler node location)
@@ -1315,7 +1315,7 @@ rest indented by 1, keeping keywords in pairs."
                               (cons (make-location :node node :id '(parse:body 0)) stack)
                               context
                               (tui:clamp-rect
-                                (tui:copy-rect rect :x (1+ (tui:rect-x rect)))
+                               (tui:copy-rect rect :x (1+ (tui:rect-x rect)))
                                rect)
                               :measuring measuring)
                              (render-node arg1
@@ -1326,7 +1326,7 @@ rest indented by 1, keeping keywords in pairs."
               (op-view (render-node (parse:op node)
                         (cons (make-location :node node :id 'parse:op) stack) context
                         (tui:clamp-rect
-                          (tui:copy-rect rect :x (1+ (tui:rect-x2 arg1-rect)))
+                         (tui:copy-rect rect :x (1+ (tui:rect-x2 arg1-rect)))
                          rect)
                         :measuring measuring))
               (op-rect (tui:rect op-view))
@@ -1336,7 +1336,7 @@ rest indented by 1, keeping keywords in pairs."
                           (cons (make-location :node node :id '(parse:body 1)) stack)
                           context
                           (tui:clamp-rect
-                            (tui:copy-rect rect :x (1+ (tui:rect-x2 op-rect)))
+                           (tui:copy-rect rect :x (1+ (tui:rect-x2 op-rect)))
                            rect)
                           :measuring measuring))
               (arg2-rect (tui:rect arg2-view)))
@@ -1380,13 +1380,13 @@ rest indented by 1, keeping keywords in pairs."
          (make-instance 'ast-view
           :location location
           :rect (tui:clamp-rect
-                  (tui:copy-rect rect
-                                 :rows (max (tui:rect-rows arg1-rect)
-                                            (tui:rect-rows arg2-rect))
-                                 :cols (+ (tui:rect-cols arg1-rect) (if arg1-bracketed 1 0)
-                                          2 (tui:rect-cols op-rect)
-                                          (tui:rect-cols arg2-rect)
-                                          (if arg2-bracketed 1 0)))
+                 (tui:copy-rect rect
+                                :rows (max (tui:rect-rows arg1-rect)
+                                           (tui:rect-rows arg2-rect))
+                                :cols (+ (tui:rect-cols arg1-rect) (if arg1-bracketed 1 0)
+                                         2 (tui:rect-cols op-rect)
+                                         (tui:rect-cols arg2-rect)
+                                         (if arg2-bracketed 1 0)))
                  rect)
           :children (list arg1-view op-view arg2-view)
           :key-handler (make-key-handler node location)
@@ -1529,9 +1529,9 @@ rest indented by 1, keeping keywords in pairs."
      :location location
      :children (list op-view view)
      :rect (tui:clamp-rect
-             (tui:copy-rect rect
-                            :rows (tui:rect-rows view-rect)
-                            :cols (+ (tui:rect-cols op-rect) (tui:rect-cols view-rect)))
+            (tui:copy-rect rect
+                           :rows (tui:rect-rows view-rect)
+                           :cols (+ (tui:rect-cols op-rect) (tui:rect-cols view-rect)))
             rect)
      :key-handler (make-key-handler node location)
      :focused (location= location (focus context)))))
@@ -1581,7 +1581,7 @@ pairs building new elements of &rest and &body slots."))
   (:method ((node parse:macro-call))
     '(parse:op parse:body))
   (:method ((node parse:function-code))
-    '(parse:lambda-list parse:docstring parse:declarations parse:body))
+    '(parse:lambda-list parse:docstring parse:decls parse:body))
   (:documentation "The slots of `node' in reading order."))
 
 (defun slot-end-position (node slot)
@@ -1634,7 +1634,7 @@ pairs building new elements of &rest and &body slots."))
          (loop with visible = (layout-slots layout)
                with optional = (parse:form-optional-slots (layout-op layout))
                for (slot . kind) in (remove-duplicates
-                                      (parse:form-slot-kinds (layout-op layout))
+                                     (parse:form-slot-kinds (layout-op layout))
                                      :key #'car
                                      :from-end t)
                unless (or (eq kind '&optional)
@@ -1751,13 +1751,13 @@ ASSUMES that &rest slots accept (slot i j) even if the list is optional like let
 ASSUMES we never focus a plain list body."
   (declare (ignore options))
   `(register-layout
-     (make-layout
-      :op ',type
-      :rows ',rows
-      :templates (list ,@(loop for (slot . template) in templates
-                               collect `(cons ',slot
-                                              (lambda ()
-                                                ,template)))))))
+    (make-layout
+     :op ',type
+     :rows ',rows
+     :templates (list ,@(loop for (slot . template) in templates
+                              collect `(cons ',slot
+                                             (lambda ()
+                                               ,template)))))))
 
 (deflayout parse:let*-form ()
   ((parse:vars . (ref-list (hole) (hole))) (parse:body . (hole)))
@@ -1795,11 +1795,11 @@ ASSUMES we never focus a plain list body."
 
 (deflayout parse:macrolet-form ()
   ((parse:macro-defs
-     . (ref-list (hole)
-                 (make-instance 'parse:function-code
-                  :lambda-list-kind :macro-lambda
-                  :lambda-list (ref-list)
-                  :body (list (hole)))))
+    . (ref-list (hole)
+                (make-instance 'parse:function-code
+                 :lambda-list-kind :macro-lambda
+                 :lambda-list (ref-list)
+                 :body (list (hole)))))
    (parse:body . (hole)))
   (parse:op parse:macro-defs)
   (1 parse:decls)
@@ -1922,18 +1922,17 @@ ASSUMES we never focus a plain list body."
                             (cons (make-location :node node :id 'parse:docstring) stack)
                             context
                             (tui:clamp-rect
-                              (tui:copy-rect rect
-                                             :x (tui:rect-x rect)
-                                             :y (tui:rect-y2 ll-rect))
+                             (tui:copy-rect rect
+                                            :x (tui:rect-x rect)
+                                            :y (tui:rect-y2 ll-rect))
                              rect)
                             :measuring measuring)))
          (declarations-y (if docstring-view
                              (tui:rect-y2 (tui:rect docstring-view))
                              (tui:rect-y2 ll-rect)))
-         (declarations-view (when (parse:declarations node)
-                              (render-node (parse:declarations node)
-                               (cons (make-location :node node :id 'parse:declarations)
-                                     stack)
+         (declarations-view (when (parse:decls node)
+                              (render-node (parse:decls node)
+                               (cons (make-location :node node :id 'parse:decls) stack)
                                context
                                (tui:clamp-rect (tui:copy-rect rect :y declarations-y) rect)
                                :measuring measuring
@@ -1955,13 +1954,13 @@ ASSUMES we never focus a plain list body."
      :location location
      :children children
      :rect (tui:clamp-rect
-             (tui:copy-rect rect
-                            :rows (reduce #'+ children
-                                          :key (lambda (c)
-                                                 (tui:rect-rows (tui:rect c))))
-                            :cols (reduce #'max children
-                                          :key (lambda (c)
-                                                 (tui:rect-cols (tui:rect c)))))
+            (tui:copy-rect rect
+                           :rows (reduce #'+ children
+                                         :key (lambda (c)
+                                                (tui:rect-rows (tui:rect c))))
+                           :cols (reduce #'max children
+                                         :key (lambda (c)
+                                                (tui:rect-cols (tui:rect c)))))
             rect)
      :key-handler (make-key-handler node location)
      :focused (location= location (focus context)))))
@@ -2000,9 +1999,9 @@ ASSUMES we never focus a plain list body."
                             (if (plusp (length package-prefix))
                                 package-prefix
                                 (or (symbol-ref-prefix
-                                      (make-instance 'parse:symbol-ref
-                                       :name (symbol-name candidate)
-                                       :home-package (symbol-package candidate))
+                                     (make-instance 'parse:symbol-ref
+                                      :name (symbol-name candidate)
+                                      :home-package (symbol-package candidate))
                                      (buffer-package buffer))
                                     "")))
                           (candidates state)))
@@ -2011,11 +2010,10 @@ ASSUMES we never focus a plain list body."
                          maximize (+ (tui-sys:display-width prefix)
                                      (tui-sys:display-width (string candidate)))))
            (rect (tui:clamp-rect
-                   (tui:make-rect
-                                  :x (tui:rect-x anchor-rect)
-                                  :y (tui:rect-y2 anchor-rect)
-                                  :rows (tui:rect-rows bounds)
-                                  :cols maxlen)
+                  (tui:make-rect :x (tui:rect-x anchor-rect)
+                                 :y (tui:rect-y2 anchor-rect)
+                                 :rows (tui:rect-rows bounds)
+                                 :cols maxlen)
                   bounds)))
       (let ((view (tui:with-vertical (rect)
                     (loop for candidate across (candidates state)
@@ -2186,10 +2184,10 @@ as `viewport'."
          (bottom (+ origin (- (tui:rect-y2 rect) viewport))))
     ;; rect coordinates are unsigned; clip first
     (tui:clamp-rect
-      (tui:copy-rect rect
-                     :x (+ (tui:rect-x buffer-rect) (tui:rect-x rect))
-                     :y y
-                     :rows (max 0 (- bottom y)))
+     (tui:copy-rect rect
+                    :x (+ (tui:rect-x buffer-rect) (tui:rect-x rect))
+                    :y y
+                    :rows (max 0 (- bottom y)))
      buffer-rect)))
 
 (defun node-screen-rect (buffer node)
@@ -2207,19 +2205,19 @@ as `viewport'."
               (node (node-at (car stack)))
               (rect (staging-to-absolute-coordinates (tui:rect view) viewport buffer-rect))
               (real-stack-len (count-if-not
-                                (lambda (l)
-                                  (trivia:match (location-node l)
-                                    ;; determined by indent
-                                    ((and (class parse:irregular-form) node)
-                                     (let ((id (location-id l)))
-                                       (cond
-                                         ((symbolp id) t)
-                                         ((listp id)
-                                          (when (and (<= (length id) 2)
-                                                     (parse:location-sort node
-                                                      (append-id id 0)))
-                                            t)))))
-                                    ((class parse:reader-marker) t)))
+                               (lambda (l)
+                                 (trivia:match (location-node l)
+                                   ;; determined by indent
+                                   ((and (class parse:irregular-form) node)
+                                    (let ((id (location-id l)))
+                                      (cond
+                                        ((symbolp id) t)
+                                        ((listp id)
+                                         (when (and (<= (length id) 2)
+                                                    (parse:location-sort node
+                                                     (append-id id 0)))
+                                           t)))))
+                                   ((class parse:reader-marker) t)))
                                stack))
               (i (cond
                    ((<= 0 real-stack-len (1- (length *grayramp*)))
@@ -2265,8 +2263,7 @@ as `viewport'."
   (when (and (floating buffer) (floating-rect buffer))
     (return-from buffer-outer-rect (floating-rect buffer)))
   (let ((ui (buffer-ui buffer)))
-    (tui:make-rect
-                   :x (min (buffer-x buffer) (tui:cols ui))
+    (tui:make-rect :x (min (buffer-x buffer) (tui:cols ui))
                    :y (min (buffer-y buffer) (tui:rows ui))
                    :rows (max 0 (- (tui:rows ui) (buffer-y buffer)))
                    :cols (max 0 (- (tui:cols ui) (buffer-x buffer))))))
@@ -2304,8 +2301,7 @@ as `viewport'."
     (let ((height (min (tui:rows ui) (+ height 2)))
           (width (min (tui:cols ui) (+ width 2))))
       (setf (floating-rect buffer)
-            (tui:make-rect
-                           :x (min (buffer-x buffer) (- (tui:cols ui) width))
+            (tui:make-rect :x (min (buffer-x buffer) (- (tui:cols ui) width))
                            :y (min (buffer-y buffer) (- (tui:rows ui) height))
                            :rows height
                            :cols width)))))
@@ -2379,29 +2375,28 @@ as `viewport'."
          (condition (first (debug-conditions state)))
          (restarts (first (debug-restarts state)))
          (lines (append (list (debugger-text
-                                (lambda (out)
-                                  (slynk-backend:print-condition condition out)))
+                               (lambda (out)
+                                 (slynk-backend:print-condition condition out)))
                               "Restarts:")
                         (loop for restart in restarts
                               for i from 0
                               collect (debugger-text
-                                        (lambda (out)
-                                          (format out "~d [depth ~d]: ~a" i
-                                                  (restart-depth restart state) restart))))
+                                       (lambda (out)
+                                         (format out "~d [depth ~d]: ~a" i
+                                                 (restart-depth restart state) restart))))
                         (list "Backtrace:")
                         (loop for frame in (slynk-backend:compute-backtrace 0
                                             *debugger-entries*)
                               for i from 0
                               collect (debugger-text
-                                        (lambda (out)
-                                          (format out "~d: ~a" i
-                                                  (slynk::frame-to-string frame)))))))
+                                       (lambda (out)
+                                         (format out "~d: ~a" i
+                                                 (slynk::frame-to-string frame)))))))
          (width (min *max-debugger-width* (tui:cols ui)))
          (height (min (+ 2 (length lines)) (tui:rows ui))))
     ;;
     (setf (floating-rect buffer)
-          (tui:make-rect
-                         :x (min (buffer-x buffer) (- (tui:cols ui) width))
+          (tui:make-rect :x (min (buffer-x buffer) (- (tui:cols ui) width))
                          :y (min (buffer-y buffer) (- (tui:rows ui) height))
                          :rows height
                          :cols width))
@@ -2416,8 +2411,7 @@ as `viewport'."
             do (tui:puts* text (1+ row) 1 rect)
                (when (<= 2 row (1+ (length restarts)))
                  (let* ((restart (nth (- row 2) restarts))
-                        (bounds (tui:make-rect
-                                               :x 0
+                        (bounds (tui:make-rect :x 0
                                                :y row
                                                :rows 1
                                                :cols (tui:rect-cols rect))))
@@ -2426,10 +2420,10 @@ as `viewport'."
                           :mouse-handler (lambda (view event)
                                            (let ((mouse (tui-sys:event-kind event)))
                                              (when (and (eq (tui-sys:mouse-data-state
-                                                              mouse)
+                                                             mouse)
                                                             :click)
                                                         (eq (tui-sys:mouse-data-button
-                                                              mouse)
+                                                             mouse)
                                                             :left)
                                                         (tui:mouse-within mouse
                                                          (tui:rect view)))
@@ -2438,8 +2432,7 @@ as `viewport'."
       ;;
       (setf (buffer-view buffer)
             (make-instance 'tui:view
-             :rect (tui:make-rect
-                                  :x 0
+             :rect (tui:make-rect :x 0
                                   :y 0
                                   :rows (tui:rect-rows rect)
                                   :cols (tui:rect-cols rect))
@@ -2517,6 +2510,7 @@ as `viewport'."
     (setf old-render-method (find-method #'tui:render nil '(ui)))
     (loop for name in fnames
           do (setf (gethash name funs) (fdefinition name))))
+
   (defun reset-ui ()
     (dolist (method (copy-list (sb-mop:generic-function-methods #'draw-buffer)))
       (remove-method #'draw-buffer method))
@@ -2538,8 +2532,8 @@ as `viewport'."
 
 (defun enter-debugger-loop (ui condition)
   (slog* (debugger-text
-           (lambda (out)
-             (format out "recursively debugging error: ~a" condition))))
+          (lambda (out)
+            (format out "recursively debugging error: ~a" condition))))
   (incf (revision ui))
   (let ((debugger (find-if #'debug-state-p (buffers ui) :key #'buffer-state))
         (previous-focus (focused-buffer ui)))
@@ -2559,8 +2553,8 @@ as `viewport'."
           (debug-restarts debugger))
     (setf (focused-buffer ui) debugger (redisplayed-since-input ui) nil)
     (unwind-protect (slynk-backend:call-with-debugging-environment
-                      (lambda ()
-                        (tui:run-loop ui)))
+                     (lambda ()
+                       (tui:run-loop ui)))
       (pop (debug-conditions debugger))
       (pop (debug-restarts debugger))
       (when (eq (focused-buffer ui) debugger)
@@ -2587,16 +2581,16 @@ as `viewport'."
                (setf redisplay-failed nil))))
       (if *debug*
           (slynk-backend:call-with-debugger-hook
-            (lambda (condition previous-hook)
-              (declare (ignore previous-hook))
-              (reset-ui)
-              (if redisplay-failed
-                  (progn
-                    (slog 'fallback-redisplay-failed)
-                    (tui:stop ui))
-                  (progn
-                    (setf redisplay-failed t)
-                    (enter-debugger-loop ui condition))))
+           (lambda (condition previous-hook)
+             (declare (ignore previous-hook))
+             (reset-ui)
+             (if redisplay-failed
+                 (progn
+                   (slog 'fallback-redisplay-failed)
+                   (tui:stop ui))
+                 (progn
+                   (setf redisplay-failed t)
+                   (enter-debugger-loop ui condition))))
            #'do-redisplay)
           (do-redisplay)))))
 
@@ -2605,10 +2599,10 @@ as `viewport'."
   (find-if (lambda (buffer)
              (when-let (view (buffer-view buffer))
                (tui:rect-has-point-p
-                 (if (floating buffer)
-                     (buffer-outer-rect buffer)
-                     (staging-to-absolute-coordinates (tui:rect view)
-                      (scroll-state-viewport (scroll-state buffer)) (buffer-rect buffer)))
+                (if (floating buffer)
+                    (buffer-outer-rect buffer)
+                    (staging-to-absolute-coordinates (tui:rect view)
+                     (scroll-state-viewport (scroll-state buffer)) (buffer-rect buffer)))
                 row col)))
            (buffers ui)
            :from-end t))
@@ -2798,10 +2792,10 @@ as `viewport'."
         (if *debug*
             (let ((out *standard-output*))
               (slynk-backend:call-with-debugger-hook
-                (lambda (condition previous-hook)
-                  (declare (ignore previous-hook))
-                  (let ((*standard-output* out))
-                    (enter-debugger-loop ui condition)))
+               (lambda (condition previous-hook)
+                 (declare (ignore previous-hook))
+                 (let ((*standard-output* out))
+                   (enter-debugger-loop ui condition)))
                (lambda ()
                  (call-next-method))))
             (call-next-method)))

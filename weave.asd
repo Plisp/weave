@@ -18,6 +18,7 @@
   :pathname "src"
   :components ((:file "util")
                (:file "ast" :depends-on ("util"))
+               (:file "matching" :depends-on ("util" "ast"))
                (:file "indentation" :depends-on ("ast"))
                (:file "serialization" :depends-on ("indentation"))
                (:file "tui" :depends-on ("util" "ast" "indentation"))
@@ -35,6 +36,7 @@
                (:file "util" :depends-on ("package"))
                (:file "parser" :depends-on ("util"))
                (:file "editing" :depends-on ("util"))
-               (:file "matching" :depends-on ("util")))
+               (:file "matching" :depends-on ("util"))
+               (:file "rename" :depends-on ("util")))
   :perform (asdf:test-op (o c)
              (uiop:symbol-call '#:parachute '#:test '#:weave-tests)))

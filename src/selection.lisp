@@ -290,7 +290,7 @@ forms past the end of a selection taking the sort of its last position."
   (multiple-value-bind (low high)
       (selection-range zipper)
     (parse:copy-node (nth-value 1
-                                (rebuild-spine (selection-list-location zipper)
+                                (parse:rebuild-spine (selection-list-location zipper)
                                  (lambda (body)
                                    (let ((elts (elements body)))
                                      `(,@(subseq elts 0 low) ,@forms

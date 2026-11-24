@@ -2,7 +2,7 @@
 
 (defun ancestor-asd-files (file)
   (loop for directory = (uiop/pathname:pathname-directory-pathname
-                          (truename file)) then parent
+                         (truename file)) then parent
         for parent = (uiop/pathname:pathname-parent-directory-pathname directory)
         append (directory (make-pathname :name :wild :type "asd" :defaults directory))
         until (uiop/pathname:pathname-equal directory parent)))
@@ -20,12 +20,12 @@
 (defun system-source-components (asd)
   (let ((result nil))
     (asdf/system-registry:map-systems
-      (lambda (system)
-        (when (and (asdf/system:system-source-file system)
-                   (uiop/pathname:pathname-equal asd
-                    (asdf/system:system-source-file system)))
-          (dolist (component (source-components system))
-            (push (cons system component) result)))))
+     (lambda (system)
+       (when (and (asdf/system:system-source-file system)
+                  (uiop/pathname:pathname-equal asd
+                   (asdf/system:system-source-file system)))
+         (dolist (component (source-components system))
+           (push (cons system component) result)))))
     result))
 
 (defun system-for-file (file)
@@ -35,11 +35,11 @@
       (unless (asdf/operate:component-loaded-p (pathname-name asd))
         (asdf/find-system:load-asd asd))
       (let ((matches (remove-if-not
-                       (lambda (entry)
-                         (when-let (component-file
-                                    (probe-file
-                                      (asdf/component:component-pathname (cdr entry))))
-                           (uiop/pathname:pathname-equal target component-file)))
+                      (lambda (entry)
+                        (when-let (component-file
+                                   (probe-file
+                                    (asdf/component:component-pathname (cdr entry))))
+                          (uiop/pathname:pathname-equal target component-file)))
                       (system-source-components asd))))
         (when matches
           (unless (= 1 (length matches))
@@ -117,8 +117,8 @@ If `define-packages' is true, also evaluates top-level defpackage forms."
         (tui-main ast file package)
         (progn
           (bt:make-thread
-            (lambda ()
-              (tui-main ast file package))
+           (lambda ()
+             (tui-main ast file package))
            :initial-bindings `((*package* . ,*package*)))
           (loop :for (form . value) = (sb-concurrency:receive-message *log*)
                 :until (eq value *log-stop*)

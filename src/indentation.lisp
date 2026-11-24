@@ -148,8 +148,8 @@ its first are aligned with the first, and a loop without keywords has a line per
                            (list :header count)))))
           (if (getf rule :method)
               (let ((position (position-if
-                                (lambda (node)
-                                  (typep node 'ref-list))
+                               (lambda (node)
+                                 (typep node 'ref-list))
                                elements
                                :start (min (if (integerp (getf rule :method))
                                                (getf rule :method)

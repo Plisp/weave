@@ -23,9 +23,7 @@
            #:with-timing
            #:strcat
            #:vconc
-           #:lambda-list-section-start
-           #:search-tree
-           #:tree-subst))
+           #:lambda-list-section-start))
 
 (in-package #:weave-utils)
 
@@ -184,6 +182,7 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
                                        `(:reader ,slot-name))))
                 ,@(when seen-documentation
                     `((:documentation ,documentation))))
+
               ;; constructor
               ,@`((defun ,(symbolicate "MAKE-" name) (&rest initargs)
                     (apply #'make-instance ',name initargs)))
@@ -191,6 +190,7 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
               ;; type predicate
               (defun ,(symbolicate name "-P") (x)
                 (typep x ',name))
+
               ',name))
           (:struct
            (when (> (length superclasses) 1)
@@ -204,6 +204,7 @@ is :STRUCT. Slots are immutable, generating readers. :MUTABLE T makes an accesso
                 ,@(loop for (slot-name initform slot-type mutable) in parsed-slots
                         collect `(,slot-name ,initform :type ,slot-type :read-only
                                   ,(not mutable))))
+
               ',name)))))))
 
 (defun shallow-copy-record (record)
@@ -262,19 +263,3 @@ Returns the preceding parameters as a second value."
                 (push parameter parameters)
                 (incf count)))
           finally (return (values nil (nreverse parameters))))))
-
-(defun search-tree (o tree)
-  (declare (optimize speed))
-  (if (atom tree)
-      (eq o tree)
-      (or (search-tree o (car tree))
-          (some (lambda (m)
-                  (search-tree o m))
-                (cdr tree)))))
-
-(defun tree-subst (tree updater)
-  (if (atom tree)
-      (multiple-value-bind (new-val replace?)
-          (funcall updater tree)
-        (if replace? new-val tree))
-      (cons (tree-subst (car tree) updater) (tree-subst (cdr tree) updater))))

@@ -131,14 +131,14 @@
       ((or (eq home *package*) visible))
       (t
        (serialize-token
-         (or (car (rassoc home (slynk-backend:package-local-nicknames *package*)))
-             (first (stable-sort
-                      (cons (package-name home) (copy-list (package-nicknames home)))
-                     #'<
-                     :key #'length)))
+        (or (car (rassoc home (slynk-backend:package-local-nicknames *package*)))
+            (first (stable-sort
+                    (cons (package-name home) (copy-list (package-nicknames home)))
+                    #'<
+                    :key #'length)))
         stream)
        (write-string
-         (if (eq :external (nth-value 1 (find-symbol (name node) home))) ":" "::")
+        (if (eq :external (nth-value 1 (find-symbol (name node) home))) ":" "::")
         stream)))
     (serialize-token (name node) stream)))
 
@@ -176,12 +176,25 @@
             (when (and (eq symbol 'apply) (> (length elements) 3))
               ;; apply's final argument cannot be a keyword
               (position-if
-                (lambda (node)
-                  (and (typep node 'symbol-ref)
-                       (eq (home-package node) (find-package :keyword))))
+               (lambda (node)
+                 (and (typep node 'symbol-ref)
+                      (eq (home-package node) (find-package :keyword))))
                (rest elements)
                :start 1
                :end (- (length elements) 2))))))))
+
+(defparameter *definition-operators*
+  '(defun defmethod defmacro defgeneric defvar defparameter defconstant defclass defstruct
+    deftype define-condition defrecord)
+  "Operators whose forms are followed by a blank line when nested among siblings.")
+
+(defun definition-form-p (node)
+  (let ((head (typecase node
+                ((or irregular-form function-call) (op node))
+                (ref-list
+                 (when (eq (kind node) :list)
+                   (first (elements node)))))))
+    (and (typep head 'symbol-ref) (member (resolve head) *definition-operators*))))
 
 (defmethod serialize-node ((node ref-list) stream)
   (let* ((elements (elements node))
@@ -230,7 +243,7 @@
          (pprint-indent :block
           (cond
             (listp 0)
-            ((and long-call-p (eql keyword-start 0)) (1- *long-call-indent*))
+            (long-call-p (1- *long-call-indent*))
             (t 1))
           stream)
          (loop with previous = nil
@@ -249,16 +262,16 @@
                do (when (plusp index)
                     (unless *comment-ended-line*
                       (write-char #\Space stream))
+                    (when (and (not data) (definition-form-p previous))
+                      (pprint-newline :mandatory stream))
                     (unless (typep previous 'dot-marker)
                       (when (and (= index 1)
                                  (not listp)
                                  (null header)
                                  (not loop-rows)
                                  (typep (first elements) 'symbol-ref))
-                        (when (and long-call-p
-                                   (not (eql keyword-start 0))
-                                   (not comment-break))
-                          (pprint-newline :fill stream))
+                        (when (and long-call-p (not comment-break))
+                          (pprint-newline (if (eql keyword-start 0) :linear :fill) stream))
                         (unless long-call-p
                           (pprint-indent :current 0 stream)))
                       (when (and long-call-p (>= index 2))
@@ -294,20 +307,17 @@
                                   (and lambdap
                                        (typep previous 'symbol-ref)
                                        (member (resolve previous) lambda-list-keywords))
-                                  (and (not listp)
-                                       (not bodyp)
-                                       (= index 1)
-                                       (not (eql keyword-start 0))))
+                                  (and (not listp) (not bodyp) (= index 1)))
                         (pprint-newline
-                          (cond
-                            ((eql index (getf spec :argument-break)) :mandatory)
-                            ((and keyword-start (>= operand keyword-start)) :linear)
-                            ((and long-call-p (= index 2)) :linear)
-                            (lambda-key :linear)
-                            (bodyp body-break)
-                            ((and (getf spec :pairs) (> index 1) (oddp index)) :linear)
-                            ((getf spec :pairs) :fill)
-                            (t (or (getf spec :break) :fill)))
+                         (cond
+                           ((eql index (getf spec :argument-break)) :mandatory)
+                           ((and keyword-start (>= operand keyword-start)) :linear)
+                           ((and long-call-p (= index 2)) :linear)
+                           (lambda-key :linear)
+                           (bodyp body-break)
+                           ((and (getf spec :pairs) (> index 1) (oddp index)) :linear)
+                           ((getf spec :pairs) :fill)
+                           (t (or (getf spec :break) :fill)))
                          stream))))
                   (serialize-with-rule element stream child-rule)
                   (when loop-rows

@@ -1290,7 +1290,7 @@
 
 (define-test location-slot-exceptions :parent parser
   (is equal '(parse:op parse:body) (parse::location-slots (parse "(when a b)")))
-  (is equal '(parse:lambda-list parse:docstring parse:declarations parse:body)
+  (is equal '(parse:lambda-list parse:docstring parse:decls parse:body)
       (parse::location-slots (parse:fun-code (parse "(defun f (x) x)")))))
 
 (defun search-paths (source query)
@@ -1394,6 +1394,92 @@
             "~a reports a position twice" source)
         (is equal nil (set-difference (exact-written-paths node) reported :test #'equal)
             "~a leaves written positions unreported" source)))))
+
+(defun traversal-locations (root)
+  "Every (node . id) the search traversal visits under `root', comments excluded."
+  (let ((locations nil))
+    (labels ((walk (node)
+               (unless (or (parse:is-atom node) (parse:gen-list-p node))
+                 (parse::map-node
+                  node
+                  (lambda (subnode id spec)
+                    (parse::spec-traverse
+                     node subnode spec id
+                     (lambda (occupant sort id)
+                       (declare (ignore sort))
+                       (unless (and (consp id) (keywordp (car id)))
+                         (push (cons node id) locations)
+                         (walk occupant))
+                       nil)))))))
+      (walk root))
+    (nreverse locations)))
+
+(define-test location-sort-values-are-locations :parent parser
+  (dolist (source *traversal-sources*)
+    (let* ((root (parse source))
+           (locations (ignore-errors (traversal-locations root))))
+      (flet ((check (node id)
+               (when (nth-value 1 (parse:location-sort node id))
+                 (is eq (parse:get-location node id) (nth-value 1 (parse:location-sort node id))
+                     (let ((*print-pretty* nil)
+                           (*package* (find-package '#:weave-parser)))
+                       (format nil "~a: location-sort's value at ~s isn't the location"
+                               source id))))))
+        (loop for (node . id) in locations
+              do (check node id))
+        (dolist (node (remove-duplicates (cons root (mapcar #'car locations))))
+          (dolist (slot (parse::location-slots node))
+            (check node slot)))))))
+
+(defparameter *declaration-sources*
+  '("(let ((a 1)) (declare (special a)) a)"
+    "(let ((a 1)) (declare (optimize (speed 3)) (type fixnum a)) a)"
+    "(let ((a 1)) (declare (fixnum a) (ignore)) a)"
+    "(let ((a 1)) (declare (type (or fixnum null) a)) a)"
+    "(flet ((f () 1)) (declare (inline f) (ignore #'f)) (f))"
+    "(defun f (x) \"doc\" (declare (ignorable x) (dynamic-extent x)) x)"))
+
+(defun traversal-sorts (root)
+  "Every (node id sort) the search traversal reports under `root', comments excluded."
+  (let ((reported nil))
+    (labels ((walk (node)
+               (unless (or (parse:is-atom node) (parse:gen-list-p node))
+                 (parse::map-node
+                  node
+                  (lambda (subnode id spec)
+                    (parse::spec-traverse
+                     node subnode spec id
+                     (lambda (occupant sort id)
+                       (unless (and (consp id) (keywordp (car id)))
+                         (push (list node id sort) reported)
+                         (walk occupant))
+                       nil)))))))
+      (walk root))
+    (nreverse reported)))
+
+#+(or)
+(define-test location-sorts-agree-with-traversal :parent parser
+  (dolist (source (append *traversal-sources* *declaration-sources*))
+    (loop for (node id sort) in (ignore-errors (traversal-sorts (parse source)))
+          when (and (consp id) (not (typep node 'parse:tagbody-form)))
+            do (is equal sort (parse:location-sort node id)
+                   (let ((*print-pretty* nil)
+                         (*package* (find-package '#:weave-parser)))
+                     (format nil "~a: location-sort at ~s disagrees with traversal" source id))))))
+
+(define-test location-sort-probes-absent-positions :parent parser
+  (flet ((probe (source id)
+           (multiple-value-list (parse:location-sort (parse source) id))))
+    (is equal '(parse:eval-form nil) (probe "(block b)" '(parse:body 0)))
+    (is equal '(parse:eval-form nil) (probe "(block b 1)" '(parse:body 9)))
+    (is equal '(parse:unevaluated nil) (probe "'(a)" '(parse:thing 4)))
+    (is equal '(nil) (probe "(let () 1)" '(parse:vars 0)))
+    (is equal '(nil) (probe "(let (a) a)" '(parse:vars 0 0)))
+    (is equal '(nil) (probe "(let ((a 1)) a)" '(parse:vars 0 5)))
+    (is equal '(parse:eval-form nil) (probe "(if a b)" 'parse:else))
+    (is equal '(parse:unevaluated nil) (probe "(load-time-value 1)" 'parse:read-only-p))
+    (is equal '(parse:unevaluated nil) (probe "(defun f () 1)" 'parse:setf-op))
+    (is equal '(parse:eval-form nil) (probe "(return-from b)" 'parse:value))))
 
 ;;; helpers
 

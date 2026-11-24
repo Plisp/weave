@@ -80,7 +80,7 @@
     (press ui :rubout)
     (is equal "(LET ((A 1)) (DECLARE (SPECIAL A)) A)" (code ui)))
   (let ((ui (goto (ui-for "(flet ((f (x) (declare (ignore x)) 1)) (f 1))")
-                  '(parse:funs 0 1) '(parse:declarations 0))))
+                  '(parse:funs 0 1) '(parse:decls 0))))
     (press ui :space)
     (is equal "(FLET ((F (X) (DECLARE (IGNORE X)) _ 1)) (F 1))" (code ui))
     (is eq t (not (null (lines ui))))))
