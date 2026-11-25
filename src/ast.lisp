@@ -98,6 +98,7 @@
            #:gen-nthcdr
            #:rename-binder
            #:rename-error
+           #:rename-error-reason
            #:rename-error-node))
 
 (in-package #:weave-parser)

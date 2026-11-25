@@ -249,12 +249,10 @@ construction, do not modify."))
    (history :init nil :mutable t :type list)
    (future :init nil :mutable t :type list)
    (stack :init nil :mutable t :type list) ; of locations
-   (node-highlights :init nil :mutable t :type list) ; immutable set of (node . color)
+   ;; immutable set of (node . thunk -> nil or color or :stopped)
+   (node-highlighters :init nil :mutable t :type list)
    (goal-stacks :init nil :mutable t :type list))
   (:representation :class))
-
-(defun copy-buffer-state (state)
-  (shallow-copy-record state))
 
 (defrecord buffer ()
   ((buffer-ui)
@@ -278,6 +276,20 @@ construction, do not modify."))
 (defmethod floating ((state debug-state))
   t)
 
+(defmethod node-highlighters ((obj debug-state))
+  nil)
+
+(defun fresh-buffer-state (state)
+  "Shallow copies the immutable slots of `state', removing expired hooks."
+  (let ((res (shallow-copy-record state)))
+    (when (node-highlighters res)
+      (setf (node-highlighters res)
+            (remove-if (lambda (thunk)
+                         (eq (funcall thunk) :stopped))
+                       (node-highlighters res)
+                       :key #'cdr)))
+    res))
+
 (macrolet ((buffer-state-accessors (state readers &rest accessors)
              `(progn
                 ,@(loop for name in (append readers accessors)
@@ -289,7 +301,7 @@ construction, do not modify."))
   (buffer-state-accessors buffer-state
    () floating buffer-package buffer-source buffer-x buffer-y ast edit-loc goal-col
    completion-state debug-conditions debug-restarts history future stack goal-stacks
-   node-highlights)
+   node-highlighters)
   (buffer-state-accessors render-state
    (stage-cache redisplay-cache node-views) floating-rect buffer-view scroll-state
    rect-highlights))
@@ -513,8 +525,15 @@ Must NOT perform context side effects if `measuring'."))
           ;; save view for anchoring
           (setf (gethash node (node-views context)) view)
           ;; save highlights
-          (when-let (val (assoc (node-at (car stack)) (node-highlights context)))
-            (push (cons (tui:rect view) (cdr val)) (rect-highlights context)))
+          (when-let (highlighters
+                     (remove-if-not
+                      (lambda (pair)
+                        (eq (car pair) (node-at (car stack))))
+                      (node-highlighters context)))
+            (dolist (pair highlighters)
+              (let ((res (funcall (cdr pair))))
+                (when (integerp res)
+                  (push (cons (tui:rect view) res) (rect-highlights context))))))
           (when (location= (car stack) (focus context))
             (setf (gethash :focus-rect (redisplay-cache context)) (tui:rect view)))
           ;; save stack for event handling
@@ -2741,7 +2760,7 @@ as `viewport'."
                            (make-buffer
                             :buffer-ui working
                             :buffer-id (buffer-id buffer)
-                            :buffer-state (copy-buffer-state (buffer-state buffer))
+                            :buffer-state (fresh-buffer-state (buffer-state buffer))
                             :render-state (render-state buffer)))
                          originals)))
     (setf (buffers working) copies

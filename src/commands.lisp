@@ -206,15 +206,11 @@ Plain list bodies are skipped since they are never focused."
         (declare (ignore view))
         ;; this is really a do-while idiom
         (prog1 (move-parent buffer)
-          (loop for last-stack = nil then stack
-                for stack = (stack buffer)
-                for loc = (car stack)
-                for node = (node-at loc)
-                while (and (parse:form-p node) (move-parent buffer))
-                finally (when last-stack
-                          (setf (stack buffer) last-stack)
-                          ;; we skipped the last movement
-                          (pop (goal-stacks buffer)))))))
+          (loop for stack = (stack buffer)
+                for parent-stack = (parent-stack stack)
+                while (and parent-stack (parse:form-p (node-at (car parent-stack))))
+                do (move-parent buffer)
+                finally (setf (stack buffer) stack)))))
 
 ;;; buffer
 (defun add-buffer
@@ -1092,6 +1088,8 @@ A package prefix on `node' restricts candidates to that package and visibility."
        (trivia:match (location-id location)
          ((list (eql 'parse:lambda-list) (type integer)) t))))
 
+(defparameter *rename-fail-ticks* 8)
+
 (defmethod handle-key ((node parse:symbol-ref) view location buffer event)
   (declare (ignore view))
   (when (is-regular-char-event event)
@@ -1122,28 +1120,34 @@ A package prefix on `node' restricts candidates to that package and visibility."
                            (newstack (handler-case (parse:rename-binder (parse:root stack)
                                                     path new-name)
                                        (parse:rename-error (e)
-                                         (let ((color #xdc322f)
-                                               (node (parse:rename-error-node e)))
-                                           (push (cons node color)
-                                                 (node-highlights buffer))
+                                         (let* ((color #xdc322f)
+                                                (node (parse:rename-error-node e))
+                                                (ticks *rename-fail-ticks*))
+                                           (push (cons node
+                                                       (lambda ()
+                                                         (if (= ticks 0)
+                                                             :stopped
+                                                             (lerp-from-black
+                                                              (/ ticks *rename-fail-ticks*)
+                                                              (tui-sys:red color)
+                                                              (tui-sys:green color)
+                                                              (tui-sys:blue color)))))
+                                                 (node-highlighters buffer))
                                            (tui:schedule-timer (buffer-ui buffer)
                                             (tui:make-timer 0.1
-                                             (let ((ticks 10))
-                                               (lambda (tui)
-                                                 (decf ticks)
-                                                 (removef (node-highlights buffer) node
-                                                   :key
-                                                   #'car)
-                                                 (setf (needs-redisplay tui) t)
-                                                 (unless (zerop ticks)
-                                                   (push (cons node
-                                                               (lerp-from-black
-                                                                (/ ticks 10)
-                                                                (tui-sys:red color)
-                                                                (tui-sys:green color)
-                                                                (tui-sys:blue color)))
-                                                         (node-highlights buffer))
-                                                   0.1)))))
+                                             (lambda (tui)
+                                               (decf ticks)
+                                               (setf (needs-redisplay tui) t)
+                                               (unless (= ticks 0)
+                                                 0.1))))
+                                           (when (eq :conflict
+                                                     (parse:rename-error-reason e))
+                                             (swap-node location
+                                                        (make-instance 'parse:symbol-ref
+                                                         :name new-name
+                                                         :home-package (parse:home-package
+                                                                        node))
+                                                        buffer))
                                            (return-from rename-edit t))))))
                       (clear-function-indent-cache (stack buffer) buffer)
                       ;; batch

@@ -841,6 +841,20 @@ second\"" (parse:str (parse::docstring code))))
     (press ui '(:alt #\n) '(:alt #\n))
     (is equal '((parse:body 0) (parse:body 0)) (focus-path ui))))
 
+(define-test move-to-outermost-form-stops-at-toplevel :parent editing
+  (let ((ui (ui-for "(f 1)")))
+    (press ui '(:alt #\P) '(:alt #\P))
+    (is equal nil (focus-path ui)))
+  (let ((ui (goto (ui-for (list (parse "(f 1)") (parse "(g 2)"))) 1)))
+    (press ui '(:alt #\P) '(:alt #\P))
+    (is equal '(1) (focus-path ui)))
+  (let ((ui (goto (ui-for "(f (g 1))") '(parse:body 0) '(parse:body 0))))
+    (press ui '(:alt #\P))
+    (is equal nil (focus-path ui)))
+  (let ((ui (goto (ui-for "(let ((x (g 1))) x)") '(parse:vars 0 1) '(parse:body 0))))
+    (press ui '(:alt #\P))
+    (is equal '((parse:vars 0 1)) (focus-path ui))))
+
 (define-test goal-stack :parent editing
   (let ((ui (goto (ui-for "'(a (b c) d)") '(parse::thing 1 1))))
     (press ui '(:alt #\p) '(:alt #\p))
