@@ -84,19 +84,29 @@
             (:alt (tui-sys:make-event :kind (kind key) :altp t))))
         (tui-sys:make-event :kind (kind key)))))
 
+(defparameter *command-time-limit* 10
+  "Seconds a single command or redisplay may take before the test fails.")
+
+(defmacro within-time-limit (&body body)
+  "Runs `body', signalling an error instead of hanging if it exceeds *command-time-limit*."
+  `(handler-case (sb-ext:with-timeout *command-time-limit* ,@body)
+     (sb-ext:timeout ()
+       (error "Command did not finish within ~a seconds" *command-time-limit*))))
+
 (defun press (ui &rest keys)
   (dolist (key keys ui)
-    (lines ui)
-    (let ((focused-view nil))
-      (tui:view-traverse (w::buffer-view ui)
-       (lambda (view)
-         (when (and (typep view 'w::ast-view)
-                    (tui:focused view)
-                    (w::location= (w::location view) (w::focus ui)))
-           (setf focused-view view))
-         t))
-      (funcall (w::make-key-handler (w::node-at (w::focus ui)) (w::focus ui))
-               focused-view (event key) ui))))
+    (within-time-limit
+      (lines ui)
+      (let ((focused-view nil))
+        (tui:view-traverse (w::buffer-view ui)
+         (lambda (view)
+           (when (and (typep view 'w::ast-view)
+                      (tui:focused view)
+                      (w::location= (w::location view) (w::focus ui)))
+             (setf focused-view view))
+           t))
+        (funcall (w::make-key-handler (w::node-at (w::focus ui)) (w::focus ui))
+                 focused-view (event key) ui)))))
 
 (defun focus-path (ui)
   (let ((path (reverse (mapcar #'w::location-id (w::stack ui)))))

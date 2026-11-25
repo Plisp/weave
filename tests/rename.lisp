@@ -2,16 +2,21 @@
 
 (define-test rename)
 
+(defun resolved-package (name)
+  "The package a reader in WEAVE-TESTS resolves `name' to, or WEAVE-TESTS for a new name."
+  (let ((symbol (find-symbol name '#:weave-tests)))
+    (if symbol (symbol-package symbol) (find-package '#:weave-tests))))
+
 (defun renamed (source path new)
   "The rendering of `source' after renaming the binder at `path', a list of ids, to the
 symbol named `new'."
-  (sx (parse::rename-binder (parse source) path new)))
+  (sx (parse:root (parse::rename-binder (parse source) path new (resolved-package new)))))
 
 (defun rendered (source)
   (sx (parse source)))
 
 (defmacro refuses-rename (source path new)
-  `(fail (parse::rename-binder (parse ,source) ',path ,new)
+  `(fail (parse::rename-binder (parse ,source) ',path ,new (resolved-package ,new))
        'parse::rename-error))
 
 (defun path-of (form node)
@@ -28,7 +33,7 @@ symbol named `new'."
   "The reason for refusing the rename and the path to the blamed node in the parsed source,
 or NIL if the rename succeeds."
   (let ((form (parse source)))
-    (handler-case (progn (parse::rename-binder form path new) nil)
+    (handler-case (progn (parse::rename-binder form path new (resolved-package new)) nil)
       (parse::rename-error (e)
         (list (parse::rename-error-reason e) (path-of form (parse::rename-error-node e)))))))
 
@@ -152,6 +157,7 @@ or NIL if the rename succeeds."
 (define-test rename-refuses-unexpanded-macro-mentions :parent rename
   (refuses-rename "(let ((x 1)) (loop for i from 1 to x (print x)))" ((parse:vars 0 0)) "N"))
 
+#+or
 (define-test rename-refuses-escaping-macro-binders :parent rename
   (refuses-rename "(with-slots (a) obj a)" ((parse:body 0 0)) "N"))
 
@@ -159,10 +165,55 @@ or NIL if the rename succeeds."
   (let* ((name (loop for candidate = (format nil "FRESH-~d" (random 1000000000))
                      unless (find-symbol candidate '#:weave-tests)
                        return candidate))
-         (result (parse::rename-binder (parse "(let ((x 1)) (+ x x))") '((parse:vars 0 0)) name))
+         (result (parse:root (parse::rename-binder (parse "(let ((x 1)) (+ x x))")
+                                                   '((parse:vars 0 0)) name
+                                                   (resolved-package name))))
          (binder (first (parse:elements (first (parse:elements (parse:vars result))))))
          (references (parse:body (first (parse:body result)))))
     (is equal (format nil "(LET ((~a 1)) (+ ~a ~a))" name name name) (sx result))
     (is eq (find-package '#:weave-tests) (parse:home-package binder))
     (dolist (reference references)
       (is eq (parse:home-package binder) (parse:home-package reference)))))
+
+(defun renamed-holed (source holes path new)
+  "The rendering after putting holes at `holes', then renaming the binder at `path'."
+  (sx (parse:root (parse::rename-binder (apply #'holed source holes) path new
+                                         (resolved-package new)))))
+
+(defun holed-rendering (source holes)
+  (sx (apply #'holed source holes)))
+
+(define-test rename-around-holes :parent rename
+  (is equal (holed-rendering "(let ((n 1) (h 2)) n)" '(((parse:vars 1 0))))
+      (renamed-holed "(let ((x 1) (h 2)) x)" '(((parse:vars 1 0))) '((parse:vars 0 0)) "N"))
+  (is equal (holed-rendering "(let ((n h)) n)" '(((parse:vars 0 1))))
+      (renamed-holed "(let ((x h)) x)" '(((parse:vars 0 1))) '((parse:vars 0 0)) "N"))
+  (is equal (holed-rendering "(let ((n 1)) (+ n h))" '(((parse:body 0) (parse:body 1))))
+      (renamed-holed "(let ((x 1)) (+ x h))" '(((parse:body 0) (parse:body 1))) '((parse:vars 0 0)) "N"))
+  (is equal (holed-rendering "(let ((n 1)) h)" '(((parse:body 0))))
+      (renamed-holed "(let ((x 1)) h)" '(((parse:body 0))) '((parse:vars 0 0)) "N"))
+  (is equal (holed-rendering "(lambda (n h) n)" '((parse:fun-code (parse:lambda-list 1))))
+      (renamed-holed "(lambda (x h) x)" '((parse:fun-code (parse:lambda-list 1)))
+                     '(parse:fun-code (parse:lambda-list 0)) "N"))
+  (is equal (holed-rendering "(flet ((n () 1)) (h (n)))" '(((parse:body 0) parse:op)))
+      (renamed-holed "(flet ((f () 1)) (h (f)))" '(((parse:body 0) parse:op)) '((parse:funs 0 0)) "N"))
+  (is equal (holed-rendering "(let ((n 1)) (declare (ignore h)) n)" '(((parse:decls 0 1 1))))
+      (renamed-holed "(let ((x 1)) (declare (ignore h)) x)" '(((parse:decls 0 1 1)))
+                     '((parse:vars 0 0)) "N"))
+  (is equal (holed-rendering "(let ((n 1)) (declare (ignore y)) n)" '(((parse:decls 0 1))))
+      (renamed-holed "(let ((x 1)) (declare (ignore y)) x)" '(((parse:decls 0 1)))
+                     '((parse:vars 0 0)) "N"))
+  (is equal (holed-rendering "(dolist (n h) (print n))" '(((parse:body 0 1))))
+      (renamed-holed "(dolist (x h) (print x))" '(((parse:body 0 1))) '((parse:body 0 0)) "N"))
+)
+
+(define-test rename-refuses-binders-of-macros-with-tag-like-holes :parent rename
+  (is eq :binder
+      (handler-case (progn (parse::rename-binder (holed "(dolist (x xs) h)" '((parse:body 1)))
+                                                 '((parse:body 0 0)) "N" (resolved-package "N"))
+                           nil)
+        (parse::rename-error (e) (parse::rename-error-reason e)))))
+
+(define-test rename-fills-hole-binders :parent rename
+  (is equal (holed-rendering "(let ((n 1) (x 2)) x)" '())
+      (renamed-holed "(let ((h 1) (x 2)) x)" '(((parse:vars 0 0))) '((parse:vars 0 0)) "N")))

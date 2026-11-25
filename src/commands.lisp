@@ -210,8 +210,7 @@ Plain list bodies are skipped since they are never focused."
                 for stack = (stack buffer)
                 for loc = (car stack)
                 for node = (node-at loc)
-                while (parse:form-p node)
-                do (move-parent buffer)
+                while (and (parse:form-p node) (move-parent buffer))
                 finally (when last-stack
                           (setf (stack buffer) last-stack)
                           ;; we skipped the last movement
@@ -254,7 +253,8 @@ The anchor coordinates X, Y are absolute."
   (focus buffer))
 
 (defun save-history (buffer)
-  (push (make-undo-state :stack (stack buffer) :ast (ast buffer)) (history buffer)))
+  (push (make-undo-state :stack (stack buffer) :ast (ast buffer)) (history buffer))
+  (setf (future buffer) nil))
 
 (defun undo (buffer)
   (unless (null (history buffer))
@@ -332,7 +332,7 @@ The anchor coordinates X, Y are absolute."
                      (member-if (lambda (l)
                                   (eq (location-node location) (location-node l)))
                                 (stack buffer))))))
-    (setf (future buffer) nil (edit-loc buffer) newloc)))
+    (setf (edit-loc buffer) newloc)))
 
 (defun edit-list (loc updater focus-id buffer stack)
   "Replaces the list at `loc' using `updater' and focuses `focus-id'.
@@ -1116,22 +1116,26 @@ A package prefix on `node' restricts candidates to that package and visibility."
                    t)))
         (cond
           ((eq 'parse:binder (locsort location))
-           (cond
-             ((and (symbol-char-p c) (not (char= c #\:)))
-              (swap-node location
-                         (make-instance 'parse:symbol-ref
-                          :name (format nil "~a~a" name (string-upcase c))
-                          :home-package (parse:home-package node))
-                         buffer))
-             ((char= c #\Rubout)
-              (let ((name (string name)))
-                (if (< 1 (length name))
-                    (swap-node location
-                               (make-instance 'parse:symbol-ref
-                                :name (string-drop name 1)
-                                :home-package (parse:home-package node))
-                               buffer)
-                    (swap-node location (hole) buffer))))))
+           (flet ((rename-edit (new-name)
+                    (let* ((stack (stack buffer))
+                           (path (parse:stack-to-path stack))
+                           (newstack (parse:rename-binder (parse:root stack) path new-name)))
+                      (clear-function-indent-cache (stack buffer) buffer)
+                      ;; batch
+                      (when (or (null (edit-loc buffer))
+                                (not (location= location (edit-loc buffer))))
+                        (save-history buffer))
+                      ;;
+                      (setf (edit-loc buffer) (car newstack))
+                      (commit-edit buffer newstack (parse:root newstack)))))
+             (cond
+               ((and (symbol-char-p c) (not (char= c #\:)))
+                (rename-edit (format nil "~a~a" name (string-upcase c))))
+               ((char= c #\Rubout)
+                (let ((name (string name)))
+                  (if (< 1 (length name))
+                      (rename-edit (string-drop name 1))
+                      (swap-node location (hole) buffer)))))))
           ((char= c #\:)
            (cond
              ((null prefix)
@@ -1206,7 +1210,7 @@ if none, surround current atom"
                         (loc (car stack)))
                     (swap-node loc
                                (make-instance 'parse:function-call
-                                :name sym
+                                :op sym
                                 :body (list (node-at loc) (hole)))
                                buffer)
                     (descend buffer '(parse:body 1)))

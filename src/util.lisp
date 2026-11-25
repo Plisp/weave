@@ -266,6 +266,8 @@ Returns the preceding parameters as a second value."
           finally (return (values nil (nreverse parameters))))))
 
 (defun short-package-name (home)
-  (first (stable-sort (cons (package-name home) (copy-list (package-nicknames home)))
-          #'<
-          :key #'length)))
+  (if home
+      (first (stable-sort (cons (package-name home) (copy-list (package-nicknames home)))
+                          #'<
+                          :key #'length))
+      *package*))

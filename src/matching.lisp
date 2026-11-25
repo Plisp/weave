@@ -152,7 +152,7 @@
          (&body
           (loop for e in subnode
                 for i from 0
-                do (assert (form-p e))
+                do (assert (or (form-p e) (hole-p e)))
                    (funcall f e 'eval-form (child i))))
          (unevaluated (tree-rec subnode id))
          ;; necessary for macro calls
@@ -240,8 +240,9 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
     (rebuild (cons loc (cdr stack)) (funcall updater (node-at loc)) (list))))
 
 ;; watch out for semantic bug: confusing stacks and paths
-(defun rename-binder (form old-path new-name)
-  "assumes old-path is nonempty"
+(defun rename-binder (form old-path new-name &optional package)
+  "assumes old-path is nonempty. `package' is a fallback for holes, otherwise
+it must be the `new-name's resolved package relative to the binder."
   (flet ((refuse (reason node)
            (error 'rename-error :reason reason :node node)))
     (let (stack
@@ -261,11 +262,15 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
               new
               (copy-anchors binder
                (make-instance 'symbol-ref
-                :home-package (reresolve-package new-name binder)
+                :home-package (if (hole-p binder)
+                                  (or package (error "must provide package for holes"))
+                                  (reresolve-package new-name (home-package binder)))
                 :name new-name))))
       ;; env is right outside the binding form at stack[0].node
       ;; stack[0].node is the binding form containing binder
-      (unless (and (typep binder 'symbol-ref) (eq 'binder (locsort (car stack))))
+      (unless (and (or (typep binder 'symbol-ref)
+                       (hole-p binder))
+                   (eq 'binder (locsort (car stack))))
         (refuse :binder binder))
       ;; conservatively record new name references even if the parent can bind twice,
       ;; references under binders shadowed by the one being replaced will never change
@@ -296,7 +301,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
           (refuse :conflict existing))
         ;; search
         (node-search binding-form
-         new (butlast old-path)
+         new (cdr (reverse old-path)) ; bug, not caught by length 1
          (lambda (node query sort)
            (declare (ignore query))
            (and (typep node 'symbol-ref)
@@ -343,7 +348,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                      (lambda (s)
                        (copy-anchors s
                         (make-instance 'symbol-ref
-                         :home-package (reresolve-package new-name s)
+                         :home-package (reresolve-package new-name (home-package s))
                          :name new-name)))
                      stack))))
           ;; replace binder
@@ -369,7 +374,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                      (unless (eq newname-binder
                                  (env-lookup (node-at (car stack)) kind env))
                        (refuse :capture (relookup match oldstack)))))
-          (root newstack))))))
+          newstack)))))
 
 (defparameter *sort-repr*
   '((eval-form . parsed) (fun-designator . parsed) (unevaluated . syntax)

@@ -2801,6 +2801,7 @@ as `viewport'."
             (call-next-method)))
     (unless (and (tui-sys:mouse-event-p event)
                  (eq :hover (tui-sys:mouse-data-button (tui-sys:event-kind event))))
+      ;;(slog (mapcar #'stack (buffers ui)))
       (slog* (format nil "~a~a" (make-string 70 :initial-element #\-) 'event-handled)))))
 
 (defmethod tui:dispatch-event :after ((ui ui) event)

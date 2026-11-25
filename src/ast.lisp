@@ -18,7 +18,9 @@
            #:append-id
            #:parent-id
            #:update
+           #:root
            #:path-to-stack
+           #:stack-to-path
            #:rebuild-spine
            #:get-location
            #:node-at
@@ -38,6 +40,7 @@
            #:form-p
            #:syntax-p
            #:symbol-ref
+           #:home-package
            #:symbol-ref=
            #:symbol-reify
            #:eval-form
@@ -93,7 +96,7 @@
            #:gen-cdr
            #:gen-atom-p
            #:gen-nthcdr
-           #:home-package))
+           #:rename-binder))
 
 (in-package #:weave-parser)
 
@@ -169,10 +172,10 @@
   "Suitable as a comparison predicate between symbol-ref, symbol"
   (and (string= (name node) sym) (eq (home-package node) (symbol-package sym))))
 
-(defun reresolve-package (new-name symref)
+(defun reresolve-package (new-name package)
   (multiple-value-bind (s status)
-      (find-symbol new-name (home-package symref))
-    (if status (symbol-package s) (home-package symref))))
+      (find-symbol new-name package)
+    (if status (symbol-package s) package)))
 
 (defrecord hole ()
   ((inlay :init "hole" :mutable t :type simple-string)
@@ -499,6 +502,11 @@ so a name test alone can't distinguish #:|.| from a dot."))
         for fresh = (make-location :node parent :id id)
         collect fresh into stack
         finally (return (nreverse stack))))
+
+(defun stack-to-path (stack)
+  (let ((path))
+    (loop for l in stack do (push (location-id l) path))
+    path))
 
 (defun root (stack)
   (location-node (lastcar stack)))
@@ -1434,7 +1442,10 @@ XXX type specializers currently sort as evaluated forms."
   (if (ref-list-p decls) ; can be hole
       (sort-node (cons 'unevaluated
                        (mapcar #'(lambda (declspec)
-                                   (sort-node (classify-decl declspec)))
+                                   (let ((l (classify-decl declspec)))
+                                     (if (listp l)
+                                         (sort-node l)
+                                         l)))
                                (gen-cdr decls))))
       'unevaluated))
 
@@ -2171,7 +2182,8 @@ our reader representation or ordinary sexps."
                           collect (with-elements ,declgroup
                                    (cons (gen-car ,declgroup)
                                          (mapcar (lambda (,declspec) ; (ignore #'f)
-                                                   (let ((,kind (gen-car ,declspec)))
+                                                   (let ((,kind (and (gen-list-p ,declspec)
+                                                                     (gen-car ,declspec))))
                                                      (if (and (symbol-ref-p ,kind)
                                                               (member (resolve ,kind)
                                                                       *fun-designator-declarations*
@@ -3482,7 +3494,7 @@ XXX performs unguarded read-evaluation."
 `accept-probe' receives a probe-info and its observed environment (NIL for binders).
 Returning NIL restores the occurrence and continues probing its descendants.
 `consume-probes' receives the perturbed raw call, stripped base environment, and
-gensym-to-probe-info table, within the temporary interning extent. Return its
+gensym-to-probe-info table, within the temporary interning extent. Returns its
 primary value and T, or NIL and NIL if the initial macroexpansion fails."
   (with-temporary-interning (interned)
     (handler-bind ((warning #'muffle-warning))
