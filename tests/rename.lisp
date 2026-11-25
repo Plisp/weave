@@ -90,10 +90,18 @@ or NIL if the rename succeeds."
 (define-test rename-refuses-capturing-references :parent rename
   (is equal '(:capture ((parse:body 0) (parse:body 0) (parse:body 1)))
       (refusal "(let ((n 1)) (let ((x 2)) (+ x n)))" '((parse:body 0) (parse:vars 0 0)) "N"))
-  (is equal '(:capture ((parse:body 0) (parse:body 1)))
-      (refusal "(let ((x 1)) (+ x y))" '((parse:vars 0 0)) "Y"))
   (is equal '(:capture ((parse:body 0) parse:op))
       (refusal "(flet ((f () 1)) (list (f)))" '((parse:funs 0 0)) "LIST")))
+
+(define-test rename-may-capture-unbound-references :parent rename
+  (is equal (rendered "(let ((y 1)) (+ y y))")
+      (renamed "(let ((x 1)) (+ x y))" '((parse:vars 0 0)) "Y"))
+  (is equal (rendered "(let ((z 1)) (let ((y 2)) (+ z y z)))")
+      (renamed "(let ((x 1)) (let ((y 2)) (+ x y z)))" '((parse:vars 0 0)) "Z"))
+  (is equal (rendered "(let ((free 1)) (lambda () (+ free free)))")
+      (renamed "(let ((x 1)) (lambda () (+ x free)))" '((parse:vars 0 0)) "FREE"))
+  (is equal (rendered "(flet ((undefined-fn () 1)) (list (undefined-fn) (undefined-fn)))")
+      (renamed "(flet ((f () 1)) (list (f) (undefined-fn)))" '((parse:funs 0 0)) "UNDEFINED-FN")))
 
 (define-test rename-refuses-special-binders :parent rename
   (is equal '(:special ((parse:vars 0 0)))
@@ -138,6 +146,24 @@ or NIL if the rename succeeds."
       (refusal "(flet ((f () 1) (n () 2)) (f))" '((parse:funs 0 0)) "N"))
   (is equal '(:conflict ((parse:funs 0 0)))
       (refusal "(flet ((n () 2) (f () 1)) (f))" '((parse:funs 1 0)) "N")))
+
+(define-test rename-allows-sequential-rebinding-in-let* :parent rename
+  (is equal (rendered "(let* ((n 1) (n n)) n)")
+      (renamed "(let* ((n 1) (x n)) x)" '((parse:vars 1 0)) "N"))
+  (is equal (rendered "(let* ((n 1) (n n)) n)")
+      (renamed "(let* ((x 1) (n x)) n)" '((parse:vars 0 0)) "N"))
+  (is equal (rendered "(let* ((n 1) (y n) (n 2)) y)")
+      (renamed "(let* ((x 1) (y x) (n 2)) y)" '((parse:vars 0 0)) "N")))
+
+(define-test rename-refuses-capture-by-later-let*-bindings :parent rename
+  (is equal '(:capture ((parse:body 0)))
+      (refusal "(let* ((x 1) (n 2)) x)" '((parse:vars 0 0)) "N"))
+  (is equal '(:capture ((parse:body 0) (parse:body 0)))
+      (refusal "(let* ((x 1) (n 2)) (+ x n))" '((parse:vars 0 0)) "N"))
+  (is equal '(:capture ((parse:vars 2 1)))
+      (refusal "(let* ((x 1) (n 2) (y x)) y)" '((parse:vars 0 0)) "N"))
+  (is equal '(:capture ((parse:body 0) (parse:body 0)))
+      (refusal "(let* ((n 1) (x 2)) (+ n x))" '((parse:vars 1 0)) "N")))
 
 (define-test rename-substitutes-declarations :parent rename
   (is equal (rendered "(let ((n 1)) (declare (ignorable n)) n)")

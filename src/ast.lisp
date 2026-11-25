@@ -96,7 +96,9 @@
            #:gen-cdr
            #:gen-atom-p
            #:gen-nthcdr
-           #:rename-binder))
+           #:rename-binder
+           #:rename-error
+           #:rename-error-node))
 
 (in-package #:weave-parser)
 
@@ -505,7 +507,8 @@ so a name test alone can't distinguish #:|.| from a dot."))
 
 (defun stack-to-path (stack)
   (let ((path))
-    (loop for l in stack do (push (location-id l) path))
+    (loop for l in stack
+          do (push (location-id l) path))
     path))
 
 (defun root (stack)
@@ -1443,9 +1446,7 @@ XXX type specializers currently sort as evaluated forms."
       (sort-node (cons 'unevaluated
                        (mapcar #'(lambda (declspec)
                                    (let ((l (classify-decl declspec)))
-                                     (if (listp l)
-                                         (sort-node l)
-                                         l)))
+                                     (if (listp l) (sort-node l) l)))
                                (gen-cdr decls))))
       'unevaluated))
 
@@ -2182,8 +2183,9 @@ our reader representation or ordinary sexps."
                           collect (with-elements ,declgroup
                                    (cons (gen-car ,declgroup)
                                          (mapcar (lambda (,declspec) ; (ignore #'f)
-                                                   (let ((,kind (and (gen-list-p ,declspec)
-                                                                     (gen-car ,declspec))))
+                                                   (let ((,kind
+                                                          (and (gen-list-p ,declspec)
+                                                               (gen-car ,declspec))))
                                                      (if (and (symbol-ref-p ,kind)
                                                               (member (resolve ,kind)
                                                                       *fun-designator-declarations*

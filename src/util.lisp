@@ -24,7 +24,8 @@
            #:strcat
            #:vconc
            #:lambda-list-section-start
-           #:short-package-name))
+           #:short-package-name
+           #:lerp-from-black))
 
 (in-package #:weave-utils)
 
@@ -268,6 +269,6 @@ Returns the preceding parameters as a second value."
 (defun short-package-name (home)
   (if home
       (first (stable-sort (cons (package-name home) (copy-list (package-nicknames home)))
-                          #'<
-                          :key #'length))
+              #'<
+              :key #'length))
       *package*))

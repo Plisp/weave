@@ -87,6 +87,7 @@ If `define-packages' is true, also evaluates top-level defpackage forms."
 
 (defun demo-ast ()
   (let ((source "(lambda (a &key (b a supplied-p))
+                   (declare (ignore a))
                    (loop for i from 1 to 10 do (print i)))"))
     (parse-source source)))
 

@@ -124,7 +124,7 @@ its first are aligned with the first, and a loop without keywords has a line per
     (trivia:match :header 1 :rest (:header 0 :head :data :compact-body t))
     (trivia:ematch :like trivia:match) (trivia:cmatch :like trivia:match)
     (if :break :linear) (and :break :linear) (or :break :linear) (setq :pairs t)
-    (declare :break :linear)
+    ;; (declare :break :linear)
     (setf :pairs t) (psetq :pairs t) (psetf :pairs t)
     (defvar :header 2 :body-break :linear) (defparameter :like defvar)
     (defconstant :like defvar)

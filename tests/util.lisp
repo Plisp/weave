@@ -108,6 +108,10 @@
         (funcall (w::make-key-handler (w::node-at (w::focus ui)) (w::focus ui))
                  focused-view (event key) ui)))))
 
+(defun focus-rect (ui)
+  "The focused node's rect from the last redisplay, in staging coordinates."
+  (gethash :focus-rect (w::redisplay-cache ui)))
+
 (defun focus-path (ui)
   (let ((path (reverse (mapcar #'w::location-id (w::stack ui)))))
     (if (= 1 (length (w::ast ui))) (rest path) path)))

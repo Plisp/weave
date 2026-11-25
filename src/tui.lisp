@@ -60,6 +60,13 @@
        (sb-concurrency:send-message *log* (cons nil ,res))
        ,res)))
 
+(defun lerp-from-black (tv r g b)
+  "tv in [0,1] where 0 is black and 1 is (tui:color r g b)."
+  (flet ((interp (c)
+           (let ((v (* tv (expt c 2.2d0))))
+             (truncate (expt (max 0.0d0 v) (/ 1.0d0 2.2d0))))))
+    (tui-sys:color (interp r) (interp g) (interp b))))
+
 (defun reading-order-p (views)
   "Does each of `views' start no earlier than the one before it, by line then column?"
   (loop for (a b) on views
@@ -203,7 +210,7 @@ construction, do not modify."))
    (selection :init nil :mutable t :type (or null selection))
    (zipper :init nil :mutable t :type (or null zipper))
    (cutbuffer :init nil :mutable t :type (or null cutbuffer))
-   (redisplayed-since-input :init nil :mutable t :type boolean)
+   (needs-redisplay :init t :mutable t :type boolean)
    (revision :init 0 :mutable t :type (integer 0)))
   (:representation :class))
 
@@ -223,7 +230,7 @@ construction, do not modify."))
      :segments nil)
     :mutable t :type scroll-state)
    ;; both below use staging coordinates
-   (focus-rect :init nil :mutable t :type (or null tui:rect))
+   (rect-highlights :init nil :mutable t :type list)
    (node-views :init (make-hash-table) :type hash-table))
   (:representation :class))
 
@@ -241,7 +248,8 @@ construction, do not modify."))
    (completion-state :init nil :mutable t :type (or null completion-state))
    (history :init nil :mutable t :type list)
    (future :init nil :mutable t :type list)
-   (stack :init nil :mutable t :type list)
+   (stack :init nil :mutable t :type list) ; of locations
+   (node-highlights :init nil :mutable t :type list) ; immutable set of (node . color)
    (goal-stacks :init nil :mutable t :type list))
   (:representation :class))
 
@@ -280,10 +288,11 @@ construction, do not modify."))
                                    (setf (,name (,state buffer)) value))))))
   (buffer-state-accessors buffer-state
    () floating buffer-package buffer-source buffer-x buffer-y ast edit-loc goal-col
-   completion-state debug-conditions debug-restarts history future stack goal-stacks)
+   completion-state debug-conditions debug-restarts history future stack goal-stacks
+   node-highlights)
   (buffer-state-accessors render-state
    (stage-cache redisplay-cache node-views) floating-rect buffer-view scroll-state
-   focus-rect))
+   rect-highlights))
 
 (defun buffer-focused-p (buffer)
   (when-let (focused (focused-buffer (buffer-ui buffer)))
@@ -291,7 +300,7 @@ construction, do not modify."))
 
 (defmethod (setf focused-buffer) :before (buffer (ui ui))
   (assert (or (null buffer) (member buffer (buffers ui))))
-  (setf (redisplayed-since-input ui) nil)
+  (setf (needs-redisplay ui) t)
   (when (and (not (eq buffer (focused-buffer ui))) (selection ui))
     (setf (selection ui) (copy-selection (selection ui) :activep nil))))
 
@@ -503,6 +512,9 @@ Must NOT perform context side effects if `measuring'."))
         (unless measuring
           ;; save view for anchoring
           (setf (gethash node (node-views context)) view)
+          ;; save highlights
+          (when-let (val (assoc (node-at (car stack)) (node-highlights context)))
+            (push (cons (tui:rect view) (cdr val)) (rect-highlights context)))
           (when (location= (car stack) (focus context))
             (setf (gethash :focus-rect (redisplay-cache context)) (tui:rect view)))
           ;; save stack for event handling
@@ -511,9 +523,9 @@ Must NOT perform context side effects if `measuring'."))
         (values-list (cons combined (rest vals)))))))
 
 ;;; event handling
-(defparameter *default-key-handlers* (make-hash-table :test #'equal))
+(defvar *default-key-handlers* (make-hash-table :test #'equal))
 
-(defparameter *global-key-handlers* (make-hash-table :test #'equal))
+(defvar *global-key-handlers* (make-hash-table :test #'equal))
 
 (defun plain-body-location-p (location)
   "Whether `location' addresses a whole evaluated body, which is an invariant violation
@@ -590,7 +602,7 @@ since these aren't a proper location."
   (parse:name (parse:op node)))
 
 ;; note: assumes length 1 symbol mapping for <= and >=
-(defparameter *arb-arity-binops* #(/ * + - < > <= >= = /=))
+(defvar *arb-arity-binops* #(/ * + - < > <= >= = /=))
 
 (defun binop-precedence (op-ref)
   (trivia:ematch (parse::ref-coerce-symbol op-ref)
@@ -632,9 +644,9 @@ since these aren't a proper location."
                 (tui-sys:event-altp event)
                 (tui-sys:event-metap event)))))
 
-(defparameter *symbol-mappings* '((<= . #\≤) (>= . #\≥) (/= . #\≠) (lambda . "λ")))
+(defvar *symbol-mappings* '((<= . #\≤) (>= . #\≥) (/= . #\≠) (lambda . "λ")))
 
-(defparameter *reader-punctuation*
+(defvar *reader-punctuation*
   '((quote . "'") (function . "#'") (eclector.reader:quasiquote . "`")
     (eclector.reader:unquote . ",") (eclector.reader:unquote-splicing . ",@")
     (parse:read-eval . "#.")))
@@ -719,7 +731,7 @@ unless specified in *reader-punctuation*."
     view))
 
 ;;; syntactic list
-(defparameter *list-delimiters* '("(" . ")"))
+(defvar *list-delimiters* '("(" . ")"))
 
 (defmethod parse:get-location ((node ref-list) (id (eql :open)))
   node)
@@ -809,7 +821,7 @@ convention."
       (values (tui:rect-x2 r) (tui:rect-y r)))))
 
 ;; TODO changing this/display methods should invalidate indent caches
-(defparameter *column-limit* 92)
+(defvar *column-limit* 92)
 
 ;; note: must be adjustable, bound to *put-buffer* during measurement
 (defvar *measurement-scratch*)
@@ -1076,9 +1088,9 @@ recursively unless `delimited' is :shallow. It's opening parens is selectable."
    :rect (tui:clamp-rect (tui:copy-rect rect :rows 1 :cols (tui-sys:display-width line))
           rect)))
 
-(defparameter *horizontal* '((0 . nil)))
+(defvar *horizontal* '((0 . nil)))
 
-(defparameter *vertical* '((0 . t)))
+(defvar *vertical* '((0 . t)))
 
 (defun render-literal-text (node text stack context rect)
   (let* ((location (car stack))
@@ -2165,7 +2177,8 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
                :segments segments
                :viewport viewport))
         ;; edit: split up setf
-        (setf (focus-rect buffer) (gethash :focus-rect (redisplay-cache buffer)))
+        (push (cons (gethash :focus-rect (redisplay-cache buffer)) #xb58900)
+              (rect-highlights buffer))
         (setf (gethash forms (node-views buffer)) root)
         root))))
 
@@ -2173,7 +2186,7 @@ note: the returned view includes unseen forms not clipped to `buffer-rect'."
 ;;; main render loop
 ;;
 ;; using oklab
-(defparameter *grayramp* #(0 7 #x16 #x20 #x2e #x3b #x48 #x50 #x63 #x71))
+(defvar *grayramp* #(0 7 #x16 #x20 #x2e #x3b #x48 #x50 #x63 #x71))
 
 (defun staging-to-absolute-coordinates (rect viewport buffer-rect)
   "Transforms `rect' from staging coordinates for `buffer-rect' to absolute
@@ -2254,9 +2267,10 @@ as `viewport'."
          (when (location-selected-p buffer stack)
            (tui:fill-rect (tui-sys:make-style :bg #x6c71c4) rect :blend 0.35))))
      t))
-  (when-let (focus-rect (and (buffer-focused-p buffer) (focus-rect buffer)))
-    (let ((rect (staging-to-absolute-coordinates focus-rect viewport buffer-rect)))
-      (tui:fill-rect (tui-sys:make-style :bg #xb58900) rect :blend 0.7))))
+  ;; draw highlights including focus
+  (loop for (staging-rect . color) in (rect-highlights buffer)
+        for rect = (staging-to-absolute-coordinates staging-rect viewport buffer-rect)
+        do (tui:fill-rect (tui-sys:make-style :bg color) rect :blend 0.7)))
 
 (defun buffer-outer-rect (buffer)
   "The absolute screen area available to `buffer'."
@@ -2306,9 +2320,9 @@ as `viewport'."
                            :rows height
                            :cols width)))))
 
-(defparameter *buffer-focus-border* #xb0b0b0)
+(defvar *buffer-focus-border* #xb0b0b0)
 
-(defparameter *buffer-unfocus-border* #x606060)
+(defvar *buffer-unfocus-border* #x606060)
 
 (defun draw-buffer-border (buffer)
   (let* ((rect (buffer-outer-rect buffer))
@@ -2344,9 +2358,9 @@ as `viewport'."
         (draw-highlights buffer content offset buffer-rect)
         (setf (buffer-view buffer) content)))))
 
-(defparameter *debugger-entries* 10)
+(defvar *debugger-entries* 10)
 
-(defparameter *max-debugger-width* 80)
+(defvar *max-debugger-width* 80)
 
 ;; note: debugger code must NOT error, catch any printing errors
 (defun debugger-text (printer)
@@ -2551,7 +2565,7 @@ as `viewport'."
     (push (ignore-errors
             (compute-restarts condition))
           (debug-restarts debugger))
-    (setf (focused-buffer ui) debugger (redisplayed-since-input ui) nil)
+    (setf (focused-buffer ui) debugger (needs-redisplay ui) t)
     (unwind-protect (slynk-backend:call-with-debugging-environment
                      (lambda ()
                        (tui:run-loop ui)))
@@ -2564,7 +2578,7 @@ as `viewport'."
                   (find-if (lambda (buffer)
                              (not (eq buffer debugger)))
                            (buffers ui)))))
-      (setf (redisplayed-since-input ui) nil)
+      (setf (needs-redisplay ui) t)
       (when (null (debug-conditions debugger))
         (removef (buffers ui) debugger)))))
 
@@ -2572,7 +2586,7 @@ as `viewport'."
 (let ((redisplay-failed nil))
   (defmethod tui:redisplay :around ((ui ui))
     (flet ((do-redisplay ()
-             (unless (redisplayed-since-input ui)
+             (when (needs-redisplay ui)
                (with-timing (lambda (time)
                               (slog* (format nil "~aRedisplay done in ~Ams"
                                              (make-string 70 :initial-element #\-)
@@ -2656,7 +2670,7 @@ as `viewport'."
                   :offset-y (- (tui-sys:mouse-data-row mouse) (tui:rect-y rect)))))
          t)))))
 
-(defparameter *ui-key-handlers* (make-hash-table :test #'equal))
+(defvar *ui-key-handlers* (make-hash-table :test #'equal))
 
 (defun dispatch-ui-event (ui event)
   (when (and (not (tui-sys:mouse-event-p event)) (tui:root-view ui))
@@ -2806,9 +2820,9 @@ as `viewport'."
 
 (defmethod tui:dispatch-event :after ((ui ui) event)
   (declare (ignore event))
-  (setf (redisplayed-since-input ui) nil)
+  (setf (needs-redisplay ui) t)
   (tui:redisplay ui)
-  (setf (redisplayed-since-input ui) t))
+  (setf (needs-redisplay ui) nil))
 
 (defmethod tui:handle-resize :after ((ui ui))
-  (setf (redisplayed-since-input ui) nil))
+  (setf (needs-redisplay ui) t))

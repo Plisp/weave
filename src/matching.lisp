@@ -268,8 +268,7 @@ it must be the `new-name's resolved package relative to the binder."
                 :name new-name))))
       ;; env is right outside the binding form at stack[0].node
       ;; stack[0].node is the binding form containing binder
-      (unless (and (or (typep binder 'symbol-ref)
-                       (hole-p binder))
+      (unless (and (or (typep binder 'symbol-ref) (hole-p binder))
                    (eq 'binder (locsort (car stack))))
         (refuse :binder binder))
       ;; conservatively record new name references even if the parent can bind twice,
@@ -296,6 +295,7 @@ it must be the `new-name's resolved package relative to the binder."
           (refuse :special binder))
         ;; check: binding form for parallel binding :conflict
         (when-let* ((existing (and has-decls
+                                   (not (typep binding-form 'let*-form))
                                    (env-lookup new
                                     kind (location-env binding-form 'decls +nullenv+)))))
           (refuse :conflict existing))
@@ -371,9 +371,14 @@ it must be the `new-name's resolved package relative to the binder."
                 for newname-binder in newname-binders
                 do (multiple-value-bind (stack env)
                        (resolve-path (root newstack) match +nullenv+)
-                     (unless (eq newname-binder
-                                 (env-lookup (node-at (car stack)) kind env))
-                       (refuse :capture (relookup match oldstack)))))
+                     (let ((lookup (env-lookup (node-at (car stack)) kind env)))
+                       (unless (or (eq newname-binder lookup)
+                                   ;; unbound references are accepted
+                                   (and (eq kind :variable) (null newname-binder))
+                                   (and (eq kind :function)
+                                        (null (sb-cltl2:function-information
+                                               (resolve new)))))
+                         (refuse :capture (relookup match oldstack))))))
           newstack)))))
 
 (defparameter *sort-repr*

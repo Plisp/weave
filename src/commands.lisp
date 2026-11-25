@@ -1119,7 +1119,32 @@ A package prefix on `node' restricts candidates to that package and visibility."
            (flet ((rename-edit (new-name)
                     (let* ((stack (stack buffer))
                            (path (parse:stack-to-path stack))
-                           (newstack (parse:rename-binder (parse:root stack) path new-name)))
+                           (newstack (handler-case (parse:rename-binder (parse:root stack)
+                                                    path new-name)
+                                       (parse:rename-error (e)
+                                         (let ((color #xdc322f)
+                                               (node (parse:rename-error-node e)))
+                                           (push (cons node color)
+                                                 (node-highlights buffer))
+                                           (tui:schedule-timer (buffer-ui buffer)
+                                            (tui:make-timer 0.1
+                                             (let ((ticks 10))
+                                               (lambda (tui)
+                                                 (decf ticks)
+                                                 (removef (node-highlights buffer) node
+                                                   :key
+                                                   #'car)
+                                                 (setf (needs-redisplay tui) t)
+                                                 (unless (zerop ticks)
+                                                   (push (cons node
+                                                               (lerp-from-black
+                                                                (/ ticks 10)
+                                                                (tui-sys:red color)
+                                                                (tui-sys:green color)
+                                                                (tui-sys:blue color)))
+                                                         (node-highlights buffer))
+                                                   0.1)))))
+                                           (return-from rename-edit t))))))
                       (clear-function-indent-cache (stack buffer) buffer)
                       ;; batch
                       (when (or (null (edit-loc buffer))
