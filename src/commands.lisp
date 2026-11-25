@@ -359,15 +359,28 @@ Removes spine from render cache. Returns true."
                (list-remove (elements body) index))
              (append-id (location-id loc) (max 0 (1- index))) buffer stack))
 
+(defun value-at-indices (loc indices)
+  (let ((node (location-node loc))
+        (list (node-at loc)))
+    (assert (gen-list-p list))
+    (if (typep node 'parse:macro-call)
+        (reduce (lambda (value id)
+                  (node-at (make-location :node value :id id)))
+                (parse:path-at node
+                               (reduce #'append-id indices
+                                       :initial-value (location-id loc)))
+                :initial-value node)
+        (gen-tree-ref list indices))))
+
 (defun insert-or-jump (loc index buffer stack &key (item (hole)) tail)
   "Moves to the hole at `index' of the list at `loc' and down the ids in `tail' if passed,
 otherwise inserts `item' at `index' and focuses down `tail' within it. `stack' is the
 part of the buffer stack starting from the node of `loc'. Returns true."
-  (let ((path (cons index tail)))
-    (if (typep (parse:value-at-path loc path) 'hole)
+  (let ((indices (cons index tail)))
+    (if (typep (value-at-indices loc indices) 'hole)
         (progn
           (setf (stack buffer) stack)
-          (refocus buffer (reduce #'append-id path :initial-value (location-id loc))))
+          (refocus buffer (reduce #'append-id indices :initial-value (location-id loc))))
         (progn
           (save-history buffer)
           (ast-insert item loc index buffer stack tail)))))

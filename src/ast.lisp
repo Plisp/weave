@@ -60,7 +60,6 @@
            #:string-and-package=
            #:unary-reader-marker-p
            #:resolve
-           #:value-at-path
            #:function-position-p
            #:block-position-p
            #:lexical-symbol-ref
@@ -169,6 +168,11 @@
 (defun string-and-package= (node sym)
   "Suitable as a comparison predicate between symbol-ref, symbol"
   (and (string= (name node) sym) (eq (home-package node) (symbol-package sym))))
+
+(defun reresolve-package (new-name symref)
+  (multiple-value-bind (s status)
+      (find-symbol new-name (home-package symref))
+    (if status (symbol-package s) (home-package symref))))
 
 (defrecord hole ()
   ((inlay :init "hole" :mutable t :type simple-string)
@@ -280,7 +284,10 @@ so a name test alone can't distinguish #:|.| from a dot."))
 
 (defmethod print-object ((object symbol-ref) stream)
   (pprint-logical-block (stream (list))
-    (format stream "~a@~a" (name object) (addr-str object))))
+    (format stream "~@[~a:~]~a@~a"
+            (unless (eq (home-package object) *package*)
+              (short-package-name (home-package object)))
+            (name object) (addr-str object))))
 
 (defmethod print-object ((object ref-list) stream)
   (format stream "~a(~{~a~^ ~})"
@@ -483,18 +490,23 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defun id-slot (id)
   (if (consp id) (car id) id))
 
-;; frontend utilities
-(defun value-at-path (loc path)
-  (let ((node (location-node loc))
-        (list (node-at loc)))
-    (assert (gen-list-p list))
-    (if (typep node 'macro-call)
-        (reduce (lambda (value id)
-                  (node-at (make-location :node value :id id)))
-                (path-at node (reduce #'append-id path :initial-value (location-id loc)))
-                :initial-value node)
-        (gen-tree-ref list path))))
+;; stacks: locations in reverse, like a zipper
+;; path: a list of ids down from the root
+(defun path-to-stack (path root)
+  "Converts a downwards path from the root into a stack."
+  (loop for id in path
+        for parent = root then (node-at fresh)
+        for fresh = (make-location :node parent :id id)
+        collect fresh into stack
+        finally (return (nreverse stack))))
 
+(defun root (stack)
+  (location-node (lastcar stack)))
+
+(defun relookup (match oldstack)
+  (node-at (car (path-to-stack match (root oldstack)))))
+
+;; lookups
 (defun function-position-p (loc)
   (let ((node (location-node loc))
         (id (location-id loc)))
@@ -513,7 +525,6 @@ so a name test alone can't distinguish #:|.| from a dot."))
            (block-position-p loc))))
 
 (defun unexpanded-macro-op-p (loc)
-  "Is `loc' the name of a macro call that failed to expand?"
   (let ((node (location-node loc)))
     (and (typep node 'macro-call)
          (eq (location-id loc) 'op)
@@ -614,6 +625,16 @@ from macro-calls. Use node-at instead."))
 `id' must name an evaluated or function-code location. The input is not mutated.")
   (:method (node id outer-env)
     outer-env))
+
+(defun resolve-path (form path env)
+  (loop with stack = (list)
+        for id-cons on path
+        for id = (car id-cons)
+        for node = form then (node-at loc)
+        for loc = (make-location :node node :id id)
+        do (push loc stack)
+           (setf env (location-env node id env))
+        finally (return (values stack env))))
 
 (defgeneric update (node id new-value)
   (:documentation "Functionally updates the location corresponding to `id',
@@ -3437,12 +3458,6 @@ XXX performs unguarded read-evaluation."
        (let ((tail (nth (1+ dot) elts)))
          (if (gen-list-p tail) (call-nth (- i dot) tail) tail))))))
 
-(defun lookup-path (path form)
-  (declare (optimize speed))
-  (loop for i in (reverse path)
-        do (setf form (call-nth i form))
-        finally (return form)))
-
 (defun substitute-sym (path form sym)
   (declare (optimize speed))
   (loop for rest on (reverse path)
@@ -3545,6 +3560,11 @@ primary value and T, or NIL and NIL if the initial macroexpansion fails."
                                           (return-from observe-probe
                                            (values :ref namespace subenv)))))))
                        (values nil nil)))
+                   (lookup-path (path form)
+                     (declare (optimize speed))
+                     (loop for i in (reverse path)
+                           do (setf form (call-nth i form))
+                           finally (return form)))
                    (probe (path form)
                      (let* ((gensym (gensym "PB"))
                             ;; singleton for macros that use consp to discriminate
@@ -3975,7 +3995,7 @@ The third value is a boolean indicating if the call expansion succeeded."
        (if (and (typep node 'anchor) (typep new 'anchor)) (copy-anchors node new) new)))))
 
 (defun unparse-syntax (form table)
-  "`form' with unparsed entries in `table' taking precedence over subforms."
+  "Syntax of `form' with fresh entries in `table' taking precedence."
   (if-let (entry (gethash form table))
     (to-syntax entry)
     (typecase form

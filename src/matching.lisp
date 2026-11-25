@@ -222,14 +222,6 @@
                        (t (rename-error-reason condition))))))
   (:documentation ""))
 
-(defun path-to-stack (path root)
-  "Converts a downwards path from the root into a stack."
-  (loop for id in path
-        for parent = root then (node-at fresh)
-        for fresh = (make-location :node parent :id id)
-        collect fresh into stack
-        finally (return (nreverse stack))))
-
 (defun rebuild-spine (loc updater stack)
   "Requires that (location-node `loc') = (location-node (car `stack'))
 Functionally rebuilds the path from `loc' out to the root, applying `updater' to
@@ -246,19 +238,6 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                    (rebuild (cdr stack) new-parent
                             (cons (make-location :node new-parent :id id) newstack))))))
     (rebuild (cons loc (cdr stack)) (funcall updater (node-at loc)) (list))))
-
-(defun resolve-path (form path env)
-  (loop with stack = (list)
-        for id-cons on path
-        for id = (car id-cons)
-        for node = form then (node-at loc)
-        for loc = (make-location :node node :id id)
-        do (push loc stack)
-           (setf env (location-env node id env))
-        finally (return (values stack env))))
-
-(defun root (stack)
-  (location-node (lastcar stack)))
 
 ;; watch out for semantic bug: confusing stacks and paths
 (defun rename-binder (form old-path new-name)
@@ -282,9 +261,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
               new
               (copy-anchors binder
                (make-instance 'symbol-ref
-                :home-package (multiple-value-bind (s status)
-                                  (find-symbol new-name (home-package binder))
-                                (if status (symbol-package s) (home-package binder)))
+                :home-package (reresolve-package new-name binder)
                 :name new-name))))
       ;; env is right outside the binding form at stack[0].node
       ;; stack[0].node is the binding form containing binder
@@ -312,10 +289,10 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                     (member binder (declaration-specials (decls binding-form))
                             :test #'symbol-like=)))
           (refuse :special binder))
-        ;; check: let/flet/labels/(sym)macrolet/lambda parents for parallel binding :conflict
+        ;; check: binding form for parallel binding :conflict
         (when-let* ((existing (and has-decls
                                    (env-lookup new
-                                    kind (location-env binding-form 'decls env)))))
+                                    kind (location-env binding-form 'decls +nullenv+)))))
           (refuse :conflict existing))
         ;; search
         (node-search binding-form
@@ -359,14 +336,14 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                                     (typep n 'function-code))
                                   stack
                                   :key #'location-node))
-                (refuse :escape (node-at (car (path-to-stack match (root oldstack))))))
+                (refuse :escape (relookup match oldstack)))
               ;; XXX also need to rebase match stacks
               (setf newstack
                     (rebuild-spine (car stack)
                      (lambda (s)
                        (copy-anchors s
                         (make-instance 'symbol-ref
-                         :home-package (home-package s)
+                         :home-package (reresolve-package new-name s)
                          :name new-name)))
                      stack))))
           ;; replace binder
@@ -383,7 +360,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                 (resolve-path (root newstack) match +nullenv+)
               (unless (or (env-special-p new env)
                           (eq new (env-lookup (node-at (car stack)) kind env)))
-                (refuse :capture (node-at (car (path-to-stack match (root oldstack))))))))
+                (refuse :capture (relookup match oldstack)))))
           ;; capture: every old reference with the new name still refers to the same binder
           (loop for match in new-paths
                 for newname-binder in newname-binders
@@ -391,7 +368,7 @@ the value at `loc', but retaining the current focus. Returns the new stack and r
                        (resolve-path (root newstack) match +nullenv+)
                      (unless (eq newname-binder
                                  (env-lookup (node-at (car stack)) kind env))
-                       (refuse :capture (node-at (car stack))))))
+                       (refuse :capture (relookup match oldstack)))))
           (root newstack))))))
 
 (defparameter *sort-repr*

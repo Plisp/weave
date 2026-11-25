@@ -23,7 +23,8 @@
            #:with-timing
            #:strcat
            #:vconc
-           #:lambda-list-section-start))
+           #:lambda-list-section-start
+           #:short-package-name))
 
 (in-package #:weave-utils)
 
@@ -263,3 +264,8 @@ Returns the preceding parameters as a second value."
                 (push parameter parameters)
                 (incf count)))
           finally (return (values nil (nreverse parameters))))))
+
+(defun short-package-name (home)
+  (first (stable-sort (cons (package-name home) (copy-list (package-nicknames home)))
+          #'<
+          :key #'length)))

@@ -1483,16 +1483,16 @@
 
 ;;; helpers
 
-(define-test value-at-path-reads-presented-forms :parent parser
+(define-test value-at-indices-reads-presented-forms :parent parser
   (let* ((call (parse "(dolist (x (f xs)) (print x))"))
          (inner (subform call 0 1))
          (edited (parse:update call '(parse:body 0 1) (parse:update inner 'parse:op (sym "G"))))
          (list (w::make-location :node edited :id '(parse:body 0))))
-    (is equal "(G XS)" (sx (parse:value-at-path list '(1))))
-    (is equal "G" (sx (parse:value-at-path list '(1 0))))
-    (is equal nil (parse:value-at-path list '(5)))
-    (is equal nil (parse:value-at-path list '(0 0)))
-    (fail (parse:value-at-path (w::make-location :node (parse "(let ((a 1)) a)") :id 'parse:op)
+    (is equal "(G XS)" (sx (w::value-at-indices list '(1))))
+    (is equal "G" (sx (w::value-at-indices list '(1 0))))
+    (is equal nil (w::value-at-indices list '(5)))
+    (is equal nil (w::value-at-indices list '(0 0)))
+    (fail (w::value-at-indices (w::make-location :node (parse "(let ((a 1)) a)") :id 'parse:op)
                             '(0)))))
 
 (define-test default-list-contents :parent parser
