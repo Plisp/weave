@@ -76,6 +76,7 @@
            #:function-code
            #:docstring
            #:decls
+           #:variable-declarator
            #:lambda-list
            #:unevaluated
            #:body
@@ -522,19 +523,18 @@ so a name test alone can't distinguish #:|.| from a dot."))
 (defun function-position-p (loc)
   (let ((node (location-node loc))
         (id (location-id loc)))
-    (or (and (typep node 'function-call) (eq id 'op))
-        (and (typep node 'macro-call) (eq id 'op))
-        (and (typep node 'function-form) (eq id 'fun-designator)))))
+    (or (and (typep node 'macro-call) (eq id 'op))
+        (and (typep (node-at loc) 'symbol-ref) (eq (locsort loc) 'fun-designator)))))
 
 (defun block-position-p (loc)
   (and (typep (location-node loc) 'return-from-form) (eq (location-id loc) 'name)))
 
 (defun lexical-symbol-ref (node loc)
   (and (typep node 'symbol-ref)
-       (or (eq (locsort loc) 'eval-form)
-           (eq (locsort loc) 'fun-designator)
-           (function-position-p loc)
-           (block-position-p loc))))
+       (let ((sort (locsort loc)))
+        (or (member sort '(eval-form fun-designator variable-declarator))
+            (function-position-p loc)
+            (block-position-p loc)))))
 
 (defun unexpanded-macro-op-p (loc)
   (let ((node (location-node loc)))
@@ -1435,7 +1435,7 @@ XXX type specializers currently sort as evaluated forms."
                 (mapcar (lambda (e)
                           (cond
                             ((symbol-ref-p e) 'variable-declarator)
-                            ((function-form-p e) 'fun-designator)
+                            ((function-form-p e) 'fun-designator) ; XXX not really
                             (t (unevaluated-tree e))))
                         (gen-cdr declspec))))
         ;; note: assume type liberally since we may be mid-edit / custom declaration

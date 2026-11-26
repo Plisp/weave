@@ -86,9 +86,12 @@ If `define-packages' is true, also evaluates top-level defpackage forms."
         (values forms system component end (length source) package)))))
 
 (defun demo-ast ()
-  (let ((source "(lambda (a &key (b a supplied-p))
-                   (declare (ignore a))
-                   (loop for i from 1 to 10 do (print i)))"))
+  (let (;; (source "(lambda (a &key (b a supplied-p))
+        ;;            (declare (ignore a))
+        ;;            (loop for i from 1 to 10 do (print i)))")
+        (source "(let (x) (declare (fixnum x)) x)")
+        ;; (source "(flet ((f () 3))(dotimes (i 10) (declare (inline #'f))))")
+        )
     (parse-source source)))
 
 (defun tui-main (&optional (ast nil astp) source (package *package*))
