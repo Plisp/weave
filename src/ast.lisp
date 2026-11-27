@@ -554,7 +554,7 @@ so a name test alone can't distinguish #:|.| from a dot."))
 ;; The raw syntax return value is used by the method `update' ((node macro-call))
 (defgeneric location-sort (node id)
   (:documentation "Returns a node-specific sort or NIL for an invalid id.
-A method may return the ast at `id' as a second value, NIL when absent.
+A method should return the ast at `id' as a second value, NIL when absent.
 Note: at macro calls, this returns raw syntax, similarly to get-location.
 Second value = (get-location node id) when present.")
   (:method (node id)
@@ -574,8 +574,9 @@ Second value = (get-location node id) when present.")
               ((list* slot path)
                (when (member (cdr (assoc slot (gethash (type-of node) *form-slot-kinds*)))
                              '(&tree &declarations))
-                 (values (sort-ref (location-sort node slot) path)
-                         (gen-tree-ref (slot-value node slot) path)))))))))
+                 (let ((thing (slot-value node slot)))
+                   (when-let (val (gen-tree-ref thing path))
+                     (values (sort-ref (location-sort node slot) path) val))))))))))
 
 (defun locsort (location)
   (location-sort (location-node location) (location-id location)))
@@ -1834,7 +1835,9 @@ Generally the tag name refers to a slot-value and (tag integer*) index tree stru
                        do (case kind
                             (&body
                              (push `((eql ',part) '&body) sort-clauses)
-                             (push `((list (eql ',part) (type integer)) 'eval-form)
+                             (push `((list (eql ',part) (and (type integer) i))
+                                     (when (< i (length (,part node)))
+                                       'eval-form))
                                    sort-clauses))
                             (&rest-qualifiers
                              (push `((eql ',part) '(&rest unevaluated)) sort-clauses)
@@ -1843,7 +1846,8 @@ Generally the tag name refers to a slot-value and (tag integer*) index tree stru
                             (&declarations
                              (push `((eql ',part) (mapcar #'declaration-tree (,part node)))
                                    sort-clauses))
-                            (&tree (push `((eql ',part) 'unevaluated) sort-clauses))
+                            (&tree
+                             (push `((eql ',part) 'unevaluated) sort-clauses))
                             (&rest
                              (when-let (pattern (cdr (assoc part rest-patterns)))
                                (multiple-value-bind (binder-tag value-tag value-kind)
@@ -4394,7 +4398,7 @@ keyword or a list. Consumed by the conditional one level up, never part of the A
         ((and (atom result) (constantp result))
          (cond
            ((and (vectorp result)
-                 (zerop (length result))
+                 (emptyp result)
                  (char= #\( (schar (source client) (1+ (car source)))))
             (make-instance 'ref-list :kind :vector))
            (t (reader-literal result (subseq (source client) (car source) (cdr source))))))

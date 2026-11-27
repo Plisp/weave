@@ -576,7 +576,7 @@ since these aren't a proper location."
   (assert (location= location (focus buffer)))
   ;; (slog (butlast (stack buffer))) ; suppress toplevel list
   (or (when-let (handler (gethash event *global-key-handlers*))
-        (slog 'global-handler)
+        ;;(slog 'global-handler)
         (funcall handler view buffer))
       ;; propagate
       (loop for thisnode = node then (location-node location)
@@ -1990,7 +1990,10 @@ ASSUMES we never focus a plain list body."
             (tui:copy-rect rect
                            :rows (reduce #'+ children
                                          :key (lambda (c)
-                                                (tui:rect-rows (tui:rect c))))
+                                                (let ((rect (tui:rect c)))
+                                                  (if (eq rect (tui:rect body-view))
+                                                      (max 1 (tui:rect-rows rect))
+                                                      (tui:rect-rows rect)))))
                            :cols (reduce #'max children
                                          :key (lambda (c)
                                                 (tui:rect-cols (tui:rect c)))))
@@ -2246,11 +2249,7 @@ as `viewport'."
                                     (let ((id (location-id l)))
                                       (cond
                                         ((symbolp id) t)
-                                        ((listp id)
-                                         (when (and (<= (length id) 2)
-                                                    (parse:location-sort node
-                                                     (append-id id 0)))
-                                           t)))))
+                                        ((listp id) (<= (length id) 2)))))
                                    ((class parse:reader-marker) t)))
                                stack))
               (i (cond

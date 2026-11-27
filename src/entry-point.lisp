@@ -89,8 +89,8 @@ If `define-packages' is true, also evaluates top-level defpackage forms."
   (let (;; (source "(lambda (a &key (b a supplied-p))
         ;;            (declare (ignore a))
         ;;            (loop for i from 1 to 10 do (print i)))")
-        (source "(let (x) (declare (fixnum x)) x)")
-        ;; (source "(flet ((f () 3))(dotimes (i 10) (declare (inline #'f))))")
+        ;; (source "(let (x) (declare (fixnum x)) x)") ;
+        (source "(flet ((f ()))(dotimes (i 10) (declare (inline #'f))))")
         )
     (parse-source source)))
 

@@ -855,6 +855,22 @@ second\"" (parse:str (parse::docstring code))))
     (press ui '(:alt #\P))
     (is equal '((parse:vars 0 1)) (focus-path ui))))
 
+(define-test move-child-without-goal-descends-to-first-child :parent editing
+  (flet ((descended (source &rest path)
+           (focus-path (press (apply #'goto (ui-for source) path) '(:alt #\n)))))
+    (is equal '(parse:op) (descended "(f 1)"))
+    (is equal '(parse:op) (descended "(let ((x 1)) x)"))
+    (is equal '(parse:op) (descended "(when a (f 1))"))
+    (is equal '((parse:body 0) parse:op) (descended "(f (g 1))" '(parse:body 0)))
+    (is equal '((parse::thing 0)) (descended "'(a (b c))" 'parse::thing))
+    (is equal '((parse::thing 1 0)) (descended "'(a (b c))" '(parse::thing 1)))
+    (is equal '((parse:vars 0 0)) (descended "(let ((x 1)) x)" '(parse:vars 0)))
+    (is equal '(parse:op) (descended "(f 1)" 'parse:op))
+    (is equal '((parse:body 0)) (descended "(f 1)" '(parse:body 0))))
+  (let ((ui (goto (ui-for "(f (g 1))") '(parse:body 0) '(parse:body 0))))
+    (press ui '(:alt #\p) '(:alt #\p) '(:alt #\n) '(:alt #\n))
+    (is equal '((parse:body 0) (parse:body 0)) (focus-path ui))))
+
 (define-test goal-stack :parent editing
   (let ((ui (goto (ui-for "'(a (b c) d)") '(parse::thing 1 1))))
     (press ui '(:alt #\p) '(:alt #\p))
